@@ -4,12 +4,13 @@
 #   ./scripts/pull_debug_logs.sh                     # 默认参数
 #   ./scripts/pull_debug_logs.sh -d ./my_logs -i 5   # 自定义目录和间隔
 #   ./scripts/pull_debug_logs.sh --once              # 只拉一次，不轮询
+#   ./scripts/pull_debug_logs.sh --latest            # 清空本地，只拉最新一次日志
 #   ./scripts/pull_debug_logs.sh --list              # 只列出远端文件
 
 set -euo pipefail
 
 # ── 默认配置 ──────────────────────────────────────────
-SSH_KEY="/f/Desktop/code_new.pem"
+SSH_KEY="/c/Users/yuanchuan/Desktop/code_new.pem"
 SSH_HOST="ubuntu@43.135.137.212"
 REMOTE_DIR="/tmp/ai_debug_logs"
 LOCAL_DIR="./debug_logs"
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
         -i|--interval)  INTERVAL="$2";   shift 2 ;;
         -m|--max)       MAX_FILES="$2";  shift 2 ;;
         --once)         MODE="once";     shift   ;;
+        --latest)       MODE="latest";   shift   ;;
         --list)         MODE="list";     shift   ;;
         -h|--help)
             echo "用法: $0 [选项]"
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -i, --interval SEC   轮询间隔秒数 (默认: 10)"
             echo "  -m, --max N          单次最多拉取文件数 (默认: 50)"
             echo "  --once               只拉取一次，不轮询"
+            echo "  --latest             清空本地日志，只拉取最新一次"
             echo "  --list               只列出远端文件，不下载"
             echo "  -h, --help           显示帮助"
             exit 0
@@ -114,6 +117,24 @@ list_remote() {
 # list 模式
 if [[ "$MODE" == "list" ]]; then
     list_remote
+    exit 0
+fi
+
+# latest 模式：清空本地，只拉最新一次
+if [[ "$MODE" == "latest" ]]; then
+    mkdir -p "$LOCAL_DIR"
+    rm -rf "${LOCAL_DIR:?}"/*
+    echo -e "${CYAN}已清空本地日志${NC}"
+
+    latest_file=$(remote_ls | head -1)
+    if [[ -z "$latest_file" ]]; then
+        echo -e "${YELLOW}远端暂无日志文件${NC}"
+        exit 0
+    fi
+
+    echo -e "${YELLOW}拉取最新日志:${NC} $latest_file"
+    $SCP_CMD "$SSH_HOST:$REMOTE_DIR/$latest_file" "$LOCAL_DIR/$latest_file"
+    echo -e "${GREEN}完成。${NC} 保存至 $LOCAL_DIR/$latest_file"
     exit 0
 fi
 

@@ -20,10 +20,14 @@ import re
 import json
 import time
 import logging
-from typing import Optional
+import uuid
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Literal, Optional
 
 import anyio
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -35,11 +39,16 @@ from claude_agent_sdk import (
     StreamEvent,
     TextBlock,
     ToolUseBlock,
+    ToolResultBlock,
+    UserMessage,
     query,
 )
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
+
+# 日志目录配置
+LOG_DIR = Path("./debug_logs")
 
 # 前端注册的工具白名单 — 只转换这些工具为 [TOOL_CALL]，忽略 Claude Code 内置工具（Bash、Read 等）
 DESIGN_TOOLS = {'create_node', 'insert_node', 'create_action', 'list_elements', 'preview_code'}
@@ -89,16 +98,282 @@ def _build_options(req_model: str, **kwargs) -> ClaudeAgentOptions:
     elif req_model:
         logger.warning(f"[凭证] 模型 {req_model} 无凭证配置，使用默认")
     return ClaudeAgentOptions(env=env, **kwargs)
+
+
+def _generate_log_filename(conversation_id: str) -> str:
+    """生成日志文件名：{conversation_id}.json 或 unknown_{timestamp}.json"""
+    if conversation_id:
+        return f"{conversation_id}.json"
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d-%H-%M-%S")
+    return f"unknown_{timestamp}.json"
+
+
+def save_debug_log(log_data: dict, conversation_id: str):
+    """保存调试日志到文件，同一会话追加到同一文件"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _generate_log_filename(conversation_id)
+    filepath = LOG_DIR / filename
+
+    # 读取现有数据或初始化
+    if filepath.exists():
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)
+            if isinstance(existing_data, list):
+                existing_data.append(log_data)
+            else:
+                existing_data = [existing_data, log_data]
+        except (json.JSONDecodeError, Exception):
+            existing_data = [log_data]
+    else:
+        existing_data = [log_data]
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(existing_data, f, ensure_ascii=False, indent=2)
+    logger.info(f"[日志] 保存至 {filepath}")
+
+
 # uvicorn access log 太吵，只保留 warning+
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # 预编译正则表达式
 _RE_TOOL_CALL = re.compile(r'\[TOOL_CALL\]\s*(\w+)\s*\(', re.DOTALL)
+_RE_TYPO_TOOL_CALL = re.compile(r'\[TOL_CALL\]\s*(\w+)\s*\(', re.DOTALL)
+_RE_TOOL_CALL_MARKER = re.compile(r'\[(?:TOOL_CALL|TOL_CALL)\]')
+_RE_MARKER_PREFIX = re.compile(r'\[T(?:O(?:O(?:L(?:_(?:C(?:A(?:L(?:L)?)?)?)?)?)?)?)?')
 _RE_CODE_BLOCK = re.compile(r'```(?:jsonc?|JSON)?\s*\n?(.*?)\n?```', re.DOTALL)
+
+
+def _find_tool_call_end(text: str) -> int:
+    """找到 [TOOL_CALL] func(...) 结束位置，用括号深度追踪。返回 -1 表示未闭合。"""
+    paren_start = text.find('(')
+    if paren_start == -1:
+        return -1
+    depth = 0
+    for i in range(paren_start, len(text)):
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _emit_safe_text(pending: str, chunk: str) -> tuple[list[str], list[dict], str]:
+    """处理流式文本块，抑制 [TOOL_CALL] 标记泄漏到前端。
+
+    - 普通文本：立即输出。
+    - [TOOL_CALL] 前缀跨 chunk：继续缓冲。
+    - 完整工具调用：提取但不输出 UI 文本。
+    - 调用方在流结束时用 _flush_pending 处理残余缓冲。
+
+    Returns:
+        (text_chunks_to_yield, extracted_tool_calls, updated_pending)
+    """
+    pending += chunk
+    chunks: list[str] = []
+    tool_calls: list[dict] = []
+
+    while pending:
+        idx = pending.find('[')
+        if idx == -1:
+            chunks.append(pending)
+            pending = ""
+        elif idx > 0:
+            chunks.append(pending[:idx])
+            pending = pending[idx:]
+        else:
+            m = _RE_TOOL_CALL_MARKER.match(pending)
+            if m:
+                end = _find_tool_call_end(pending)
+                if end == -1:
+                    break  # 工具调用未闭合，继续缓冲
+                full, _ = _normalize_tool_call_markers(pending[:end])
+                parsed = extract_tool_calls(full)
+                tool_calls.extend(parsed)
+                pending = pending[end:]
+            elif _RE_MARKER_PREFIX.match(pending):
+                break  # 可能是标记前缀，继续缓冲
+            else:
+                # 不是标记 — 找到下一个 [ 之前全部输出
+                next_bracket = pending.find('[', 1)
+                if next_bracket == -1:
+                    chunks.append(pending)
+                    pending = ""
+                else:
+                    chunks.append(pending[:next_bracket])
+                    pending = pending[next_bracket:]
+
+    return chunks, tool_calls, pending
+
+
+def _flush_pending(pending: str) -> tuple[str | None, list[dict]]:
+    """流结束时处理残余缓冲。
+
+    - 包含可解析的 [TOOL_CALL]：提取到 tool_calls，不发 text_delta。
+    - 普通文本或无法形成工具调用：返回给前端。
+
+    Returns:
+        (text_to_yield_or_none, extracted_tool_calls)
+    """
+    if not pending:
+        return None, []
+
+    normalized, _ = _normalize_tool_call_markers(pending)
+    parsed = extract_tool_calls(normalized)
+    if parsed:
+        return None, parsed  # 工具调用，不推给前端
+
+    # 普通文本 — 推给前端
+    return pending, []
 _RE_FIX_KEY = re.compile(r'(\w+)\s*:')
 _RE_FIX_TRAILING_COMMA = re.compile(r',\s*([\]}])')
 _RE_FIX_SINGLE_QUOTE = re.compile(r"'([^']*)'\s*:")
 _RE_CLEAN_TOOL_CALL = re.compile(r'\[TOOL_CALL\]\s*\w+\s*\([^)]*(?:\([^)]*\)[^)]*)*\)')
+_RE_DATA_URL = re.compile(r'^data:image/\w+;base64,')
+
+
+# ============================================================
+# 工具调用辅助函数
+# ============================================================
+
+def _normalize_tool_call_markers(content: str) -> tuple[str, list[str]]:
+    """修复常见的 tool_call 标记拼写错误（如 TOL_CALL → TOOL_CALL）"""
+    typo_matches = re.findall(r'\[TOL_CALL\]', content)
+    normalized = content.replace('[TOL_CALL]', '[TOOL_CALL]')
+    return normalized, typo_matches
+
+
+def _clean_extracted_tool_calls(content: str) -> str:
+    """从内容中移除所有 [TOOL_CALL] 标记及其参数（包括之后的文本）"""
+    normalized, _ = _normalize_tool_call_markers(content)
+    # 找到第一个 TOOL_CALL 标记的位置，截取之前的内容
+    match = re.search(r'\[TOOL_CALL\]', normalized)
+    if match:
+        return normalized[:match.start()].strip()
+    return normalized.strip()
+
+
+def _normalize_image_data(data: str) -> str:
+    """移除 base64 图片的 data URL 前缀"""
+    return _RE_DATA_URL.sub('', data)
+
+
+def _strip_json_actions_content(content: str) -> tuple[str, int]:
+    """移除内容中的 JSON actions 代码块，返回 (清理后内容, 移除字符数)"""
+    original_len = len(content)
+    # 移除 ```json 代码块
+    cleaned = re.sub(r'```(?:jsonc?|JSON)?\s*\n?\{.*?"actions"\s*:.*?\}\s*\n?```', '', content, flags=re.DOTALL)
+    # 移除裸 JSON actions 对象（支持嵌套大括号）
+    def _find_and_strip_json(text: str) -> str:
+        result = text
+        # 找到所有以 { 开头且包含 "actions" 的 JSON 对象
+        while True:
+            # 找到 {"actions" 或包含 "actions" 的 JSON 对象的起始位置
+            match = re.search(r'\{[^"]*"actions"\s*:', result)
+            if not match:
+                # 也匹配 {"message":"...","actions":...}
+                match = re.search(r'\{[^{]*?"actions"\s*:', result)
+            if not match:
+                break
+            start = match.start()
+            # 计算匹配的闭合大括号
+            depth = 0
+            end = start
+            for i in range(start, len(result)):
+                if result[i] == '{':
+                    depth += 1
+                elif result[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if depth != 0:
+                break
+            result = result[:start] + result[end:]
+        return result
+    cleaned = _find_and_strip_json(cleaned)
+    removed = original_len - len(cleaned)
+    return cleaned.strip(), removed
+
+
+def _transform_tool_args(tool_name: str, args: dict) -> dict:
+    """转换工具参数格式（如 Question → ask_user）"""
+    if tool_name == "Question" and "questions" in args:
+        questions = args["questions"]
+        if questions and isinstance(questions, list):
+            q = questions[0]
+            result = {
+                "question": q.get("question", ""),
+                "context": q.get("header", ""),
+            }
+            options = q.get("options", [])
+            if options:
+                transformed_options = []
+                for opt in options:
+                    if isinstance(opt, dict):
+                        label = opt.get("label", "")
+                        desc = opt.get("description", "")
+                        transformed_options.append(f"{label}（{desc}）" if desc else label)
+                    else:
+                        transformed_options.append(str(opt))
+                result["suggestedOptions"] = transformed_options
+            return result
+    return args
+
+
+def extract_tool_calls_with_diagnostics(content: str) -> tuple[list[dict], dict]:
+    """提取工具调用并返回诊断信息"""
+    # 先修复拼写错误
+    normalized, typo_matches = _normalize_tool_call_markers(content)
+
+    # 统计标记数量
+    tool_call_marker_count = len(_RE_TOOL_CALL.findall(normalized))
+
+    # 提取工具调用
+    calls = extract_tool_calls(normalized)
+    parsed_count = len(calls)
+
+    # 找出解析失败的标记位置
+    parse_failed_spans = []
+    for match in _RE_TOOL_CALL.finditer(normalized):
+        name = match.group(1)
+        paren_start = match.end() - 1
+        result = _extract_balanced_args(normalized, paren_start)
+        if result is None:
+            parse_failed_spans.append(match.group(0)[:50])
+        else:
+            args_str, _ = result
+            # 尝试解析参数
+            try:
+                json.loads(args_str.strip())
+            except json.JSONDecodeError:
+                repaired = _repair_json(args_str.strip())
+                if repaired:
+                    try:
+                        json.loads(repaired)
+                    except json.JSONDecodeError:
+                        parse_failed_spans.append(match.group(0)[:50])
+                else:
+                    parse_failed_spans.append(match.group(0)[:50])
+
+    parse_failed_count = len(parse_failed_spans)
+
+    diagnostics = {
+        "raw_length": len(content),
+        "tool_call_count": parsed_count,
+        "typo_markers": typo_matches,
+        "has_typo_tool_calls": len(typo_matches) > 0,
+        "tool_call_marker_count": tool_call_marker_count,
+        "parsed_tool_calls_count": parsed_count,
+        "dropped_duplicate_count": 0,
+        "parse_failed_count": parse_failed_count,
+        "parse_failed_spans": parse_failed_spans,
+    }
+    return calls, diagnostics
+
 
 app = FastAPI(title="Claude Agent Proxy", version="1.0.0")
 
@@ -144,6 +419,58 @@ class ClaudeProxyResponse(BaseModel):
     error: Optional[str] = None
     cost_usd: float = 0.0
     duration_ms: int = 0
+
+
+class ToolResultRequest(BaseModel):
+    """前端返回工具调用结果的请求格式（camelCase）"""
+    conversationId: str = ""       # 会话 ID（也可从 header 取）
+    runId: str                     # 本次运行 ID
+    turn: int = 0                  # 轮次
+    toolCallId: str                # 工具调用 ID（对应 ToolUseBlock.id）
+    toolName: str                  # 工具名称
+    arguments: dict = {}           # 原始工具参数
+    status: Literal["success", "failed"] = "success"
+    result: Any = None             # 工具执行结果（任意类型）
+    error: str = ""                # 错误信息
+    timestamp: str = ""            # 前端时间戳
+
+
+class ToolResultResponse(BaseModel):
+    """工具结果接收响应"""
+    success: bool
+    message: str
+    duplicate: bool = False  # 是否为重复接收
+
+
+# ============================================================
+# Pydantic v1/v2 兼容
+# ============================================================
+
+def model_to_dict(model) -> dict:
+    """Pydantic v1/v2 兼容的模型转字典"""
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+# ============================================================
+# 工具结果存储（幂等 + 超时清理）
+# ============================================================
+
+# key: (conversation_id, run_id, tool_call_id) → value: ToolResultRequest + timestamp
+_tool_result_store: dict[tuple[str, str, str], dict] = {}
+TOOL_RESULT_TTL_SECONDS = 300  # 5 分钟超时
+
+
+def _cleanup_expired_tool_results():
+    """清理过期的工具结果"""
+    now = datetime.now()
+    expired_keys = [
+        key for key, val in _tool_result_store.items()
+        if (now - val["received_at"]).total_seconds() > TOOL_RESULT_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        del _tool_result_store[key]
+    if expired_keys:
+        logger.info(f"[ToolResult] 清理过期记录: {len(expired_keys)} 条")
 
 
 # ============================================================
@@ -236,26 +563,30 @@ def _extract_actions_from_json(data: dict) -> list[dict]:
 
 def extract_tool_calls(content: str) -> list[dict]:
     """从 AI 响应文本中提取工具调用，支持多种格式"""
+    # 先修复拼写错误
+    content = content.replace('[TOL_CALL]', '[TOOL_CALL]')
+
     tool_calls = []
     seen: set[tuple[str, str, str, str]] = set()
 
     def _add(tc: dict):
         args = tc["arguments"]
-        key = (tc["name"], args.get("elementKey") or args.get("element", ""), args.get("title", ""), args.get("actionKey", "") or args.get("targetAction", ""))
-        if key not in seen:
-            seen.add(key)
-            tool_calls.append(tc)
+        if args is None:
+            return  # 解析失败，跳过
+        # 不去重 — 保留重复的相同工具调用（如多个 ExitAction）
+        tool_calls.append(tc)
 
-    def _parse_args(args_str: str) -> dict:
-        """解析工具参数，带多级修复"""
+    def _parse_args(args_str: str) -> dict | None:
+        """解析工具参数，带多级修复。返回 None 表示解析失败。"""
         # 1. 直接解析
         try:
             return json.loads(args_str)
         except json.JSONDecodeError:
             pass
-        # 2. 修复 key 未加引号
+        # 2. 修复 key 未加引号（但不能破坏 URL 中的冒号）
         try:
-            fixed = _RE_FIX_KEY.sub(r'"\1":', args_str)
+            # 用正则匹配未加引号的 key：行首或逗号/花括号后的 word 字符再跟冒号
+            fixed = re.sub(r'(?<=[{,])\s*(\w+)\s*:', r' "\1":', args_str)
             return json.loads(fixed)
         except json.JSONDecodeError:
             pass
@@ -267,7 +598,7 @@ def extract_tool_calls(content: str) -> list[dict]:
             except json.JSONDecodeError:
                 pass
         logger.debug(f"TOOL_CALL 参数解析失败: {args_str[:200]}")
-        return {}
+        return None
 
     # 格式 1: [TOOL_CALL] tool_name({...}) — 使用平衡括号匹配
     for match in _RE_TOOL_CALL.finditer(content):
@@ -364,14 +695,15 @@ _RE_LOOKS_LIKE_ACTIONS = re.compile(
 )
 
 # 修复提示词模板
-_REPAIR_PROMPT_TEMPLATE = """你的上一条回复中包含了 JSON 数据，但格式有误，前端无法解析。
+_REPAIR_PROMPT_TEMPLATE = """Your previous response contains JSON data with formatting errors that cannot be parsed.
 
-以下是你的原始回复内容：
+Here is your original response:
 ---
 {content}
 ---
 
-请将上述内容中的 JSON 数据严格按照以下格式重新输出，不要添加任何额外解释：
+Repair only the JSON formatting. Do not add, remove, reorder, rename, translate, or infer any fields.
+Return only the JSON code block, no extra explanation.
 
 ```json
 {{
@@ -385,7 +717,7 @@ _REPAIR_PROMPT_TEMPLATE = """你的上一条回复中包含了 JSON 数据，但
         "paramsValue": {{ ... }}
       }}
     ],
-    "子动作名": [
+    "sub_action_name": [
       {{
         "key": "...",
         "title": "...",
@@ -398,11 +730,11 @@ _REPAIR_PROMPT_TEMPLATE = """你的上一条回复中包含了 JSON 数据，但
 }}
 ```
 
-要求：
-1. 只输出 JSON 代码块，不要输出其他文字
-2. 确保所有 key 和字符串值都用双引号
-3. 确保 JSON 格式完全正确（无尾逗号、括号闭合）
-4. 保留原始内容中的所有节点和参数"""
+Requirements:
+1. Output only the JSON code block, no other text
+2. Ensure all keys and string values use double quotes
+3. Ensure JSON format is completely correct (no trailing commas, closed brackets)
+4. Preserve all nodes and parameters from the original content"""
 
 
 def _looks_like_structured_actions(content: str) -> bool:
@@ -498,7 +830,7 @@ async def build_multimodal_prompt(req: ClaudeProxyRequest):
 # ============================================================
 
 @app.post("/api/ai/claude", response_model=ClaudeProxyResponse)
-async def claude_proxy(req: ClaudeProxyRequest):
+async def claude_proxy(req: ClaudeProxyRequest, request: Request):
     """
     代理 Claude Code 调用
 
@@ -507,7 +839,8 @@ async def claude_proxy(req: ClaudeProxyRequest):
     query() 函数处理，收集完整响应后返回。
     """
     start_time = time.time()
-    logger.info(f"[非流式] 收到请求: prompt_len={len(req.prompt)}, model={req.model or 'default'}, images={len(req.images)}, max_turns={req.max_turns}, max_tokens={req.max_tokens}, auto_repair={req.auto_repair}, tool_names={req.tool_names}")
+    conversation_id = request.headers.get("X-Conversation-Id", "")
+    logger.info(f"[非流式] 收到请求: prompt_len={len(req.prompt)}, model={req.model or 'default'}, images={len(req.images)}, max_turns={req.max_turns}, max_tokens={req.max_tokens}, auto_repair={req.auto_repair}, tool_names={req.tool_names}, conversation_id={conversation_id}")
     allowed = set(req.tool_names) if req.tool_names else DESIGN_TOOLS
     logger.debug(f"[非流式] prompt 前500字: {req.prompt[:500]}")
 
@@ -520,6 +853,8 @@ async def claude_proxy(req: ClaudeProxyRequest):
         )
 
         content_parts: list[str] = []
+        turns_log: list[dict] = []
+        native_tool_calls: list[dict] = []  # 原生工具调用（带 id）
         total_cost = 0.0
         msg_count = 0
         turn_count = 0
@@ -531,28 +866,51 @@ async def claude_proxy(req: ClaudeProxyRequest):
             if isinstance(message, AssistantMessage):
                 turn_count += 1
                 block_types = []
+                turn_blocks = []
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         block_types.append("TextBlock")
                         content_parts.append(block.text)
+                        turn_blocks.append({"type": "TextBlock", "length": len(block.text), "text": block.text})
                         logger.debug(f"[非流式] turn={turn_count} TextBlock len={len(block.text)}: {block.text[:200]}")
                     elif isinstance(block, ToolUseBlock):
                         if block.name in allowed:
                             block_types.append(f"ToolUseBlock({block.name})")
                             args_str = json.dumps(block.input, ensure_ascii=False)
                             content_parts.append(f'[TOOL_CALL] {block.name}({args_str})')
+                            turn_blocks.append({"type": "ToolUseBlock", "original_name": block.name, "id": block.id, "args": block.input})
+                            native_tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
                             logger.info(f"[非流式] turn={turn_count} 设计工具: {block.name}, id={block.id}")
                             logger.debug(f"[非流式] turn={turn_count} input: {args_str[:500]}")
                         else:
                             logger.debug(f"[非流式] turn={turn_count} 忽略内置工具: {block.name}")
+                turns_log.append({"turn": turn_count, "type": "AssistantMessage", "blocks": turn_blocks})
                 logger.info(f"[非流式] turn={turn_count} AssistantMessage blocks={block_types}")
 
+            elif isinstance(message, UserMessage):
+                # 工具调用结果
+                if isinstance(message.content, list):
+                    result_blocks = []
+                    for block in message.content:
+                        if isinstance(block, ToolResultBlock):
+                            content_str = block.content if isinstance(block.content, str) else json.dumps(block.content, ensure_ascii=False)
+                            result_blocks.append({
+                                "type": "ToolResultBlock",
+                                "tool_use_id": block.tool_use_id,
+                                "content": content_str[:1000],
+                                "is_error": block.is_error,
+                            })
+                            logger.info(f"[非流式] ToolResult: tool_use_id={block.tool_use_id}, is_error={block.is_error}, content_len={len(content_str)}")
+                    if result_blocks:
+                        turns_log.append({"type": "ToolResultMessage", "blocks": result_blocks})
+
             elif isinstance(message, ResultMessage):
-                logger.info(f"[非流式] ResultMessage: subtype={message.subtype}, cost=${message.total_cost_usd:.4f}, "
+                cost = message.total_cost_usd or 0.0
+                logger.info(f"[非流式] ResultMessage: subtype={message.subtype}, cost=${cost:.4f}, "
                            f"duration_ms={message.duration_ms}, is_error={message.is_error}, "
                            f"errors={message.errors}, api_error_status={message.api_error_status}")
                 logger.debug(f"[非流式] ResultMessage result_text (前500字): {(message.result or '')[:500]}")
-                if message.total_cost_usd:
+                if message.total_cost_usd is not None:
                     total_cost = message.total_cost_usd
 
             else:
@@ -564,9 +922,19 @@ async def claude_proxy(req: ClaudeProxyRequest):
         logger.info(f"[非流式] 请求完成: {duration_ms}ms, cost=${total_cost:.4f}, "
                     f"总消息数={msg_count}, 总轮次={turn_count}, content_len={len(content)}")
 
-        # 提取工具调用（从文本中解析 [TOOL_CALL] 等格式）
-        tool_calls = extract_tool_calls(content)
-        logger.info(f"[非流式] 提取到 {len(tool_calls)} 个 tool_calls")
+        # 合并原生工具调用（带 id）和从文本解析的工具调用
+        parsed_tool_calls = extract_tool_calls(content)
+        logger.info(f"[非流式] 原生 tool_calls: {len(native_tool_calls)} 个, 解析 tool_calls: {len(parsed_tool_calls)} 个")
+
+        # 以原生为主，用 parsed 补充（按 name+arguments 去重）
+        tool_calls = list(native_tool_calls)
+        seen_keys = {(tc["name"], json.dumps(tc["arguments"], sort_keys=True)) for tc in native_tool_calls}
+        for tc in parsed_tool_calls:
+            key = (tc["name"], json.dumps(tc["arguments"], sort_keys=True))
+            if key not in seen_keys:
+                tool_calls.append(tc)
+                seen_keys.add(key)
+
         if tool_calls:
             for i, tc in enumerate(tool_calls):
                 logger.debug(f"[非流式] tool_call[{i}]: name={tc['name']}, args_keys={list(tc['arguments'].keys())}")
@@ -588,6 +956,35 @@ async def claude_proxy(req: ClaudeProxyRequest):
             clean_content = _RE_CLEAN_TOOL_CALL.sub('', content).strip()
         else:
             clean_content = content
+
+        # 保存调试日志
+        log_data = {
+            "conversation_id": conversation_id,
+            "timestamp": datetime.now().isoformat(),
+            "request": {
+                "mode": "non-stream",
+                "prompt_len": len(req.prompt),
+                "prompt_preview": req.prompt[:200],
+                "model": req.model or "default",
+                "max_turns": req.max_turns,
+                "max_tokens": req.max_tokens,
+                "tool_names": req.tool_names,
+                "auto_repair": req.auto_repair,
+                "images_count": len(req.images),
+            },
+            "turns": turns_log,
+            "raw_content": content,
+            "tool_calls": tool_calls,
+            "clean_content": clean_content,
+            "result": {
+                "success": True,
+                "cost_usd": total_cost,
+                "duration_ms": duration_ms,
+                "total_messages": msg_count,
+                "total_turns": turn_count,
+            },
+        }
+        save_debug_log(log_data, conversation_id)
 
         return ClaudeProxyResponse(
             content=clean_content,
@@ -613,7 +1010,7 @@ async def claude_proxy(req: ClaudeProxyRequest):
 
 
 @app.post("/api/ai/claude/stream")
-async def claude_proxy_stream(req: ClaudeProxyRequest):
+async def claude_proxy_stream(req: ClaudeProxyRequest, request: Request):
     """
     SSE 流式代理 — 逐字返回 AI 响应（真正的 token-by-token）
 
@@ -623,7 +1020,8 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
     data: {"type":"message_complete","content":"完整内容","tool_calls":[],"success":true,"cost_usd":0.05,"duration_ms":2300}
     """
     start_time = time.time()
-    logger.info(f"[SSE] 收到请求: prompt_len={len(req.prompt)}, model={req.model or 'default'}, images={len(req.images)}, max_turns={req.max_turns}, max_tokens={req.max_tokens}, auto_repair={req.auto_repair}, tool_names={req.tool_names}")
+    conversation_id = request.headers.get("X-Conversation-Id", "")
+    logger.info(f"[SSE] 收到请求: prompt_len={len(req.prompt)}, model={req.model or 'default'}, images={len(req.images)}, max_turns={req.max_turns}, max_tokens={req.max_tokens}, auto_repair={req.auto_repair}, tool_names={req.tool_names}, conversation_id={conversation_id}")
     logger.debug(f"[SSE] prompt 前500字: {req.prompt[:500]}")
     allowed = set(req.tool_names) if req.tool_names else DESIGN_TOOLS
 
@@ -638,10 +1036,13 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
             )
 
             full_text = ""
+            turns_log: list[dict] = []
+            native_tool_calls: list[dict] = []  # 原生工具调用（带 id）
             total_cost = 0.0
             msg_count = 0
             turn_count = 0
             stream_event_count = 0
+            _pending_text = ""  # 缓冲区：检测跨 token 的 [TOOL_CALL] 标记
 
             prompt_input = build_multimodal_prompt(req) if req.images else req.prompt
             async for message in query(prompt=prompt_input, options=options):
@@ -659,7 +1060,12 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
                             text_chunk = delta.get("text", "")
                             if text_chunk:
                                 full_text += text_chunk
-                                yield f"data: {json.dumps({'type': 'text_delta', 'content': text_chunk}, ensure_ascii=False)}\n\n"
+                                safe_chunks, extracted, _pending_text = _emit_safe_text(_pending_text, text_chunk)
+                                for chunk in safe_chunks:
+                                    yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk}, ensure_ascii=False)}\n\n"
+                                if extracted:
+                                    native_tool_calls.extend(extracted)
+                                    logger.debug(f"[SSE] StreamEvent 中提取到 {len(extracted)} 个工具调用")
                         elif delta_type == "input_json_delta":
                             # 工具调用的 input JSON delta
                             partial_json = delta.get("partial_json", "")
@@ -689,30 +1095,57 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
                 elif isinstance(message, AssistantMessage):
                     turn_count += 1
                     block_types = []
+                    turn_blocks = []
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             block_types.append("TextBlock")
                             full_text += block.text
-                            yield f"data: {json.dumps({'type': 'text_delta', 'content': block.text}, ensure_ascii=False)}\n\n"
+                            turn_blocks.append({"type": "TextBlock", "length": len(block.text), "text": block.text})
+                            # 不要把内部工具协议标记推给前端 UI
+                            if not _RE_TOOL_CALL.search(block.text) and not _RE_TYPO_TOOL_CALL.search(block.text):
+                                yield f"data: {json.dumps({'type': 'text_delta', 'content': block.text}, ensure_ascii=False)}\n\n"
+                            else:
+                                logger.debug(f"[SSE] turn={turn_count} TextBlock 包含 TOOL_CALL 标记，跳过 text_delta 推送")
                             logger.debug(f"[SSE] turn={turn_count} TextBlock len={len(block.text)}")
                         elif isinstance(block, ToolUseBlock):
                             if block.name in allowed:
                                 block_types.append(f"ToolUseBlock({block.name})")
                                 args_str = json.dumps(block.input, ensure_ascii=False)
                                 full_text += f'[TOOL_CALL] {block.name}({args_str})'
+                                turn_blocks.append({"type": "ToolUseBlock", "original_name": block.name, "id": block.id, "args": block.input})
+                                native_tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
                                 # 不 yield text_delta — tool call 标记不应显示给用户
                                 logger.info(f"[SSE] turn={turn_count} 设计工具: {block.name}, id={block.id}")
                                 logger.debug(f"[SSE] turn={turn_count} input: {args_str[:500]}")
                             else:
                                 logger.debug(f"[SSE] turn={turn_count} 忽略内置工具: {block.name}")
+                    turns_log.append({"turn": turn_count, "type": "AssistantMessage", "blocks": turn_blocks})
                     logger.info(f"[SSE] turn={turn_count} AssistantMessage blocks={block_types}")
 
+                elif isinstance(message, UserMessage):
+                    # 工具调用结果
+                    if isinstance(message.content, list):
+                        result_blocks = []
+                        for block in message.content:
+                            if isinstance(block, ToolResultBlock):
+                                content_str = block.content if isinstance(block.content, str) else json.dumps(block.content, ensure_ascii=False)
+                                result_blocks.append({
+                                    "type": "ToolResultBlock",
+                                    "tool_use_id": block.tool_use_id,
+                                    "content": content_str[:1000],
+                                    "is_error": block.is_error,
+                                })
+                                logger.info(f"[SSE] ToolResult: tool_use_id={block.tool_use_id}, is_error={block.is_error}, content_len={len(content_str)}")
+                        if result_blocks:
+                            turns_log.append({"type": "ToolResultMessage", "blocks": result_blocks})
+
                 elif isinstance(message, ResultMessage):
-                    logger.info(f"[SSE] ResultMessage: subtype={message.subtype}, cost=${message.total_cost_usd:.4f}, "
+                    cost = message.total_cost_usd or 0.0
+                    logger.info(f"[SSE] ResultMessage: subtype={message.subtype}, cost=${cost:.4f}, "
                                f"duration_ms={message.duration_ms}, is_error={message.is_error}, "
                                f"errors={message.errors}, api_error_status={message.api_error_status}")
                     logger.debug(f"[SSE] ResultMessage result_text (前500字): {(message.result or '')[:500]}")
-                    if message.total_cost_usd:
+                    if message.total_cost_usd is not None:
                         total_cost = message.total_cost_usd
 
                 else:
@@ -722,9 +1155,28 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
             logger.info(f"[SSE] 流结束: {duration_ms}ms, 总消息数={msg_count}, 轮次={turn_count}, "
                        f"stream_events={stream_event_count}, full_text_len={len(full_text)}")
 
-            # 提取工具调用
-            tool_calls = extract_tool_calls(full_text)
-            logger.info(f"[SSE] 提取到 {len(tool_calls)} 个 tool_calls")
+            # 刷新缓冲区 — 可解析的工具调用提取不推 UI，普通文本推给前端
+            if _pending_text:
+                flush_text, flush_tc = _flush_pending(_pending_text)
+                if flush_tc:
+                    native_tool_calls.extend(flush_tc)
+                    logger.debug(f"[SSE] 流结束缓冲区提取到 {len(flush_tc)} 个工具调用")
+                if flush_text:
+                    yield f"data: {json.dumps({'type': 'text_delta', 'content': flush_text}, ensure_ascii=False)}\n\n"
+                _pending_text = ""
+
+            # 合并原生工具调用（带 id）和从文本解析的工具调用
+            parsed_tool_calls = extract_tool_calls(full_text)
+            logger.info(f"[SSE] 原生 tool_calls: {len(native_tool_calls)} 个, 解析 tool_calls: {len(parsed_tool_calls)} 个")
+
+            # 以原生为主，用 parsed 补充（按 name+arguments 去重）
+            tool_calls = list(native_tool_calls)
+            seen_keys = {(tc["name"], json.dumps(tc["arguments"], sort_keys=True)) for tc in native_tool_calls}
+            for tc in parsed_tool_calls:
+                key = (tc["name"], json.dumps(tc["arguments"], sort_keys=True))
+                if key not in seen_keys:
+                    tool_calls.append(tc)
+                    seen_keys.add(key)
 
             # AI 格式修复（如果需要）
             if not tool_calls and req.auto_repair and _looks_like_structured_actions(full_text):
@@ -747,6 +1199,36 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
             # 发送最终结果
             yield f"data: {json.dumps({'type': 'message_complete', 'content': clean_content, 'tool_calls': tool_calls, 'success': True, 'cost_usd': total_cost, 'duration_ms': duration_ms}, ensure_ascii=False)}\n\n"
 
+            # 保存调试日志
+            log_data = {
+                "conversation_id": conversation_id,
+                "timestamp": datetime.now().isoformat(),
+                "request": {
+                    "mode": "sse-stream",
+                    "prompt_len": len(req.prompt),
+                    "prompt_preview": req.prompt[:200],
+                    "model": req.model or "default",
+                    "max_turns": req.max_turns,
+                    "max_tokens": req.max_tokens,
+                    "tool_names": req.tool_names,
+                    "auto_repair": req.auto_repair,
+                    "images_count": len(req.images),
+                },
+                "turns": turns_log,
+                "raw_content": full_text,
+                "tool_calls": tool_calls,
+                "clean_content": clean_content,
+                "result": {
+                    "success": True,
+                    "cost_usd": total_cost,
+                    "duration_ms": duration_ms,
+                    "total_messages": msg_count,
+                    "total_turns": turn_count,
+                    "stream_events": stream_event_count,
+                },
+            }
+            save_debug_log(log_data, conversation_id)
+
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[SSE] 请求失败: {type(e).__name__}: {e}", exc_info=True)
@@ -761,6 +1243,67 @@ async def claude_proxy_stream(req: ClaudeProxyRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/ai/claude/tool-result", response_model=ToolResultResponse)
+async def receive_tool_result(req: ToolResultRequest, request: Request):
+    """
+    接收前端返回的工具调用结果
+
+    按 conversation_id + runId + toolCallId 做幂等接收。
+    当前阶段仅接收/记录/排队，不主动喂给模型。
+    """
+    conversation_id = request.headers.get("X-Conversation-Id", "") or req.conversationId
+    key = (conversation_id, req.runId, req.toolCallId)
+    is_error = req.status == "failed"
+
+    logger.info(f"[ToolResult] 收到: conversation_id={conversation_id}, runId={req.runId}, "
+                f"toolCallId={req.toolCallId}, toolName={req.toolName}, status={req.status}")
+
+    # 清理过期记录
+    _cleanup_expired_tool_results()
+
+    # 幂等检查
+    if key in _tool_result_store:
+        logger.info(f"[ToolResult] 重复接收: {key}")
+        return ToolResultResponse(success=True, message="已接收过该工具结果", duplicate=True)
+
+    # 存储完整请求体
+    _tool_result_store[key] = {
+        "request": model_to_dict(req),
+        "conversation_id": conversation_id,
+        "received_at": datetime.now(),
+    }
+
+    # 记录日志
+    log_data = {
+        "conversation_id": conversation_id,
+        "timestamp": datetime.now().isoformat(),
+        "type": "tool_result",
+        "run_id": req.runId,
+        "tool_call_id": req.toolCallId,
+        "tool_name": req.toolName,
+        "arguments": req.arguments,
+        "status": req.status,
+        "result": req.result,
+        "error": req.error,
+        "is_error": is_error,
+    }
+    save_debug_log(log_data, conversation_id)
+
+    logger.info(f"[ToolResult] 已存储: {key}, 当前缓存 {len(_tool_result_store)} 条")
+    return ToolResultResponse(success=True, message="工具结果已接收", duplicate=False)
+
+
+@app.get("/api/ai/claude/tool-results/{conversation_id}/{run_id}")
+async def get_tool_results(conversation_id: str, run_id: str):
+    """获取指定会话和运行的所有工具结果（用于调试）"""
+    _cleanup_expired_tool_results()
+    results = []
+    for (cid, rid, _), val in _tool_result_store.items():
+        if cid == conversation_id and rid == run_id:
+            results.append(val["request"])
+    return {"conversation_id": conversation_id, "run_id": run_id, "results": results}
 
 
 @app.get("/config")
