@@ -982,6 +982,7 @@ async def claude_proxy(req: ClaudeProxyRequest, request: Request):
                 "duration_ms": duration_ms,
                 "total_messages": msg_count,
                 "total_turns": turn_count,
+                "interrupted": False,
             },
         }
         save_debug_log(log_data, conversation_id)
@@ -1043,6 +1044,7 @@ async def claude_proxy_stream(req: ClaudeProxyRequest, request: Request):
             turn_count = 0
             stream_event_count = 0
             _pending_text = ""  # 缓冲区：检测跨 token 的 [TOOL_CALL] 标记
+            first_token_time: float | None = None
 
             prompt_input = build_multimodal_prompt(req) if req.images else req.prompt
             async for message in query(prompt=prompt_input, options=options):
@@ -1062,6 +1064,8 @@ async def claude_proxy_stream(req: ClaudeProxyRequest, request: Request):
                                 full_text += text_chunk
                                 safe_chunks, extracted, _pending_text = _emit_safe_text(_pending_text, text_chunk)
                                 for chunk in safe_chunks:
+                                    if first_token_time is None:
+                                        first_token_time = time.time()
                                     yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk}, ensure_ascii=False)}\n\n"
                                 if extracted:
                                     native_tool_calls.extend(extracted)
@@ -1222,9 +1226,11 @@ async def claude_proxy_stream(req: ClaudeProxyRequest, request: Request):
                     "success": True,
                     "cost_usd": total_cost,
                     "duration_ms": duration_ms,
+                    "first_token_ms": int((first_token_time - start_time) * 1000) if first_token_time else None,
                     "total_messages": msg_count,
                     "total_turns": turn_count,
                     "stream_events": stream_event_count,
+                    "interrupted": False,
                 },
             }
             save_debug_log(log_data, conversation_id)
@@ -1232,6 +1238,28 @@ async def claude_proxy_stream(req: ClaudeProxyRequest, request: Request):
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[SSE] 请求失败: {type(e).__name__}: {e}", exc_info=True)
+            # 异常时也保存日志
+            error_log = {
+                "conversation_id": conversation_id,
+                "timestamp": datetime.now().isoformat(),
+                "request": {
+                    "mode": "sse-stream",
+                    "prompt_len": len(req.prompt),
+                    "model": req.model or "default",
+                    "max_turns": req.max_turns,
+                    "tool_names": req.tool_names,
+                },
+                "result": {
+                    "success": False,
+                    "error": f"{type(e).__name__}: {e}",
+                    "cost_usd": total_cost if 'total_cost' in dir() else 0.0,
+                    "duration_ms": duration_ms,
+                    "first_token_ms": int((first_token_time - start_time) * 1000) if first_token_time else None,
+                    "total_turns": turn_count if 'turn_count' in dir() else 0,
+                    "interrupted": True,
+                },
+            }
+            save_debug_log(error_log, conversation_id)
             yield f"data: {json.dumps({'type': 'message_complete', 'content': '', 'tool_calls': [], 'success': False, 'error': str(e), 'cost_usd': 0.0, 'duration_ms': duration_ms}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
