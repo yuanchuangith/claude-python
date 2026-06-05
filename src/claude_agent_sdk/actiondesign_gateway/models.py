@@ -96,6 +96,7 @@ class AgentChatResponse(_GatewayBaseModel):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     success: bool = True
     error: str | None = None
+    code: str | None = None
     duration_ms: int = 0
     usage: dict[str, Any] = Field(default_factory=dict)
 

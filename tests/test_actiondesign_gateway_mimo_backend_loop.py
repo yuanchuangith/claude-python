@@ -1,15 +1,33 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import anyio
+import httpx
 import pytest
+from fastapi import HTTPException
 
 from claude_agent_sdk.actiondesign_gateway import mimo_provider
+from claude_agent_sdk.actiondesign_gateway.mimo_stream import iter_sse_events
 from claude_agent_sdk.actiondesign_gateway.backend_tools import (
     BackendToolCall,
     BackendToolResult,
     execute_backend_tool_calls,
 )
+
+
+def sse_payloads(events: list[str]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for event in events:
+        for line in event.splitlines():
+            if line.startswith("data: "):
+                payloads.append(json.loads(line.removeprefix("data: ")))
+    return payloads
+
+
+async def _aiter(items: list[str]):
+    for item in items:
+        yield item
 
 
 class FakeBackendExecutor:
@@ -236,16 +254,274 @@ def test_mimo_does_not_parse_tool_calls_from_backend_result_echo(monkeypatch):
     assert response["tool_calls"] == []
 
 
+def test_mimo_malformed_backend_tool_marker_is_fed_back_not_returned(
+    monkeypatch,
+):
+    responses = [
+        'visible [BACKEND_TOOL_CALL] knowledge.search({"query":"x" tail',
+        "final answer",
+    ]
+    bodies: list[dict[str, Any]] = []
+
+    async def fake_post_mimo(body, _settings):
+        bodies.append(body)
+        return {"content": [{"type": "text", "text": responses.pop(0)}]}
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {"prompt": "lookup", "toolNames": []},
+        make_settings(),
+    )
+
+    assert len(bodies) == 2
+    assert "BACKEND_TOOL_ARGUMENTS_INVALID" in str(bodies[1])
+    assert response["content"] == "final answer"
+    assert "BACKEND_TOOL_CALL" not in response["content"]
+
+
+def test_mimo_usage_is_merged_across_backend_tool_turns(monkeypatch):
+    responses = [
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '[BACKEND_TOOL_CALL] mcp.search({"query":"x"})',
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        },
+        {
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 20, "output_tokens": 3},
+        },
+    ]
+
+    async def fake_post_mimo(_body, _settings):
+        return responses.pop(0)
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {"prompt": "lookup", "toolNames": []},
+        make_settings(),
+    )
+
+    assert response["usage"]["input_tokens"] == 30
+    assert response["usage"]["output_tokens"] == 5
+    assert response["usage"]["turns"] == [
+        {"input_tokens": 10, "output_tokens": 2},
+        {"input_tokens": 20, "output_tokens": 3},
+    ]
+
+
+def test_mimo_single_turn_usage_keeps_legacy_shape(monkeypatch):
+    async def fake_post_mimo(_body, _settings):
+        return {
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {"prompt": "single", "toolNames": []},
+        make_settings(),
+    )
+
+    assert response["usage"] == {"input_tokens": 10, "output_tokens": 2}
+
+
+def test_mimo_malformed_frontend_tool_marker_is_cleaned(monkeypatch):
+    async def fake_post_mimo(_body, _settings):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": 'visible [TOOL_CALL] create_node({"elementKey":"x"',
+                }
+            ],
+        }
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {"prompt": "bad frontend tool", "toolNames": ["create_node"]},
+        make_settings(),
+    )
+
+    assert response["success"] is True
+    assert response["content"] == "visible"
+    assert response["tool_calls"] == []
+    assert "TOOL_CALL" not in response["content"]
+
+
+def test_mimo_stream_uses_upstream_sse_and_emits_incremental_text(
+    monkeypatch,
+):
+    bodies: list[dict[str, Any]] = []
+
+    async def fake_stream_post_mimo(body, _settings):
+        bodies.append(body)
+        yield {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hel"},
+        }
+        yield {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "lo"},
+        }
+        yield {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        }
+        yield {"type": "message_stop"}
+
+    async def fail_post_mimo(_body, _settings):
+        raise AssertionError("_post_mimo must not be used by stream_mimo")
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fail_post_mimo)
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {"prompt": "stream", "toolNames": []},
+                make_settings(),
+            )
+        ]
+
+    events = anyio.run(collect_events)
+    payloads = sse_payloads(events)
+
+    assert bodies[0]["stream"] is True
+    assert [
+        payload["content"] for payload in payloads if payload["type"] == "text_delta"
+    ] == ["hel", "lo"]
+    assert payloads[-1]["type"] == "message_complete"
+    assert payloads[-1]["success"] is True
+
+
+def test_mimo_stream_buffers_backend_tool_turn_until_final_turn(monkeypatch):
+    turns = [
+        [
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "searching first "},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {
+                    "type": "text_delta",
+                    "text": '[BACKEND_TOOL_CALL] knowledge.search({"query":"x"})',
+                },
+            },
+            {"type": "message_stop"},
+        ],
+        [
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "final answer"},
+            },
+            {"type": "message_stop"},
+        ],
+    ]
+
+    async def fake_stream_post_mimo(_body, _settings):
+        for event in turns.pop(0):
+            yield event
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {"prompt": "preview", "toolNames": []},
+                make_settings(),
+            )
+        ]
+
+    payloads = sse_payloads(anyio.run(collect_events))
+    text_deltas = [
+        payload["content"] for payload in payloads if payload["type"] == "text_delta"
+    ]
+
+    assert text_deltas == ["final answer"]
+    assert "searching first" not in "".join(json.dumps(payload) for payload in payloads)
+    assert payloads[-1]["type"] == "message_complete"
+    assert payloads[-1]["content"] == "final answer"
+
+
+def test_mimo_stream_cleans_malformed_frontend_tool_marker(monkeypatch):
+    async def fake_stream_post_mimo(_body, _settings):
+        yield {
+            "type": "content_block_delta",
+            "delta": {
+                "type": "text_delta",
+                "text": 'visible [TOL_CALL] create_node({"elementKey":"x"',
+            },
+        }
+        yield {"type": "message_stop"}
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {"prompt": "bad frontend tool", "toolNames": ["create_node"]},
+                make_settings(),
+            )
+        ]
+
+    payload = "".join(anyio.run(collect_events))
+
+    assert "TOL_CALL" not in payload
+    assert "TOOL_CALL" not in payload
+    assert '"content": "visible"' in payload
+
+
 def test_mimo_stream_hides_backend_tool_protocol(monkeypatch):
     responses = [
         '[BACKEND_TOOL_CALL] skill.search({"query":"validation"})',
         '完成\n[TOOL_CALL] preview_code({"targetAction":"main"})',
     ]
 
-    async def fake_post_mimo(body, _settings):
-        return {"content": [{"type": "text", "text": responses.pop(0)}]}
+    async def fake_stream_post_mimo(_body, _settings):
+        yield {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": responses.pop(0)},
+        }
+        yield {"type": "message_stop"}
 
-    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
 
     async def collect_events():
         return [
@@ -266,17 +542,22 @@ def test_mimo_stream_hides_backend_tool_protocol(monkeypatch):
 
 
 def test_mimo_stream_loop_limit_reports_error_code(monkeypatch):
-    async def fake_post_mimo(body, _settings):
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": '[BACKEND_TOOL_CALL] mcp.search({"query":"again"})',
-                }
-            ]
+    async def fake_stream_post_mimo(_body, _settings):
+        yield {
+            "type": "content_block_delta",
+            "delta": {
+                "type": "text_delta",
+                "text": '[BACKEND_TOOL_CALL] mcp.search({"query":"again"})',
+            },
         }
+        yield {"type": "message_stop"}
 
-    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
 
     async def collect_events():
         return [
@@ -291,6 +572,68 @@ def test_mimo_stream_loop_limit_reports_error_code(monkeypatch):
 
     assert '"success": false' in payload
     assert "BACKEND_TOOL_LOOP_LIMIT" in payload
+
+
+def test_mimo_stream_error_event_returns_structured_code(monkeypatch):
+    async def fake_stream_post_mimo(_body, _settings):
+        yield {
+            "type": "error",
+            "error": {"type": "upstream_error", "message": "stream broke"},
+        }
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {"prompt": "stream", "toolNames": []},
+                make_settings(),
+            )
+        ]
+
+    complete = sse_payloads(anyio.run(collect_events))[-1]
+
+    assert complete["success"] is False
+    assert complete["code"] == "MIMO_STREAM_ERROR"
+    assert "stream broke" in complete["error"]
+
+
+def test_mimo_sse_parser_supports_multiline_data_and_event_fallback():
+    async def collect():
+        lines = [
+            "event: content_block_delta",
+            'data: {"delta":{"type":"text_delta",',
+            'data: "text":"hello"}}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        return [event async for event in iter_sse_events(_aiter(lines))]
+
+    events = anyio.run(collect)
+
+    assert events == [
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hello"},
+        }
+    ]
+
+
+def test_mimo_sse_parser_invalid_json_is_structured():
+    async def collect():
+        return [event async for event in iter_sse_events(_aiter(["data: {bad", ""]))]
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(collect)
+
+    assert exc_info.value.detail["code"] == "MIMO_RESPONSE_INVALID"
 
 
 def test_mimo_backend_tool_loop_limit(monkeypatch):
@@ -315,6 +658,83 @@ def test_mimo_backend_tool_loop_limit(monkeypatch):
 
     assert getattr(exc_info.value, "status_code", None) == 502
     assert exc_info.value.detail["code"] == "BACKEND_TOOL_LOOP_LIMIT"
+
+
+def test_mimo_timeout_error_is_structured(monkeypatch):
+    async def fake_post(self, *args, **kwargs):
+        raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(
+            mimo_provider.call_mimo,
+            {"prompt": "hello", "toolNames": []},
+            make_settings(),
+        )
+
+    assert exc_info.value.detail["code"] == "MIMO_UPSTREAM_TIMEOUT"
+
+
+def test_mimo_network_error_is_structured(monkeypatch):
+    async def fake_post(self, *args, **kwargs):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(
+            mimo_provider.call_mimo,
+            {"prompt": "hello", "toolNames": []},
+            make_settings(),
+        )
+
+    assert exc_info.value.detail["code"] == "MIMO_UPSTREAM_NETWORK_ERROR"
+
+
+def test_mimo_invalid_json_response_is_structured(monkeypatch):
+    class BadJsonResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("bad json")
+
+    async def fake_post(self, *args, **kwargs):
+        return BadJsonResponse()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(
+            mimo_provider.call_mimo,
+            {"prompt": "hello", "toolNames": []},
+            make_settings(),
+        )
+
+    assert exc_info.value.detail["code"] == "MIMO_RESPONSE_INVALID"
+
+
+def test_mimo_image_support_uses_models_image_whitelist(monkeypatch):
+    monkeypatch.setattr(
+        mimo_provider,
+        "MIMO_IMAGE_MODELS",
+        frozenset({"new-image-model"}),
+        raising=False,
+    )
+
+    mimo_provider._reject_unsupported_images(
+        {"images": [{"data": "abc"}]},
+        "new-image-model",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        mimo_provider._reject_unsupported_images(
+            {"images": [{"data": "abc"}]},
+            "text-only-model",
+        )
+
+    assert exc_info.value.detail["fallbackModel"] == "new-image-model"
 
 
 def test_mcp_call_tool_requires_configured_read_only_nested_tool():

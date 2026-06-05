@@ -5,7 +5,7 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
-import httpx
+import httpx  # noqa: F401 - keep mimo_provider.httpx monkeypatch compatibility
 from fastapi import HTTPException
 
 from .backend_tools import (
@@ -16,15 +16,29 @@ from .backend_tools import (
     extract_backend_tool_calls,
     format_backend_tool_results,
 )
-from .models import DESIGN_TOOLS
+from .mimo_http import post_mimo, stream_post_mimo
+from .mimo_protocol import (
+    clean_malformed_frontend_tool_text,
+    has_malformed_backend_tool_call,
+    has_malformed_frontend_tool_call,
+    malformed_backend_tool_result,
+    visible_text_chunks,
+)
+from .mimo_stream import (
+    event_usage,
+    extract_stop_reason,
+    merge_numeric_usage,
+    raise_for_stream_error_event,
+    stream_text_delta,
+)
+from .models import DESIGN_TOOLS, MIMO_IMAGE_MODELS
 from .tool_protocol import (
     clean_tool_protocol_text,
     extract_tool_calls,
     normalize_image_data,
 )
 
-_IMAGE_MODELS = {"mimo-v2.5"}
-_FALLBACK_IMAGE_MODEL = "mimo-v2.5"
+_MIMO_INCOMPLETE_CODE = "MIMO_RESPONSE_INCOMPLETE"
 _MIMO_BACKEND_TOOL_PROMPT = """Backend-only tools:
 - When you need ActionDesign component parameters, events, usage, or examples,
   first call [BACKEND_TOOL_CALL] knowledge.search({"query":"..."}).
@@ -53,57 +67,151 @@ async def call_mimo(req: Any, settings: Any) -> dict[str, Any]:
         extract_tool_calls(clean_backend_content),
         _allowed_tools(req),
     )
-    clean_content = _clean_final_content(content)
-    return _response(
+    if has_malformed_frontend_tool_call(clean_backend_content, parsed_tool_calls):
+        clean_content = clean_malformed_frontend_tool_text(clean_backend_content)
+        parsed_tool_calls = []
+    else:
+        clean_content = _clean_final_content(content)
+    success = bool(loop_result.get("success", True))
+    payload = _response(
         content=clean_content,
-        tool_calls=parsed_tool_calls,
-        success=True,
+        tool_calls=parsed_tool_calls if success else [],
+        success=success,
+        error=loop_result.get("error"),
         duration_ms=_duration_ms(started),
         usage=loop_result["usage"],
         model=model,
         provider="mimo",
     )
+    if loop_result.get("code"):
+        payload["code"] = loop_result["code"]
+    return payload
 
 
 async def stream_mimo(req: Any, settings: Any) -> AsyncIterator[str]:
     """Stream MiMo results while hiding backend-only tool protocol markers."""
     started = time.time()
     model = _model(req, settings)
-    _reject_unsupported_images(req, model)
-
+    usage: dict[str, Any] = {}
     try:
-        loop_result = await _run_mimo_agent_loop(req, settings, model)
-        full_text = loop_result["content"]
-        clean_backend_content = clean_backend_tool_protocol_text(full_text)
-        tool_calls = _filter_allowed(
-            extract_tool_calls(clean_backend_content),
-            _allowed_tools(req),
-        )
-        clean_content = _clean_final_content(full_text)
-        if clean_content:
-            yield _sse({"type": "text_delta", "content": clean_content})
-        yield _sse(
-            {
-                "type": "message_complete",
-                "content": clean_content,
-                "tool_calls": tool_calls,
-                "success": True,
-                "duration_ms": _duration_ms(started),
-                "usage": loop_result["usage"],
-                "model": model,
-                "provider": "mimo",
-            }
-        )
+        _reject_unsupported_images(req, model)
+        messages = _initial_messages(req)
+        system_prompt = _system_prompt(req)
+        max_turns = _max_backend_tool_turns(settings)
+        max_calls_per_turn = _max_backend_tool_calls_per_turn(settings)
+        allowed_tools = _allowed_tools(req)
+
+        for _ in range(max_turns):
+            body = _messages_body(
+                req,
+                settings,
+                model,
+                stream=True,
+                messages=messages,
+                system_prompt=system_prompt,
+            )
+            content_parts: list[str] = []
+            text_chunks: list[str] = []
+            turn_usage: dict[str, Any] = {}
+            stop_reason = ""
+
+            async for event in _stream_post_mimo(body, settings):
+                raise_for_stream_error_event(event)
+                turn_usage = merge_numeric_usage(turn_usage, event_usage(event))
+                stop_reason = extract_stop_reason(event) or stop_reason
+                text_delta = stream_text_delta(event)
+                if not text_delta:
+                    continue
+                content_parts.append(text_delta)
+                text_chunks.append(text_delta)
+
+            usage = _merge_usage(usage, turn_usage)
+            content = "".join(content_parts)
+            if stop_reason == "max_tokens":
+                yield _sse(
+                    _message_complete_payload(
+                        content=_clean_final_content(content),
+                        tool_calls=[],
+                        success=False,
+                        duration_ms=_duration_ms(started),
+                        usage=usage,
+                        model=model,
+                        code=_MIMO_INCOMPLETE_CODE,
+                        error="MiMo stopped before completion because max_tokens was reached",
+                    )
+                )
+                return
+
+            backend_calls = extract_backend_tool_calls(content)
+            malformed_backend_call = has_malformed_backend_tool_call(
+                content,
+                backend_calls,
+            )
+            if not backend_calls and not malformed_backend_call:
+                clean_backend_content = clean_backend_tool_protocol_text(content)
+                tool_calls = _filter_allowed(
+                    extract_tool_calls(clean_backend_content),
+                    allowed_tools,
+                )
+                if has_malformed_frontend_tool_call(
+                    clean_backend_content,
+                    tool_calls,
+                ):
+                    clean_content = clean_malformed_frontend_tool_text(
+                        clean_backend_content
+                    )
+                    tool_calls = []
+                else:
+                    clean_content = _clean_final_content(content)
+                for chunk in _stream_visible_chunks(text_chunks, clean_content):
+                    yield _sse({"type": "text_delta", "content": chunk})
+                yield _sse(
+                    _message_complete_payload(
+                        content=clean_content,
+                        tool_calls=tool_calls,
+                        success=True,
+                        duration_ms=_duration_ms(started),
+                        usage=usage,
+                        model=model,
+                    )
+                )
+                return
+
+            messages.append({"role": "assistant", "content": content})
+            if malformed_backend_call:
+                results = [malformed_backend_tool_result()]
+            else:
+                limited_calls = backend_calls[:max_calls_per_turn]
+                results = await execute_backend_tool_calls(limited_calls, settings)
+                if len(backend_calls) > max_calls_per_turn:
+                    results.append(
+                        BackendToolResult(
+                            name="backend.call_limit",
+                            status="failed",
+                            error="Too many backend tool calls in one turn",
+                            code="BACKEND_TOOL_CALL_LIMIT",
+                        )
+                    )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": format_backend_tool_results(results),
+                }
+            )
+
+        raise backend_tool_loop_limit_error()
     except Exception as exc:
+        code, error = _exception_code_and_message(exc)
         yield _sse(
             {
                 "type": "message_complete",
                 "content": "",
                 "tool_calls": [],
                 "success": False,
-                "error": str(exc),
+                "code": code,
+                "error": error,
                 "duration_ms": _duration_ms(started),
-                "usage": {},
+                "usage": usage,
                 "model": model,
                 "provider": "mimo",
             }
@@ -131,26 +239,41 @@ async def _run_mimo_agent_loop(
             system_prompt=system_prompt,
         )
         payload = await _post_mimo(body, settings)
-        if isinstance(payload.get("usage"), dict):
-            usage = payload["usage"]
+        usage = _merge_usage(usage, _payload_usage(payload))
 
         content = _extract_response_text(payload)
+        if extract_stop_reason(payload) == "max_tokens":
+            return {
+                "content": content,
+                "usage": usage,
+                "success": False,
+                "code": _MIMO_INCOMPLETE_CODE,
+                "error": "MiMo stopped before completion because max_tokens was reached",
+            }
+
         backend_calls = extract_backend_tool_calls(content)
-        if not backend_calls:
-            return {"content": content, "usage": usage}
+        malformed_backend_call = has_malformed_backend_tool_call(
+            content,
+            backend_calls,
+        )
+        if not backend_calls and not malformed_backend_call:
+            return {"content": content, "usage": usage, "success": True}
 
         messages.append({"role": "assistant", "content": content})
-        limited_calls = backend_calls[:max_calls_per_turn]
-        results = await execute_backend_tool_calls(limited_calls, settings)
-        if len(backend_calls) > max_calls_per_turn:
-            results.append(
-                BackendToolResult(
-                    name="backend.call_limit",
-                    status="failed",
-                    error="Too many backend tool calls in one turn",
-                    code="BACKEND_TOOL_CALL_LIMIT",
+        if malformed_backend_call:
+            results = [malformed_backend_tool_result()]
+        else:
+            limited_calls = backend_calls[:max_calls_per_turn]
+            results = await execute_backend_tool_calls(limited_calls, settings)
+            if len(backend_calls) > max_calls_per_turn:
+                results.append(
+                    BackendToolResult(
+                        name="backend.call_limit",
+                        status="failed",
+                        error="Too many backend tool calls in one turn",
+                        code="BACKEND_TOOL_CALL_LIMIT",
+                    )
                 )
-            )
         messages.append(
             {
                 "role": "user",
@@ -162,52 +285,75 @@ async def _run_mimo_agent_loop(
 
 
 async def _post_mimo(body: dict[str, Any], settings: Any) -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=_timeout(settings)) as client:
-            response = await client.post(
-                _base_url(settings),
-                headers=_headers(settings),
-                json=body,
-            )
-            response.raise_for_status()
-            payload = response.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "MIMO_UPSTREAM_ERROR",
-                "message": f"MiMo HTTP {exc.response.status_code}",
-            },
-        ) from exc
-    return payload if isinstance(payload, dict) else {}
+    return await post_mimo(body, settings)
 
 
-def _headers(settings: Any) -> dict[str, str]:
-    api_key = _setting(settings, "mimo_api_key", "api_key", default="")
-    if not api_key:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "MIMO_API_KEY_MISSING",
-                "message": "Set GXP_MIMO_API_KEY on the backend",
-            },
-        )
-    headers = {
-        "Content-Type": "application/json",
-        "anthropic-version": _setting(
-            settings,
-            "mimo_anthropic_version",
-            default="2023-06-01",
-        ),
+async def _stream_post_mimo(
+    body: dict[str, Any],
+    settings: Any,
+) -> AsyncIterator[dict[str, Any]]:
+    async for event in stream_post_mimo(body, settings):
+        yield event
+
+
+def _exception_code_and_message(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        code = str(exc.detail.get("code") or "MIMO_PROVIDER_ERROR")
+        message = str(exc.detail.get("message") or exc.detail.get("error") or "")
+        return code, message or code
+    return "MIMO_PROVIDER_ERROR", str(exc)
+
+
+def _message_complete_payload(
+    *,
+    content: str,
+    tool_calls: list[dict[str, Any]],
+    success: bool,
+    duration_ms: int,
+    usage: dict[str, Any],
+    model: str,
+    code: str = "",
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "message_complete",
+        "content": content,
+        "tool_calls": tool_calls,
+        "success": success,
+        "duration_ms": duration_ms,
+        "usage": usage,
+        "model": model,
+        "provider": "mimo",
     }
-    auth_mode = str(
-        _setting(settings, "mimo_auth_mode", "mimo_auth_type", default="api-key")
-    ).lower()
-    if auth_mode in {"bearer", "authorization", "auth-bearer"}:
-        headers["Authorization"] = f"Bearer {api_key}"
+    if code:
+        payload["code"] = code
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _payload_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usage")
+    return dict(usage) if isinstance(usage, dict) else {}
+
+
+def _merge_usage(
+    accumulated: dict[str, Any],
+    turn_usage: dict[str, Any],
+) -> dict[str, Any]:
+    if not turn_usage:
+        return accumulated
+
+    if accumulated and "turns" not in accumulated:
+        turns = [dict(accumulated)]
     else:
-        headers["api-key"] = api_key
-    return headers
+        turns = list(accumulated.get("turns") or [])
+    current = {key: value for key, value in accumulated.items() if key != "turns"}
+    merged = merge_numeric_usage(current, turn_usage)
+    turns.append(dict(turn_usage))
+    if len(turns) > 1:
+        merged["turns"] = turns
+    return merged
 
 
 def _messages_body(
@@ -296,14 +442,21 @@ def _message_content(req: Any) -> str | list[dict[str, Any]]:
 
 
 def _reject_unsupported_images(req: Any, model: str) -> None:
-    if _request_value(req, "images", default=[]) and model not in _IMAGE_MODELS:
+    if _request_value(req, "images", default=[]) and model not in MIMO_IMAGE_MODELS:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "MODEL_DOES_NOT_SUPPORT_IMAGES",
-                "fallbackModel": _FALLBACK_IMAGE_MODEL,
+                "fallbackModel": _fallback_image_model(),
             },
         )
+
+
+def _fallback_image_model() -> str:
+    default = "mimo-v2.5"
+    if default in MIMO_IMAGE_MODELS:
+        return default
+    return sorted(MIMO_IMAGE_MODELS)[0] if MIMO_IMAGE_MODELS else ""
 
 
 def _extract_response_text(payload: dict[str, Any]) -> str:
@@ -325,30 +478,6 @@ def _model(req: Any, settings: Any) -> str:
             default=_setting(settings, "mimo_default_model", default="mimo-v2.5"),
         )
         or _setting(settings, "mimo_default_model", default="mimo-v2.5")
-    )
-
-
-def _base_url(settings: Any) -> str:
-    return str(
-        _setting(
-            settings,
-            "mimo_api_url",
-            "mimo_base_url",
-            "mimo_messages_url",
-            default="https://api.xiaomimimo.com/anthropic/v1/messages",
-        )
-    )
-
-
-def _timeout(settings: Any) -> float:
-    return float(
-        _setting(
-            settings,
-            "mimo_timeout_seconds",
-            "mimo_timeout",
-            "request_timeout",
-            default=120.0,
-        )
     )
 
 
@@ -398,6 +527,13 @@ def _clean_final_content(content: str) -> str:
     return clean_tool_protocol_text(
         clean_backend_tool_protocol_text(content)
     ).strip()
+
+
+def _stream_visible_chunks(text_chunks: list[str], clean_content: str) -> list[str]:
+    safe_chunks, safe_visible = visible_text_chunks(text_chunks)
+    if safe_visible == clean_content:
+        return safe_chunks
+    return [clean_content] if clean_content else []
 
 
 def _sse(payload: dict[str, Any]) -> str:

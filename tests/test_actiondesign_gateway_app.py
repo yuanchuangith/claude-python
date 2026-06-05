@@ -134,7 +134,43 @@ def test_mimo_chat_route_forces_mimo_provider_with_consistent_response(
         "error": None,
         "duration_ms": 12,
         "usage": {"input_tokens": 1},
+        "code": None,
     }
+
+
+def test_mimo_chat_route_preserves_structured_error_code(tmp_path, monkeypatch):
+    async def fake_call_mimo(req, settings):
+        return {
+            "provider": "mimo",
+            "model": "mimo-v2.5",
+            "content": "",
+            "tool_calls": [],
+            "success": False,
+            "error": "MiMo stopped before completion because max_tokens was reached",
+            "code": "MIMO_RESPONSE_INCOMPLETE",
+            "duration_ms": 12,
+            "usage": {"input_tokens": 1},
+        }
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.app.call_mimo",
+        fake_call_mimo,
+    )
+    client = make_client(log_root=tmp_path, mimo_api_key="secret")
+
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        json={
+            "provider": "mimo",
+            "conversationId": "conv_mimo_code",
+            "prompt": "hello",
+            "toolNames": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is False
+    assert response.json()["code"] == "MIMO_RESPONSE_INCOMPLETE"
 
 
 def test_claude_code_chat_route_forces_claude_provider_with_same_shape(
@@ -179,8 +215,10 @@ def test_claude_code_chat_route_forces_claude_provider_with_same_shape(
         "error",
         "duration_ms",
         "usage",
+        "code",
     }
     assert body["provider"] == "claude-code"
+    assert body["code"] is None
     assert body["tool_calls"] == []
 
 

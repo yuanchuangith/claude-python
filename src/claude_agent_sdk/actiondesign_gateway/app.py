@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from .actiondesign_backend_executor import warm_knowledge_index
+from .backend_tools import BackendToolCall, BackendToolResult, execute_backend_tool_calls
 from .claude_code_provider import call_claude_code, stream_claude_code
 from .mimo_provider import call_mimo, stream_mimo
 from .models import MIMO_MODELS, AgentChatRequest, AgentChatResponse, ToolResultRequest
@@ -76,6 +77,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mimo = {
             "status": "ready" if gateway_settings.mimo_api_key else "unavailable",
             "defaultModel": gateway_settings.mimo_default_model,
+            "chatPath": "/api/actiondesign-agent/mimo/chat",
+            "streamPath": "/api/actiondesign-agent/mimo/chat/stream",
+            "supportsGenericChat": False,
             "models": mimo_models,
         }
         if not gateway_settings.mimo_api_key:
@@ -86,6 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if gateway_settings.claude_code_enabled
             else "unavailable",
             "defaultModel": gateway_settings.claude_code_default_model,
+            "chatPath": "/api/actiondesign-agent/claude-code/chat",
+            "streamPath": "/api/actiondesign-agent/claude-code/chat/stream",
+            "supportsGenericChat": False,
             "models": [],
         }
         if not gateway_settings.claude_code_enabled:
@@ -94,6 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "defaultProvider": gateway_settings.default_provider,
             "defaultModel": gateway_settings.mimo_default_model,
+            "supportsGenericChat": False,
             "providers": {
                 "mimo": mimo,
                 "claude-code": claude_code,
@@ -153,14 +161,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "message": "knowledge search requires query",
                 },
             )
-        store = _knowledge_store_or_503(gateway_settings)
-        results = store.search(
-            query,
-            limit=int(payload.get("limit") or gateway_settings.knowledge_max_results),
-            max_chars_per_item=gateway_settings.knowledge_max_chars_per_item,
-            max_context_chars=gateway_settings.knowledge_max_context_chars,
+        result = await _execute_public_knowledge_tool(
+            gateway_settings,
+            BackendToolCall(
+                name="knowledge.search",
+                arguments={
+                    "query": query,
+                    "limit": payload.get("limit")
+                    or gateway_settings.knowledge_max_results,
+                    "maxCharsPerItem": payload.get("maxCharsPerItem")
+                    or payload.get("max_chars_per_item")
+                    or gateway_settings.knowledge_max_chars_per_item,
+                    "maxContextChars": payload.get("maxContextChars")
+                    or payload.get("max_context_chars")
+                    or gateway_settings.knowledge_max_context_chars,
+                },
+            ),
         )
-        return {"query": query, "results": results}
+        return _public_knowledge_result_or_raise(result)
 
     @app.post("/api/actiondesign-agent/knowledge/read")
     async def read_knowledge(payload: dict) -> dict:
@@ -173,25 +191,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "message": "knowledge read requires path",
                 },
             )
-        store = _knowledge_store_or_503(gateway_settings)
-        try:
-            return store.read(
-                path=path,
-                heading=str(payload.get("heading") or "").strip(),
-                max_chars=int(
-                    payload.get("maxChars")
+        result = await _execute_public_knowledge_tool(
+            gateway_settings,
+            BackendToolCall(
+                name="knowledge.read",
+                arguments={
+                    "path": path,
+                    "heading": str(payload.get("heading") or "").strip(),
+                    "maxChars": payload.get("maxChars")
                     or payload.get("max_chars")
-                    or gateway_settings.knowledge_max_chars_per_item
-                ),
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "code": "KNOWLEDGE_NOT_FOUND",
-                    "message": f"Knowledge file not found: {path}",
+                    or gateway_settings.knowledge_max_chars_per_item,
                 },
-            ) from exc
+            ),
+        )
+        return _public_knowledge_result_or_raise(result)
 
     @app.post(
         "/api/actiondesign-agent/mimo/chat",
@@ -319,6 +332,41 @@ def _knowledge_store_or_503(settings: Settings):
             },
         )
     return store
+
+
+async def _execute_public_knowledge_tool(
+    settings: Settings,
+    call: BackendToolCall,
+) -> BackendToolResult:
+    results = await execute_backend_tool_calls([call], settings)
+    return results[0]
+
+
+def _public_knowledge_result_or_raise(result: BackendToolResult) -> dict:
+    if result.status == "success":
+        return result.result if isinstance(result.result, dict) else {"result": result.result}
+
+    code = result.code or "KNOWLEDGE_TOOL_FAILED"
+    if code in {
+        "KNOWLEDGE_QUERY_REQUIRED",
+        "KNOWLEDGE_PATH_REQUIRED",
+        "KNOWLEDGE_PATH_FORBIDDEN",
+        "BACKEND_TOOL_ARGUMENTS_INVALID",
+    }:
+        status_code = 400
+    elif code == "KNOWLEDGE_NOT_FOUND":
+        status_code = 404
+    elif code == "KNOWLEDGE_ROOT_NOT_CONFIGURED":
+        status_code = 503
+    else:
+        status_code = 502
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": result.error or f"{result.name} failed",
+        },
+    )
 
 
 def _upload_path(uploaded: UploadFile, path_override: str | None = None) -> str:
