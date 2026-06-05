@@ -32,6 +32,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+actiondesign = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "httpx>=0.27.0",
+    "python-multipart>=0.0.9",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.20.0",
