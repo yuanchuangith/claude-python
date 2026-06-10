@@ -1,3 +1,5 @@
+import json
+
 import anyio
 import pytest
 
@@ -14,6 +16,10 @@ from claude_agent_sdk.actiondesign_gateway.tool_protocol import (
     flush_pending,
     normalize_image_data,
 )
+
+
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_extracts_typo_tool_call_marker():
@@ -220,6 +226,69 @@ def test_claude_code_executes_backend_tool_loop_then_returns_frontend_tool(
     assert "BACKEND_TOOL_CALL" not in response["content"]
 
 
+def test_claude_code_full_conversation_log_records_model_and_backend_tool_events(
+    tmp_path,
+    monkeypatch,
+):
+    responses = [
+        '[BACKEND_TOOL_CALL] knowledge.search({"query":"required validation"})',
+        "final answer",
+    ]
+
+    class FakeBackendExecutor:
+        async def execute(self, call):
+            from claude_agent_sdk.actiondesign_gateway.backend_tools import (
+                BackendToolResult,
+            )
+
+            return BackendToolResult(
+                name=call.name,
+                status="success",
+                result={"results": [{"heading": "NullCondition"}]},
+            )
+
+    async def fake_query(prompt, options):
+        yield AssistantMessage(content=[TextBlock(responses.pop(0))], model="test")
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.claude_code_provider.query",
+        fake_query,
+    )
+
+    response = anyio.run(
+        call_claude_code,
+        {
+            "prompt": "build validation flow",
+            "conversationId": "conv_claude_provider",
+            "runId": "run_claude",
+            "toolNames": [],
+        },
+        Settings(
+            log_root=None,
+            backend_tool_executor=FakeBackendExecutor(),
+            claude_code_max_backend_tool_turns=4,
+            claude_code_max_backend_tool_calls_per_turn=2,
+            full_conversation_log_enabled=True,
+            full_conversation_log_root=tmp_path,
+        ),
+    )
+
+    assert response["content"] == "final answer"
+    events = read_jsonl(tmp_path / "conv_claude_provider.jsonl")
+    assert [event["type"] for event in events] == [
+        "model_turn",
+        "backend_tool_call",
+        "backend_tool_result",
+        "model_turn",
+    ]
+    assert events[0]["provider"] == "claude-code"
+    assert events[0]["runId"] == "run_claude"
+    assert events[1]["toolName"] == "knowledge.search"
+    assert events[1]["arguments"] == {"query": "required validation"}
+    assert events[2]["status"] == "success"
+    assert events[3]["content"] == "final answer"
+
+
 def test_claude_code_internal_tools_can_be_configured_without_auto_allow(monkeypatch):
     captured = {}
 
@@ -245,6 +314,53 @@ def test_claude_code_internal_tools_can_be_configured_without_auto_allow(monkeyp
     assert response["success"] is True
     assert captured["options"].tools == ["Read"]
     assert captured["options"].allowed_tools == []
+
+
+def test_claude_code_uses_mimo_default_model_when_unconfigured(monkeypatch):
+    captured = {}
+
+    async def fake_query(prompt, options):
+        captured["options"] = options
+        yield AssistantMessage(content=[TextBlock("ok")], model="test")
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.claude_code_provider.query",
+        fake_query,
+    )
+
+    response = anyio.run(
+        call_claude_code,
+        {"prompt": "use default model", "toolNames": []},
+        Settings(log_root=None, mimo_default_model="mimo-v2.5-pro"),
+    )
+
+    assert captured["options"].model == "mimo-v2.5-pro"
+    assert response["model"] == "mimo-v2.5-pro"
+
+
+def test_claude_code_uses_first_configured_mimo_model_as_default(monkeypatch):
+    captured = {}
+
+    async def fake_query(prompt, options):
+        captured["options"] = options
+        yield AssistantMessage(content=[TextBlock("ok")], model="test")
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.claude_code_provider.query",
+        fake_query,
+    )
+
+    response = anyio.run(
+        call_claude_code,
+        {"prompt": "use default model", "toolNames": []},
+        Settings(
+            log_root=None,
+            claude_code_models=["mimo-v2.5-pro", "mimo-v2.5"],
+        ),
+    )
+
+    assert captured["options"].model == "mimo-v2.5-pro"
+    assert response["model"] == "mimo-v2.5-pro"
 
 
 def test_claude_code_stream_does_not_duplicate_single_text_tool_call(monkeypatch):

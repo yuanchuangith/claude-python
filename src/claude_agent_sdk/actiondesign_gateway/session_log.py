@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import secrets
 import time
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from fastapi import HTTPException
 
 from .redaction import redact_value, safe_conversation_id
 
@@ -31,6 +35,65 @@ def append_log(
     log_payload = redact_value(model_to_dict(payload))
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(log_payload, ensure_ascii=False, default=str))
+        handle.write("\n")
+
+
+def conversation_log_enabled(settings: "Settings | Any") -> bool:
+    return bool(getattr(settings, "full_conversation_log_enabled", False))
+
+
+def generate_conversation_id() -> str:
+    return f"conv_server_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+
+
+def resolve_conversation_id(request: Any, body: Any) -> str:
+    header_value = _header_value(request, "X-Conversation-Id")
+    body_value = _value(body, "conversationId", "conversation_id")
+    candidate = _normalize_id(header_value) or _normalize_id(body_value)
+    if not candidate:
+        candidate = generate_conversation_id()
+    return safe_conversation_id(candidate)
+
+
+def require_run_id_for_full_log(settings: "Settings | Any", req: Any) -> str:
+    run_id = str(_value(req, "runId", "run_id", default="") or "").strip()
+    if conversation_log_enabled(settings) and not run_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "RUN_ID_REQUIRED",
+                "message": "runId is required when full conversation logging is enabled",
+            },
+        )
+    return run_id
+
+
+def append_conversation_event(
+    settings: "Settings | Any",
+    conversation_id: str,
+    event: Any,
+) -> None:
+    if not conversation_log_enabled(settings):
+        return
+
+    safe_id = safe_conversation_id(conversation_id)
+    root = Path(
+        getattr(
+            settings,
+            "full_conversation_log_root",
+            Path("logs/actiondesign-agent"),
+        )
+    )
+    log_path = root / f"{safe_id}.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = model_to_dict(event)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    payload.setdefault("conversationId", safe_id)
+    payload.setdefault("time", _iso_time())
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, default=str))
         handle.write("\n")
 
 
@@ -61,6 +124,31 @@ def model_to_dict(value: Any) -> Any:
             if not key.startswith("_")
         }
     return value
+
+
+def _header_value(request: Any, name: str) -> str:
+    headers = getattr(request, "headers", None)
+    if not headers:
+        return ""
+    value = headers.get(name) if hasattr(headers, "get") else None
+    return str(value or "")
+
+
+def _value(obj: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if isinstance(obj, Mapping) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _normalize_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _iso_time() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class ToolResultStore:

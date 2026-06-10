@@ -54,3 +54,6 @@ htmlcov/
 dmypy.json
 .pyre/
 .claude/worktrees/
+
+# Logs
+debug_log/

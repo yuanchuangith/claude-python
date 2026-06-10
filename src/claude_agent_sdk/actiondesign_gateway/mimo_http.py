@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException
@@ -116,14 +117,30 @@ def headers(settings: Any) -> dict[str, str]:
 
 
 def base_url(settings: Any) -> str:
-    return str(
+    configured = str(
         setting(
             settings,
+            "mimo_messages_url",
             "mimo_api_url",
             "mimo_base_url",
-            "mimo_messages_url",
-            default="https://api.xiaomimimo.com/anthropic/v1/messages",
+            default="https://token-plan-cn.xiaomimimo.com/anthropic",
         )
+    )
+    return normalize_messages_url(configured)
+
+
+def normalize_messages_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    if not url:
+        return "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/messages"):
+        return urlunsplit(parsed._replace(path=path))
+
+    return urlunsplit(
+        parsed._replace(path=f"{path}/v1/messages" if path else "/v1/messages")
     )
 
 

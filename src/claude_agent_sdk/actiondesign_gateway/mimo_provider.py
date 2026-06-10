@@ -15,6 +15,7 @@ from .backend_tools import (
     execute_backend_tool_calls,
     extract_backend_tool_calls,
     format_backend_tool_results,
+    frontend_tool_misuse_result,
 )
 from .mimo_http import post_mimo, stream_post_mimo
 from .mimo_protocol import (
@@ -32,6 +33,7 @@ from .mimo_stream import (
     stream_text_delta,
 )
 from .models import DESIGN_TOOLS, MIMO_IMAGE_MODELS
+from .session_log import append_conversation_event, model_to_dict
 from .tool_protocol import (
     clean_tool_protocol_text,
     extract_tool_calls,
@@ -48,6 +50,7 @@ _MIMO_BACKEND_TOOL_PROMPT = """Backend-only tools:
 - Available backend tool namespaces are knowledge.*, mcp.*, and skill.*.
 - Backend tool calls are executed only by the backend and must never be shown to the frontend.
 - Do not use [BACKEND_TOOL_CALL] for ActionDesign canvas operations.
+- get_element_detail, list_elements, get_page_actions, propose_plan, create_node, insert_node, delete_node, and preview_code are frontend tools and must never be used with [BACKEND_TOOL_CALL].
 
 ActionDesign frontend tools:
 - Final answers should only use [TOOL_CALL] tool_name({...}) for ActionDesign frontend tools such as create_node, preview_code, and propose_plan.
@@ -127,6 +130,20 @@ async def stream_mimo(req: Any, settings: Any) -> AsyncIterator[str]:
 
             usage = _merge_usage(usage, turn_usage)
             content = "".join(content_parts)
+            backend_calls = extract_backend_tool_calls(content)
+            malformed_backend_call = has_malformed_backend_tool_call(
+                content,
+                backend_calls,
+            )
+            _log_model_turn(
+                req,
+                settings,
+                model,
+                content,
+                stop_reason,
+                turn_usage,
+                bool(backend_calls or malformed_backend_call),
+            )
             if stop_reason == "max_tokens":
                 yield _sse(
                     _message_complete_payload(
@@ -142,11 +159,6 @@ async def stream_mimo(req: Any, settings: Any) -> AsyncIterator[str]:
                 )
                 return
 
-            backend_calls = extract_backend_tool_calls(content)
-            malformed_backend_call = has_malformed_backend_tool_call(
-                content,
-                backend_calls,
-            )
             if not backend_calls and not malformed_backend_call:
                 clean_backend_content = clean_backend_tool_protocol_text(content)
                 tool_calls = _filter_allowed(
@@ -179,19 +191,15 @@ async def stream_mimo(req: Any, settings: Any) -> AsyncIterator[str]:
 
             messages.append({"role": "assistant", "content": content})
             if malformed_backend_call:
-                results = [malformed_backend_tool_result()]
+                results = [_malformed_backend_tool_result(content, backend_calls)]
+                _log_backend_tool_results(req, settings, results)
             else:
-                limited_calls = backend_calls[:max_calls_per_turn]
-                results = await execute_backend_tool_calls(limited_calls, settings)
-                if len(backend_calls) > max_calls_per_turn:
-                    results.append(
-                        BackendToolResult(
-                            name="backend.call_limit",
-                            status="failed",
-                            error="Too many backend tool calls in one turn",
-                            code="BACKEND_TOOL_CALL_LIMIT",
-                        )
-                    )
+                results = await _execute_backend_tool_calls_with_log(
+                    req,
+                    settings,
+                    backend_calls,
+                    max_calls_per_turn,
+                )
             messages.append(
                 {
                     "role": "user",
@@ -239,10 +247,26 @@ async def _run_mimo_agent_loop(
             system_prompt=system_prompt,
         )
         payload = await _post_mimo(body, settings)
-        usage = _merge_usage(usage, _payload_usage(payload))
+        turn_usage = _payload_usage(payload)
+        usage = _merge_usage(usage, turn_usage)
 
         content = _extract_response_text(payload)
-        if extract_stop_reason(payload) == "max_tokens":
+        stop_reason = extract_stop_reason(payload)
+        backend_calls = extract_backend_tool_calls(content)
+        malformed_backend_call = has_malformed_backend_tool_call(
+            content,
+            backend_calls,
+        )
+        _log_model_turn(
+            req,
+            settings,
+            model,
+            content,
+            stop_reason,
+            turn_usage,
+            bool(backend_calls or malformed_backend_call),
+        )
+        if stop_reason == "max_tokens":
             return {
                 "content": content,
                 "usage": usage,
@@ -251,29 +275,20 @@ async def _run_mimo_agent_loop(
                 "error": "MiMo stopped before completion because max_tokens was reached",
             }
 
-        backend_calls = extract_backend_tool_calls(content)
-        malformed_backend_call = has_malformed_backend_tool_call(
-            content,
-            backend_calls,
-        )
         if not backend_calls and not malformed_backend_call:
             return {"content": content, "usage": usage, "success": True}
 
         messages.append({"role": "assistant", "content": content})
         if malformed_backend_call:
-            results = [malformed_backend_tool_result()]
+            results = [_malformed_backend_tool_result(content, backend_calls)]
+            _log_backend_tool_results(req, settings, results)
         else:
-            limited_calls = backend_calls[:max_calls_per_turn]
-            results = await execute_backend_tool_calls(limited_calls, settings)
-            if len(backend_calls) > max_calls_per_turn:
-                results.append(
-                    BackendToolResult(
-                        name="backend.call_limit",
-                        status="failed",
-                        error="Too many backend tool calls in one turn",
-                        code="BACKEND_TOOL_CALL_LIMIT",
-                    )
-                )
+            results = await _execute_backend_tool_calls_with_log(
+                req,
+                settings,
+                backend_calls,
+                max_calls_per_turn,
+            )
         messages.append(
             {
                 "role": "user",
@@ -523,6 +538,117 @@ def _response(**payload: Any) -> dict[str, Any]:
     return payload
 
 
+async def _execute_backend_tool_calls_with_log(
+    req: Any,
+    settings: Any,
+    backend_calls: list[Any],
+    max_calls_per_turn: int,
+) -> list[BackendToolResult]:
+    limited_calls = backend_calls[:max_calls_per_turn]
+    _log_backend_tool_calls(req, settings, limited_calls)
+    results = await execute_backend_tool_calls(limited_calls, settings)
+    if len(backend_calls) > max_calls_per_turn:
+        results.append(
+            BackendToolResult(
+                name="backend.call_limit",
+                status="failed",
+                error="Too many backend tool calls in one turn",
+                code="BACKEND_TOOL_CALL_LIMIT",
+            )
+        )
+    _log_backend_tool_results(req, settings, results)
+    return results
+
+
+def _log_model_turn(
+    req: Any,
+    settings: Any,
+    model: str,
+    content: str,
+    stop_reason: str,
+    usage: dict[str, Any],
+    has_backend_tool_call: bool,
+) -> None:
+    conversation_id = _conversation_id(req)
+    frontend_tool_calls = _frontend_tool_calls(content, req)
+    append_conversation_event(
+        settings,
+        conversation_id,
+        {
+            "type": "model_turn",
+            "conversationId": conversation_id,
+            "runId": _run_id(req),
+            "provider": "mimo",
+            "model": model,
+            "content": content,
+            "stopReason": stop_reason,
+            "usage": usage,
+            "hasBackendToolCall": has_backend_tool_call,
+            "frontendToolCallCount": len(frontend_tool_calls),
+            "frontendToolCallNames": [
+                str(call.get("name") or "") for call in frontend_tool_calls
+            ],
+            "contentDiagnostics": _content_diagnostics(
+                content,
+                frontend_tool_calls,
+            ),
+        },
+    )
+
+
+def _log_backend_tool_calls(
+    req: Any,
+    settings: Any,
+    calls: list[Any],
+) -> None:
+    conversation_id = _conversation_id(req)
+    for call in calls:
+        append_conversation_event(
+            settings,
+            conversation_id,
+            {
+                "type": "backend_tool_call",
+                "conversationId": conversation_id,
+                "runId": _run_id(req),
+                "provider": "mimo",
+                "toolName": call.name,
+                "arguments": model_to_dict(call.arguments),
+            },
+        )
+
+
+def _log_backend_tool_results(
+    req: Any,
+    settings: Any,
+    results: list[BackendToolResult],
+) -> None:
+    conversation_id = _conversation_id(req)
+    for result in results:
+        append_conversation_event(
+            settings,
+            conversation_id,
+            {
+                "type": "backend_tool_result",
+                "conversationId": conversation_id,
+                "runId": _run_id(req),
+                "provider": "mimo",
+                "toolName": result.name,
+                "status": result.status,
+                "code": result.code,
+                "error": result.error,
+                "result": model_to_dict(result.result),
+            },
+        )
+
+
+def _conversation_id(req: Any) -> str:
+    return str(_request_value(req, "conversationId", "conversation_id", default="") or "")
+
+
+def _run_id(req: Any) -> str:
+    return str(_request_value(req, "runId", "run_id", default="") or "")
+
+
 def _clean_final_content(content: str) -> str:
     return clean_tool_protocol_text(
         clean_backend_tool_protocol_text(content)
@@ -538,6 +664,46 @@ def _stream_visible_chunks(text_chunks: list[str], clean_content: str) -> list[s
 
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(_response(**payload), ensure_ascii=False)}\n\n"
+
+
+def _malformed_backend_tool_result(
+    content: str,
+    backend_calls: list[Any],
+) -> BackendToolResult:
+    return frontend_tool_misuse_result(content, backend_calls) or malformed_backend_tool_result()
+
+
+def _frontend_tool_calls(content: str, req: Any) -> list[dict[str, Any]]:
+    return _filter_allowed(extract_tool_calls(content), _allowed_tools(req))
+
+
+def _content_diagnostics(
+    content: str,
+    frontend_tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "containsControlCharacters": _contains_control_characters(content),
+        "containsMalformedFrontendToolCall": _contains_malformed_frontend_tool_call(
+            content,
+            frontend_tool_calls,
+        ),
+    }
+
+
+def _contains_control_characters(content: str) -> bool:
+    return any(
+        ord(char) < 32 and char not in {"\t", "\n", "\r"} for char in content
+    )
+
+
+def _contains_malformed_frontend_tool_call(
+    content: str,
+    frontend_tool_calls: list[dict[str, Any]],
+) -> bool:
+    if has_malformed_frontend_tool_call(content, frontend_tool_calls):
+        return True
+    cleaned = clean_tool_protocol_text(content)
+    return "[TOOL_CALL]" in cleaned or "[TOL_CALL]" in cleaned
 
 
 def _duration_ms(started: float) -> int:

@@ -95,6 +95,18 @@ class Settings(BaseModel):
             else Path("debug_logs/actiondesign-agent")
         )
     )
+    full_conversation_log_enabled: bool = Field(
+        default_factory=lambda: _env_bool(
+            "ACTIONDESIGN_FULL_CONVERSATION_LOG",
+            True,
+        )
+    )
+    full_conversation_log_root: Path = Field(
+        default_factory=lambda: _env_path(
+            "ACTIONDESIGN_FULL_CONVERSATION_LOG_ROOT",
+            Path("logs/actiondesign-agent"),
+        )
+    )
     allow_origins: list[str] = Field(default_factory=_env_origins)
     mimo_api_key: str = Field(
         default_factory=lambda: _first_env(
@@ -106,7 +118,7 @@ class Settings(BaseModel):
         default_factory=lambda: _first_env(
             "GXP_MIMO_MESSAGES_URL",
             "MODEL_MIMO_URL",
-            default="https://api.xiaomimimo.com/anthropic/v1/messages",
+            default="https://token-plan-cn.xiaomimimo.com/anthropic",
         )
     )
     mimo_default_model: str = Field(
@@ -129,6 +141,12 @@ class Settings(BaseModel):
     )
     claude_code_default_model: str = Field(
         default_factory=lambda: _first_env("CLAUDE_CODE_DEFAULT_MODEL")
+    )
+    claude_code_models: list[str] = Field(
+        default_factory=lambda: _env_csv(
+            "CLAUDE_CODE_MODELS",
+            [],
+        )
     )
     claude_code_timeout_seconds: float = Field(
         default_factory=lambda: _env_float("CLAUDE_CODE_TIMEOUT_SECONDS", 300.0)
@@ -264,6 +282,11 @@ class Settings(BaseModel):
         def _split_internal_tools_v2(cls, value: Any) -> Any:
             return _split_csv(value)
 
+        @field_validator("claude_code_models", mode="before")
+        @classmethod
+        def _split_claude_code_models_v2(cls, value: Any) -> Any:
+            return _split_csv(value)
+
         @field_validator("mcp_read_only_tool_names", mode="before")
         @classmethod
         def _split_read_only_mcp_tools_v2(cls, value: Any) -> Any:
@@ -273,6 +296,10 @@ class Settings(BaseModel):
 
         @validator("claude_code_internal_tools", pre=True)
         def _split_internal_tools_v1(cls, value: Any) -> Any:
+            return _split_csv(value)
+
+        @validator("claude_code_models", pre=True)
+        def _split_claude_code_models_v1(cls, value: Any) -> Any:
             return _split_csv(value)
 
         @validator("mcp_read_only_tool_names", pre=True)

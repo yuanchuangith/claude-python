@@ -1,21 +1,34 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+import time
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .actiondesign_backend_executor import warm_knowledge_index
 from .backend_tools import BackendToolCall, BackendToolResult, execute_backend_tool_calls
 from .claude_code_provider import call_claude_code, stream_claude_code
 from .mimo_provider import call_mimo, stream_mimo
-from .models import MIMO_MODELS, AgentChatRequest, AgentChatResponse, ToolResultRequest
+from .models import (
+    MIMO_MODELS,
+    AgentChatRequest,
+    AgentChatResponse,
+    ToolResultRequest,
+)
 from .qdrant_knowledge_store import qdrant_knowledge_store_from_settings
 from .redaction import safe_conversation_id
-from .session_log import ToolResultStore
+from .session_log import (
+    ToolResultStore,
+    append_conversation_event,
+    model_to_dict,
+    require_run_id_for_full_log,
+    resolve_conversation_id,
+)
 from .settings import Settings
 
 
@@ -25,6 +38,72 @@ def _allow_origins(value: str | Sequence[str]) -> list[str]:
     if value == "*":
         return ["*"]
     return [origin.strip() for origin in value.split(",") if origin.strip()]
+
+
+def _claude_code_models(settings: Settings) -> list[dict]:
+    configured_model_ids = [
+        str(model).strip()
+        for model in (getattr(settings, "claude_code_models", None) or [])
+        if str(model).strip()
+    ]
+    if configured_model_ids:
+        model_ids = configured_model_ids
+    else:
+        model_ids = list(MIMO_MODELS)
+    default_model = str(
+        getattr(settings, "claude_code_default_model", "") or ""
+    ).strip()
+    if default_model and default_model not in model_ids:
+        model_ids = [default_model, *model_ids]
+    models: list[dict] = []
+    seen: set[str] = set()
+    for model_id in model_ids:
+        model_id = str(model_id).strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        metadata = MIMO_MODELS.get(
+            model_id,
+            {
+                "name": model_id,
+                "supportsImages": False,
+            },
+        )
+        models.append(
+            {
+                "id": model_id,
+                "name": metadata["name"],
+                "provider": "claude-code",
+                "supportsImages": bool(metadata.get("supportsImages", False)),
+                "supportsTextToolProtocol": True,
+                "supportsNativeTools": True,
+                "supportsThinking": False,
+            }
+        )
+    return models
+
+
+def _first_model_id(models: list[dict]) -> str:
+    if not models:
+        return ""
+    return str(models[0].get("id") or "")
+
+
+def _resolved_request_model(
+    req: AgentChatRequest,
+    settings: Settings,
+    provider: Literal["mimo", "claude-code"],
+) -> str:
+    if req.model:
+        return req.model
+    if provider == "mimo":
+        return settings.mimo_default_model or "mimo-v2.5"
+    return (
+        settings.claude_code_default_model
+        or _first_model_id(_claude_code_models(settings))
+        or settings.mimo_default_model
+        or "mimo-v2.5"
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -85,15 +164,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not gateway_settings.mimo_api_key:
             mimo["error"] = "Missing GXP_MIMO_API_KEY or MODEL_MIMO_KEY"
 
+        claude_code_models = _claude_code_models(gateway_settings)
+        claude_code_default_model = (
+            gateway_settings.claude_code_default_model
+            or _first_model_id(claude_code_models)
+        )
         claude_code = {
             "status": "ready"
             if gateway_settings.claude_code_enabled
             else "unavailable",
-            "defaultModel": gateway_settings.claude_code_default_model,
+            "defaultModel": claude_code_default_model,
             "chatPath": "/api/actiondesign-agent/claude-code/chat",
             "streamPath": "/api/actiondesign-agent/claude-code/chat/stream",
             "supportsGenericChat": False,
-            "models": [],
+            "models": claude_code_models,
         }
         if not gateway_settings.claude_code_enabled:
             claude_code["error"] = "CLAUDE_CODE_PROVIDER_ENABLED=false"
@@ -210,7 +294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/actiondesign-agent/mimo/chat",
         response_model=AgentChatResponse,
     )
-    async def mimo_chat(req: AgentChatRequest, request: Request) -> AgentChatResponse:
+    async def mimo_chat(req: AgentChatRequest, request: Request) -> JSONResponse:
         return await _chat(req, request, "mimo")
 
     @app.post(
@@ -219,7 +303,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def claude_code_chat(
         req: AgentChatRequest, request: Request
-    ) -> AgentChatResponse:
+    ) -> JSONResponse:
         return await _chat(req, request, "claude-code")
 
     @app.post("/api/actiondesign-agent/mimo/chat/stream")
@@ -236,11 +320,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/actiondesign-agent/tool-result")
     async def receive_tool_result(req: ToolResultRequest, request: Request) -> dict:
-        conversation_id = (
-            request.headers.get("X-Conversation-Id") or req.conversation_id
-        )
-        safe_conversation_id(conversation_id)
+        conversation_id = resolve_conversation_id(request, req)
+        req.conversation_id = conversation_id
         duplicate = tool_results.store(gateway_settings, conversation_id, req)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            {
+                "type": "tool_result",
+                "conversationId": conversation_id,
+                "runId": req.run_id,
+                "toolCallId": req.tool_call_id,
+                "toolName": req.tool_name,
+                "arguments": req.arguments,
+                "status": req.status,
+                "result": req.result,
+                "error": req.error,
+                "duplicate": duplicate,
+            },
+        )
         return {"success": True, "message": "received", "duplicate": duplicate}
 
     @app.get("/api/actiondesign-agent/tool-results/{conversation_id}/{run_id}")
@@ -256,40 +354,228 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         req: AgentChatRequest,
         request: Request,
         provider: Literal["mimo", "claude-code"],
-    ) -> AgentChatResponse:
-        req.conversation_id = (
-            request.headers.get("X-Conversation-Id") or req.conversation_id
+    ) -> JSONResponse:
+        started = time.time()
+        conversation_id = resolve_conversation_id(request, req)
+        req.conversation_id = conversation_id
+        req.provider = provider
+        req.model = _resolved_request_model(req, gateway_settings, provider)
+        run_id = require_run_id_for_full_log(gateway_settings, req)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            _request_event(req, provider, run_id),
         )
-        safe_conversation_id(req.conversation_id)
-        if provider == "mimo":
-            return await call_mimo(req, gateway_settings)
-        return await call_claude_code(req, gateway_settings)
+
+        try:
+            raw_response = (
+                await call_mimo(req, gateway_settings)
+                if provider == "mimo"
+                else await call_claude_code(req, gateway_settings)
+            )
+        except Exception as exc:
+            append_conversation_event(
+                gateway_settings,
+                conversation_id,
+                _response_event(
+                    _exception_response_payload(exc, provider, req.model),
+                    conversation_id,
+                    run_id,
+                    started,
+                ),
+            )
+            raise
+        content = _agent_response_payload(raw_response)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            _response_event(content, conversation_id, run_id, started),
+        )
+        return JSONResponse(
+            content=content,
+            headers=_conversation_headers(conversation_id, run_id),
+        )
 
     def _chat_stream(
         req: AgentChatRequest,
         request: Request,
         provider: Literal["mimo", "claude-code"],
     ) -> StreamingResponse:
-        req.conversation_id = (
-            request.headers.get("X-Conversation-Id") or req.conversation_id
+        started = time.time()
+        conversation_id = resolve_conversation_id(request, req)
+        req.conversation_id = conversation_id
+        req.provider = provider
+        req.model = _resolved_request_model(req, gateway_settings, provider)
+        run_id = require_run_id_for_full_log(gateway_settings, req)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            _request_event(req, provider, run_id),
         )
-        safe_conversation_id(req.conversation_id)
         generator = (
             stream_mimo(req, gateway_settings)
             if provider == "mimo"
             else stream_claude_code(req, gateway_settings)
         )
         return StreamingResponse(
-            generator,
+            _log_stream_response(
+                generator,
+                gateway_settings,
+                conversation_id,
+                run_id,
+                started,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **_conversation_headers(conversation_id, run_id),
             },
         )
 
     return app
+
+
+def _request_event(
+    req: AgentChatRequest,
+    provider: Literal["mimo", "claude-code"],
+    run_id: str,
+) -> dict:
+    request_body = model_to_dict(req)
+    if isinstance(request_body, dict):
+        request_body["provider"] = provider
+        request_body["conversationId"] = req.conversation_id
+        request_body["runId"] = run_id
+    return {
+        "type": "request",
+        "conversationId": req.conversation_id,
+        "runId": run_id,
+        "provider": provider,
+        "model": req.model,
+        "userPrompt": req.prompt,
+        "requestBody": request_body,
+    }
+
+
+def _agent_response_payload(raw_response: dict) -> dict:
+    response = AgentChatResponse(**raw_response)
+    dump = getattr(response, "model_dump", None)
+    if callable(dump):
+        return dump(mode="json")
+    return response.dict()
+
+
+def _response_event(
+    response: dict,
+    conversation_id: str,
+    run_id: str,
+    started: float,
+) -> dict:
+    duration = response.get("duration_ms")
+    if duration is None:
+        duration = int((time.time() - started) * 1000)
+    return {
+        "type": "response",
+        "conversationId": conversation_id,
+        "runId": run_id,
+        "provider": response.get("provider"),
+        "model": response.get("model"),
+        "content": response.get("content", ""),
+        "toolCalls": response.get("tool_calls", []),
+        "success": bool(response.get("success", False)),
+        "error": response.get("error"),
+        "code": response.get("code"),
+        "usage": response.get("usage", {}),
+        "duration": duration,
+    }
+
+
+def _exception_response_payload(
+    exc: Exception,
+    provider: Literal["mimo", "claude-code"],
+    model: str,
+) -> dict:
+    code = "PROVIDER_ERROR"
+    error = str(exc)
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or code)
+            error = str(
+                detail.get("message")
+                or detail.get("error")
+                or detail.get("code")
+                or error
+            )
+        else:
+            error = str(detail or error)
+    return {
+        "provider": provider,
+        "model": model,
+        "content": "",
+        "tool_calls": [],
+        "success": False,
+        "error": error,
+        "code": code,
+        "usage": {},
+    }
+
+
+def _conversation_headers(conversation_id: str, run_id: str) -> dict[str, str]:
+    return {
+        "X-Conversation-Id": conversation_id,
+        "X-Run-Id": run_id,
+    }
+
+
+async def _log_stream_response(
+    generator: AsyncIterator[str],
+    settings: Settings,
+    conversation_id: str,
+    run_id: str,
+    started: float,
+) -> AsyncIterator[str]:
+    final_payload: dict | None = None
+    async for chunk in generator:
+        for payload in _sse_payloads(chunk):
+            if payload.get("type") == "message_complete":
+                final_payload = payload
+        yield chunk
+
+    if final_payload is None:
+        final_payload = {
+            "provider": None,
+            "model": None,
+            "content": "",
+            "tool_calls": [],
+            "success": False,
+            "error": "Stream ended without message_complete",
+            "code": "STREAM_RESPONSE_INCOMPLETE",
+            "usage": {},
+        }
+    append_conversation_event(
+        settings,
+        conversation_id,
+        _response_event(final_payload, conversation_id, run_id, started),
+    )
+
+
+def _sse_payloads(chunk: str) -> list[dict]:
+    payloads: list[dict] = []
+    for line in str(chunk).splitlines():
+        if not line.startswith("data:"):
+            continue
+        raw = line.removeprefix("data:").strip()
+        if not raw or raw == "[DONE]":
+            continue
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
 
 
 def _require_knowledge_admin(request: Request, settings: Settings) -> None:

@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - pydantic v1
 DESIGN_TOOLS = frozenset(
     {
         "list_elements",
+        "inspect_action",
         "get_element_detail",
         "get_component_methods",
         "get_page_actions",
@@ -49,7 +50,6 @@ MIMO_IMAGE_MODELS = frozenset(
     if metadata.get("supportsImages")
 )
 
-
 class _GatewayBaseModel(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(populate_by_name=True)
@@ -73,6 +73,7 @@ class AgentChatRequest(_GatewayBaseModel):
     provider: Literal["mimo", "claude-code", "auto"] = "mimo"
     model: str = ""
     conversation_id: str = Field(default="", alias="conversationId")
+    run_id: str = Field(default="", alias="runId")
     prompt: str
     stream: bool = False
     tool_names: list[str] = Field(default_factory=list, alias="toolNames")

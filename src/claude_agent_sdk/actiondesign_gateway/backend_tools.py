@@ -7,6 +7,7 @@ from typing import Any, Literal, Protocol
 
 from fastapi import HTTPException
 
+from .models import DESIGN_TOOLS
 
 BACKEND_TOOL_ALLOWED_NAMES = frozenset(
     {
@@ -23,6 +24,10 @@ BACKEND_TOOL_ALLOWED_NAMES = frozenset(
 
 _RE_BACKEND_TOOL_CALL = re.compile(
     r"\[BACKEND_TOOL_CALL\]\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s*\(",
+    re.DOTALL,
+)
+_RE_ANY_BACKEND_TOOL_CALL = re.compile(
+    r"\[BACKEND_TOOL_CALL\]\s*([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)*)\s*\(",
     re.DOTALL,
 )
 _RE_BACKEND_CLEAN_MARKER = re.compile(r"\[BACKEND_TOOL_(?:CALL|RESULT)\]")
@@ -86,6 +91,32 @@ def clean_backend_tool_protocol_text(content: str) -> str:
         return content
     cleaned = _remove_backend_tool_calls(content)
     return _remove_backend_tool_results(cleaned).strip()
+
+
+def frontend_tool_misuse_result(
+    content: str,
+    backend_calls: list[BackendToolCall],
+) -> BackendToolResult | None:
+    if backend_calls or "[BACKEND_TOOL_CALL]" not in content:
+        return None
+
+    match = _RE_ANY_BACKEND_TOOL_CALL.search(content)
+    if match is None:
+        return None
+
+    tool_name = match.group(1)
+    if tool_name not in DESIGN_TOOLS:
+        return None
+
+    return BackendToolResult(
+        name=tool_name,
+        status="failed",
+        error=(
+            f"{tool_name} is an ActionDesign frontend tool. "
+            f"Use [TOOL_CALL] {tool_name}(...) instead of [BACKEND_TOOL_CALL]."
+        ),
+        code="BACKEND_TOOL_FRONTEND_TOOL_MISUSED",
+    )
 
 
 async def execute_backend_tool_calls(
@@ -189,10 +220,7 @@ def _is_read_only_mcp_call_tool(call: BackendToolCall, settings: Any) -> bool:
 
 def _read_only_mcp_tool_names(settings: Any) -> list[str]:
     raw = getattr(settings, "mcp_read_only_tool_names", [])
-    if isinstance(raw, str):
-        values = raw.split(",")
-    else:
-        values = raw
+    values = raw.split(",") if isinstance(raw, str) else raw
     return [str(tool).strip() for tool in values if str(tool).strip()]
 
 

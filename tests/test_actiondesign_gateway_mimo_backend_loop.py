@@ -7,13 +7,15 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from claude_agent_sdk.actiondesign_gateway import mimo_provider
-from claude_agent_sdk.actiondesign_gateway.mimo_stream import iter_sse_events
+from claude_agent_sdk.actiondesign_gateway import backend_tools, mimo_provider
 from claude_agent_sdk.actiondesign_gateway.backend_tools import (
     BackendToolCall,
     BackendToolResult,
     execute_backend_tool_calls,
+    extract_backend_tool_calls,
 )
+from claude_agent_sdk.actiondesign_gateway.mimo_http import normalize_messages_url
+from claude_agent_sdk.actiondesign_gateway.mimo_stream import iter_sse_events
 
 
 def sse_payloads(events: list[str]) -> list[dict[str, Any]]:
@@ -23,6 +25,10 @@ def sse_payloads(events: list[str]) -> list[dict[str, Any]]:
             if line.startswith("data: "):
                 payloads.append(json.loads(line.removeprefix("data: ")))
     return payloads
+
+
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 async def _aiter(items: list[str]):
@@ -84,6 +90,34 @@ NullCondition validates required form fields before submit.
 """,
         encoding="utf-8",
     )
+
+
+def test_mimo_messages_url_accepts_anthropic_base_url():
+    assert normalize_messages_url(
+        "https://token-plan-cn.xiaomimimo.com/anthropic"
+    ) == "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+    assert normalize_messages_url(
+        "https://token-plan-cn.xiaomimimo.com/anthropic/"
+    ) == "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+    assert normalize_messages_url(
+        "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+    ) == "https://token-plan-cn.xiaomimimo.com/anthropic/v1/messages"
+    assert normalize_messages_url("https://mimo.test/messages") == (
+        "https://mimo.test/messages"
+    )
+
+
+def test_frontend_tool_used_as_backend_tool_gets_actionable_feedback():
+    content = '[BACKEND_TOOL_CALL] get_element_detail({"elementKey":"ExitAction"})'
+
+    calls = extract_backend_tool_calls(content)
+    result = backend_tools.frontend_tool_misuse_result(content, calls)
+
+    assert calls == []
+    assert result is not None
+    assert result.code == "BACKEND_TOOL_FRONTEND_TOOL_MISUSED"
+    assert result.name == "get_element_detail"
+    assert "[TOOL_CALL] get_element_detail" in result.error
 
 
 def test_mimo_executes_backend_tool_then_returns_only_frontend_tool(monkeypatch):
@@ -167,6 +201,54 @@ def test_mimo_executes_knowledge_search_then_returns_only_frontend_tool(
         {"name": "create_node", "arguments": {"elementKey": "NullCondition"}}
     ]
     assert "knowledge.search" not in str(response["tool_calls"])
+
+
+def test_mimo_full_conversation_log_records_model_and_backend_tool_events(
+    tmp_path,
+    monkeypatch,
+):
+    responses = [
+        '[BACKEND_TOOL_CALL] knowledge.search({"query":"required validation"})',
+        "final answer",
+    ]
+    settings = make_settings(
+        full_conversation_log_enabled=True,
+        full_conversation_log_root=tmp_path,
+    )
+
+    async def fake_post_mimo(_body, _settings):
+        return {"content": [{"type": "text", "text": responses.pop(0)}]}
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {
+            "prompt": "lookup",
+            "conversationId": "conv_provider",
+            "runId": "run_1",
+            "toolNames": [],
+        },
+        settings,
+    )
+
+    assert response["content"] == "final answer"
+    events = read_jsonl(tmp_path / "conv_provider.jsonl")
+    assert [event["type"] for event in events] == [
+        "model_turn",
+        "backend_tool_call",
+        "backend_tool_result",
+        "model_turn",
+    ]
+    assert events[0]["runId"] == "run_1"
+    assert events[0]["content"] == (
+        '[BACKEND_TOOL_CALL] knowledge.search({"query":"required validation"})'
+    )
+    assert events[1]["toolName"] == "knowledge.search"
+    assert events[1]["arguments"] == {"query": "required validation"}
+    assert events[2]["toolName"] == "knowledge.search"
+    assert events[2]["status"] == "success"
+    assert events[3]["content"] == "final answer"
 
 
 def test_mimo_unknown_backend_tool_result_is_fed_back_not_frontend(monkeypatch):
@@ -411,6 +493,90 @@ def test_mimo_stream_uses_upstream_sse_and_emits_incremental_text(
     ] == ["hel", "lo"]
     assert payloads[-1]["type"] == "message_complete"
     assert payloads[-1]["success"] is True
+
+
+def test_mimo_stream_full_conversation_log_records_assembled_turn(
+    tmp_path,
+    monkeypatch,
+):
+    async def fake_stream_post_mimo(_body, _settings):
+        yield {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hel"},
+        }
+        yield {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "lo"},
+        }
+        yield {"type": "message_stop"}
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {
+                    "prompt": "stream",
+                    "conversationId": "conv_stream_provider",
+                    "runId": "run_stream",
+                    "toolNames": [],
+                },
+                make_settings(
+                    full_conversation_log_enabled=True,
+                    full_conversation_log_root=tmp_path,
+                ),
+            )
+        ]
+
+    payloads = sse_payloads(anyio.run(collect_events))
+    events = read_jsonl(tmp_path / "conv_stream_provider.jsonl")
+
+    assert [
+        payload["content"] for payload in payloads if payload["type"] == "text_delta"
+    ] == ["hel", "lo"]
+    assert [event["type"] for event in events] == ["model_turn"]
+    assert events[0]["content"] == "hello"
+    assert events[0]["runId"] == "run_stream"
+
+
+def test_model_turn_log_summarizes_frontend_tools_and_content_diagnostics(tmp_path):
+    content = (
+        '[TOOL_CALL] create_node({"elementKey":"ExitAction"})\n'
+        '[TOOL_CALL] preview_code({"targetAction":"main"})\n'
+        'bad fragment \x00 [TOOL_CALL] create_node({"elementKey":"x"'
+    )
+
+    mimo_provider._log_model_turn(
+        {
+            "conversationId": "conv_tool_diagnostics",
+            "runId": "run_tool_diagnostics",
+            "toolNames": ["create_node", "preview_code"],
+        },
+        make_settings(
+            full_conversation_log_enabled=True,
+            full_conversation_log_root=tmp_path,
+        ),
+        "mimo-v2.5",
+        content,
+        "end_turn",
+        {},
+        False,
+    )
+
+    raw = (tmp_path / "conv_tool_diagnostics.jsonl").read_text(encoding="utf-8")
+    assert len(raw.splitlines()) == 1
+    events = [json.loads(raw)]
+    assert events[0]["content"] == content
+    assert events[0]["frontendToolCallCount"] == 2
+    assert events[0]["frontendToolCallNames"] == ["create_node", "preview_code"]
+    assert events[0]["contentDiagnostics"]["containsControlCharacters"] is True
+    assert events[0]["contentDiagnostics"]["containsMalformedFrontendToolCall"] is True
 
 
 def test_mimo_stream_buffers_backend_tool_turn_until_final_turn(monkeypatch):

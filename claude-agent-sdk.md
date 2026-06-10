@@ -1,4 +1,5 @@
 # Claude Agent SDK ActionDesign Agent 上下文
+# 尽量少写测试除非必要是必要的测试，少废话
 
 ## 文档用途
 
@@ -124,6 +125,8 @@ data: {"type":"message_complete","content":"...","tool_calls":[],"success":true}
 默认配置：
 
 - 默认模型：`mimo-v2.5`
+- 默认 Anthropic-compatible Base URL：`https://token-plan-cn.xiaomimimo.com/anthropic`
+- 实际 Messages API 请求地址会归一化为 `{base}/v1/messages`，因此 `GXP_MIMO_MESSAGES_URL` / `MODEL_MIMO_URL` 可以配置 base URL，也可以直接配置完整 `/v1/messages` 地址。
 - 默认认证：`api-key` header
 - 可选认证：bearer
 - 默认超时：由 settings 中 MiMo timeout 配置控制
@@ -503,6 +506,47 @@ MiMo provider 已完成以下修复：
 - MiMo SSE parser 已标准化为空行聚合 event，支持多行 `data:`、`event:` fallback、`[DONE]` 正常结束；invalid JSON 或非对象事件返回 `MIMO_RESPONSE_INVALID`。
 - MiMo provider 维护边界已拆分：`mimo_provider.py` 保留 provider loop、请求体构造和响应组装；`mimo_http.py` 负责 HTTP/SSE 请求和上游错误映射；`mimo_stream.py` 负责 SSE event 解析、usage/stop/text delta 提取；`mimo_protocol.py` 负责 frontend/backend marker 诊断和安全清理。
 
+### 2026-06-05 ActionDesign 完整对话 JSONL 日志
+
+本次新增默认开启的完整会话日志，用于测试和调试阶段查看同一次 ActionDesign 对话的完整链路。
+
+- 开关：默认启用；需要关闭时设置 `ACTIONDESIGN_FULL_CONVERSATION_LOG=0` 或 `false`。
+- 路径：默认写入 `logs/actiondesign-agent/{conversationId}.jsonl`；可用 `ACTIONDESIGN_FULL_CONVERSATION_LOG_ROOT` 覆盖根目录。
+- 完整日志与现有普通调试日志分离；现有 `debug_logs/actiondesign-agent` 脱敏日志逻辑保持不变。
+- 完整日志按用户要求原样记录 prompt、模型文本、tool 参数、tool 返回、knowledge backend tool 返回；生产环境如需避免落盘可显式关闭。
+- `conversationId` 读取顺序为 `X-Conversation-Id` header、body `conversationId`、后端生成 `conv_server_<timestamp>_<random>`。
+- 开启完整日志时，chat/stream 请求必须由前端在 body 传入 `runId`；缺失返回 400，code 为 `RUN_ID_REQUIRED`。后端不自动生成 `runId`。
+- chat/stream 响应 header 会回写 `X-Conversation-Id` 和 `X-Run-Id`，方便前端和日志文件对齐。
+- 不使用 IP、cookie 或 provider 判断同一对话；`conversationId` 是唯一会话主键，`runId` 只区分同一对话里的某一次用户发送。
+- `request` 事件在进入 provider 前写入，包含 provider、model、userPrompt、requestBody 等。
+- `request.model` 记录进入 provider 前解析出的实际模型；前端没传 `model` 时也会落到默认模型，例如 `mimo-v2.5`。
+- `model_turn` 事件由 MiMo/Claude Code provider 在每个模型轮次完成后写入，记录完整 assembled 文本、stopReason、usage、是否包含 backend tool call。
+- `backend_tool_call` 和 `backend_tool_result` 事件记录 provider 内部 backend-only tool 执行；`knowledge.search/read` 也按 backend tool 记录。
+- `response` 事件在最终返回前写入；stream 不记录每个 `text_delta`，只记录 assembled model turn 和最终 response。
+- `/api/actiondesign-agent/tool-result` 收到前端工具结果后，额外追加 `tool_result` 到同一个 `{conversationId}.jsonl` 文件。
+- 公共 `/knowledge/search` 和 `/knowledge/read` 没有 conversationId 语义，不纳入完整会话日志；这里的“知识库记录”指 provider backend loop 内的 `knowledge.search/read`。
+
+### 2026-06-05 Claude Code 模型列表修正
+
+本次修复 `/api/actiondesign-agent/models` 中 Claude Code provider 没有可选模型，以及错误展示 Claude 原生模型的问题。
+
+- 当前项目里 Claude 入口使用的密钥和模型体系与 MiMo 一致，也就是 `GXP_MIMO_API_KEY` / `MODEL_MIMO_KEY` 和 `mimo-v2.5`、`mimo-v2.5-pro`。
+- `claude-code.models` 默认复用 MiMo 模型列表，而不是展示 Claude 原生 `sonnet/opus/haiku`。
+- `claude-code.defaultModel` 未配置时回退到 `GXP_MIMO_DEFAULT_MODEL` / `mimo_default_model`，默认是 `mimo-v2.5`。
+- `CLAUDE_CODE_MODELS` 只作为显式覆盖配置；未配置时不改变 MiMo 模型体系。
+- `CLAUDE_CODE_DEFAULT_MODEL` 仍然保留；配置后优先作为 `/models` 的 `defaultModel` 和 provider 默认模型。
+- 如果只配置 `CLAUDE_CODE_DEFAULT_MODEL`，该模型会自动并入 `/models` 的 Claude Code 模型列表，避免前端默认值不在下拉选项里。
+- Claude Code provider 实际调用链继续支持请求体 `model` 字段；前端从 `/models` 选择的 MiMo 模型可以直接传给 `/api/actiondesign-agent/claude-code/chat` 或 `/stream`。
+
+### 2026-06-08 backend tool 误用反馈和日志诊断增强
+
+本次修复模型把 ActionDesign 前端工具误写成 backend tool 时反馈不清晰的问题，并增强完整会话日志排查字段：
+
+- `[BACKEND_TOOL_CALL] get_element_detail(...)` 这类无命名空间且属于 ActionDesign 前端工具的误用，会回灌结构化结果 `BACKEND_TOOL_FRONTEND_TOOL_MISUSED`，提示应改用 `[TOOL_CALL] get_element_detail(...)`。
+- MiMo 和 Claude Code backend tool prompt 明确约束 `get_element_detail/list_elements/get_page_actions/propose_plan/create_node/insert_node/delete_node/preview_code` 只能作为前端工具，不能与 `[BACKEND_TOOL_CALL]` 搭配。
+- `model_turn` 完整日志新增 `frontendToolCallCount` 和 `frontendToolCallNames`，便于快速判断模型实际生成了哪些前端工具调用。
+- `model_turn` 完整日志新增 `contentDiagnostics`，记录是否包含控制字符、是否包含无法解析的前端工具 marker；JSONL 写入继续使用 `json.dumps(..., ensure_ascii=False)` 保持单行可解析。
+
 ## 测试覆盖
 
 Gateway 相关测试：
@@ -523,7 +567,15 @@ Gateway 相关测试：
 - 跨 chunk 隐藏工具协议。
 - `/models` 无 key 时显示 `mimo.unavailable`。
 - `/models` 返回 provider 专用 `chatPath/streamPath`。
+- `/models` 中 Claude Code 默认复用 MiMo 模型列表和 `defaultModel`，前端可展示/切换同一套 MiMo 模型。
+- `CLAUDE_CODE_MODELS` 仅作为显式覆盖；`CLAUDE_CODE_DEFAULT_MODEL` 会自动并入列表。
 - `/tool-result` 幂等。
+- 完整对话 JSONL 日志可通过 `ACTIONDESIGN_FULL_CONVERSATION_LOG=0` 关闭，关闭时不创建会话文件。
+- 完整对话 JSONL 日志开启时，header conversationId 优先于 body conversationId。
+- 完整对话 JSONL 日志开启时，缺少 chat/stream `runId` 返回 `RUN_ID_REQUIRED`。
+- 完整对话 JSONL 日志记录 `request`、`model_turn`、`backend_tool_call`、`backend_tool_result`、`response`、`tool_result`。
+- MiMo stream 完整日志记录 assembled model turn，不逐条记录 `text_delta`。
+- Claude Code provider 完整日志同样记录 `model_turn`、`backend_tool_call`、`backend_tool_result`。
 - 非法 `conversationId` 返回 400。
 - 图片模型拒绝和 fallback。
 - Claude Code 内部工具默认是 `Read/Grep/Glob/LS`。
@@ -545,6 +597,10 @@ Gateway 相关测试：
 - embedding 失败退回关键词检索。
 - `knowledge.read` 禁止路径穿越。
 - Qdrant knowledge store 行为。
+- 前端工具误用为 backend tool 时返回 `BACKEND_TOOL_FRONTEND_TOOL_MISUSED`。
+- MiMo backend prompt 明确禁止前端工具搭配 `[BACKEND_TOOL_CALL]`。
+- 完整会话日志记录 parsed frontend tool call 数量和名称。
+- 完整会话日志对包含换行、控制字符和 malformed tool marker 的模型文本保持单行 JSONL 可解析，并记录 `contentDiagnostics`。
 
 ## 最新验证结果
 
@@ -552,13 +608,26 @@ Gateway 相关测试：
 
 ```powershell
 $env:PYTHONPATH='src'
-python -m pytest tests/test_actiondesign_gateway_tool_protocol.py tests/test_actiondesign_gateway_app.py tests/test_actiondesign_gateway_mimo_backend_loop.py tests/test_actiondesign_gateway_knowledge_vector_index.py tests/test_actiondesign_gateway_qdrant_knowledge_store.py -q
+python -m pytest tests/test_actiondesign_gateway_app.py tests/test_actiondesign_gateway_mimo_backend_loop.py tests/test_actiondesign_gateway_tool_protocol.py -q
 ```
 
 结果：
 
 ```text
-60 passed
+67 passed
+```
+
+已执行：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m pytest tests/test_actiondesign_gateway_knowledge_vector_index.py tests/test_actiondesign_gateway_qdrant_knowledge_store.py -q
+```
+
+结果：
+
+```text
+7 passed
 ```
 
 已执行：
@@ -582,4 +651,10 @@ git diff --check
 结果：
 
 - 旧入口残留搜索无命中。
-- `git diff --check` 无空白错误；Windows checkout 可能提示 CRLF normalization warning。
+- `git diff --check` 无空白错误；本次输出仅有 Windows checkout 的 CRLF normalization warning。
+
+## 2026-06-09 ActionDesign 完成闸门前后端边界
+
+- 前端新增只读工具 `inspect_action`，用于让模型读取当前画布动作的节点、关键参数、事件绑定和动作摘要；后端 `DESIGN_TOOLS` 白名单已加入该工具名，只负责透传，不执行画布验收。
+- ActionDesign 编排最终可用性由前端 AgentLoop 闸门判断：显式 `preview_code` 通过、approved plan 完整、语义验收通过、用户需求契约 requirements 验收通过后，才允许 complete。
+- 后端不新增路由，不根据模型文本判断“是否满足用户需求”；完整会话 JSONL 继续记录 request、model_turn、response、tool_result。前端可用现有 `/tool-result` 回传合成的 `completion_gate` 结果，方便按 `(conversationId, runId)` 排查缺失项和修复循环。

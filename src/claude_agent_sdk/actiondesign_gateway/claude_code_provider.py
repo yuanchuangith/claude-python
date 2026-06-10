@@ -23,8 +23,11 @@ from .backend_tools import (
     execute_backend_tool_calls,
     extract_backend_tool_calls,
     format_backend_tool_results,
+    frontend_tool_misuse_result,
 )
+from .mimo_protocol import has_malformed_backend_tool_call
 from .models import DESIGN_TOOLS
+from .session_log import append_conversation_event, model_to_dict
 from .tool_protocol import clean_tool_protocol_text, extract_tool_calls
 
 _CLAUDE_CODE_INTERNAL_TOOL_PROMPT = """Claude Code internal tools:
@@ -42,7 +45,8 @@ _CLAUDE_CODE_BACKEND_TOOL_PROMPT = """Backend-only knowledge tools:
 - If search snippets are not enough, call
   [BACKEND_TOOL_CALL] knowledge.read({"path":"...", "heading":"..."}).
 - Backend tool calls are executed only by the backend and must never be shown to the frontend.
-- Do not use [BACKEND_TOOL_CALL] for ActionDesign canvas operations."""
+- Do not use [BACKEND_TOOL_CALL] for ActionDesign canvas operations.
+- get_element_detail, list_elements, get_page_actions, propose_plan, create_node, insert_node, delete_node, and preview_code are frontend tools and must never be used with [BACKEND_TOOL_CALL]."""
 
 
 async def call_claude_code(req: Any, settings: Any) -> dict[str, Any]:
@@ -140,23 +144,33 @@ async def _run_claude_code_agent_loop(
         total_cost = response["total_cost_usd"] or total_cost
 
         backend_calls = extract_backend_tool_calls(last_content)
-        if not backend_calls:
+        malformed_backend_call = has_malformed_backend_tool_call(
+            last_content,
+            backend_calls,
+        )
+        _log_model_turn(
+            req,
+            settings,
+            last_content,
+            {"total_cost_usd": response["total_cost_usd"]},
+            bool(backend_calls or malformed_backend_call),
+        )
+        if not backend_calls and not malformed_backend_call:
             return {
                 "content": last_content,
                 "native_tool_calls": native_tool_calls,
                 "total_cost_usd": total_cost,
             }
 
-        limited_calls = backend_calls[:max_calls_per_turn]
-        results = await execute_backend_tool_calls(limited_calls, settings)
-        if len(backend_calls) > max_calls_per_turn:
-            results.append(
-                BackendToolResult(
-                    name="backend.call_limit",
-                    status="failed",
-                    error="Too many backend tool calls in one turn",
-                    code="BACKEND_TOOL_CALL_LIMIT",
-                )
+        if malformed_backend_call:
+            results = [_malformed_backend_tool_result(last_content, backend_calls)]
+            _log_backend_tool_results(req, settings, results)
+        else:
+            results = await _execute_backend_tool_calls_with_log(
+                req,
+                settings,
+                backend_calls,
+                max_calls_per_turn,
             )
         prompt = _next_backend_tool_prompt(prompt, last_content, results)
 
@@ -348,10 +362,22 @@ def _model(req: Any, settings: Any) -> str:
         _request_value(
             req,
             "model",
-            default=_setting(settings, "claude_code_default_model", default=""),
+            default=_default_model(settings),
         )
-        or _setting(settings, "claude_code_default_model", default="")
+        or _default_model(settings)
     )
+
+
+def _default_model(settings: Any) -> str:
+    configured = str(_setting(settings, "claude_code_default_model", default="") or "")
+    if configured:
+        return configured
+    models = _setting(settings, "claude_code_models", default=[]) or []
+    for model in models:
+        model = str(model).strip()
+        if model:
+            return model
+    return str(_setting(settings, "mimo_default_model", default="mimo-v2.5") or "mimo-v2.5")
 
 
 def _request_value(obj: Any, *names: str, default: Any = None) -> Any:
@@ -371,8 +397,166 @@ def _response(**payload: Any) -> dict[str, Any]:
     return payload
 
 
+async def _execute_backend_tool_calls_with_log(
+    req: Any,
+    settings: Any,
+    backend_calls: list[Any],
+    max_calls_per_turn: int,
+) -> list[BackendToolResult]:
+    limited_calls = backend_calls[:max_calls_per_turn]
+    _log_backend_tool_calls(req, settings, limited_calls)
+    results = await execute_backend_tool_calls(limited_calls, settings)
+    if len(backend_calls) > max_calls_per_turn:
+        results.append(
+            BackendToolResult(
+                name="backend.call_limit",
+                status="failed",
+                error="Too many backend tool calls in one turn",
+                code="BACKEND_TOOL_CALL_LIMIT",
+            )
+        )
+    _log_backend_tool_results(req, settings, results)
+    return results
+
+
+def _log_model_turn(
+    req: Any,
+    settings: Any,
+    content: str,
+    usage: dict[str, Any],
+    has_backend_tool_call: bool,
+) -> None:
+    conversation_id = _conversation_id(req)
+    frontend_tool_calls = _frontend_tool_calls(content, req)
+    append_conversation_event(
+        settings,
+        conversation_id,
+        {
+            "type": "model_turn",
+            "conversationId": conversation_id,
+            "runId": _run_id(req),
+            "provider": "claude-code",
+            "model": _model(req, settings),
+            "content": content,
+            "stopReason": "",
+            "usage": usage,
+            "hasBackendToolCall": has_backend_tool_call,
+            "frontendToolCallCount": len(frontend_tool_calls),
+            "frontendToolCallNames": [
+                str(call.get("name") or "") for call in frontend_tool_calls
+            ],
+            "contentDiagnostics": _content_diagnostics(
+                content,
+                frontend_tool_calls,
+            ),
+        },
+    )
+
+
+def _log_backend_tool_calls(
+    req: Any,
+    settings: Any,
+    calls: list[Any],
+) -> None:
+    conversation_id = _conversation_id(req)
+    for call in calls:
+        append_conversation_event(
+            settings,
+            conversation_id,
+            {
+                "type": "backend_tool_call",
+                "conversationId": conversation_id,
+                "runId": _run_id(req),
+                "provider": "claude-code",
+                "toolName": call.name,
+                "arguments": model_to_dict(call.arguments),
+            },
+        )
+
+
+def _log_backend_tool_results(
+    req: Any,
+    settings: Any,
+    results: list[BackendToolResult],
+) -> None:
+    conversation_id = _conversation_id(req)
+    for result in results:
+        append_conversation_event(
+            settings,
+            conversation_id,
+            {
+                "type": "backend_tool_result",
+                "conversationId": conversation_id,
+                "runId": _run_id(req),
+                "provider": "claude-code",
+                "toolName": result.name,
+                "status": result.status,
+                "code": result.code,
+                "error": result.error,
+                "result": model_to_dict(result.result),
+            },
+        )
+
+
+def _conversation_id(req: Any) -> str:
+    return str(_request_value(req, "conversationId", "conversation_id", default="") or "")
+
+
+def _run_id(req: Any) -> str:
+    return str(_request_value(req, "runId", "run_id", default="") or "")
+
+
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(_response(**payload), ensure_ascii=False)}\n\n"
+
+
+def _malformed_backend_tool_result(
+    content: str,
+    backend_calls: list[Any],
+) -> BackendToolResult:
+    result = frontend_tool_misuse_result(content, backend_calls)
+    if result is not None:
+        return result
+    return BackendToolResult(
+        name="backend.tool_call",
+        status="failed",
+        error="Backend tool call is malformed or incomplete",
+        code="BACKEND_TOOL_ARGUMENTS_INVALID",
+    )
+
+
+def _frontend_tool_calls(content: str, req: Any) -> list[dict[str, Any]]:
+    return _filter_allowed(extract_tool_calls(content), _allowed_tools(req))
+
+
+def _content_diagnostics(
+    content: str,
+    frontend_tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "containsControlCharacters": _contains_control_characters(content),
+        "containsMalformedFrontendToolCall": _contains_malformed_frontend_tool_call(
+            content,
+            frontend_tool_calls,
+        ),
+    }
+
+
+def _contains_control_characters(content: str) -> bool:
+    return any(
+        ord(char) < 32 and char not in {"\t", "\n", "\r"} for char in content
+    )
+
+
+def _contains_malformed_frontend_tool_call(
+    content: str,
+    frontend_tool_calls: list[dict[str, Any]],
+) -> bool:
+    has_marker = "[TOOL_CALL]" in content or "[TOL_CALL]" in content
+    if has_marker and not frontend_tool_calls:
+        return True
+    cleaned = clean_tool_protocol_text(content)
+    return "[TOOL_CALL]" in cleaned or "[TOL_CALL]" in cleaned
 
 
 def _duration_ms(started: float) -> int:
