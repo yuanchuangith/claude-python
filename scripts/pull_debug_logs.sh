@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # ── 默认配置 ──────────────────────────────────────────
-SSH_KEY="/c/Users/yuanchuan/Desktop/code_new.pem"
+SSH_KEY="/f/Desktop/code_new.pem"
 SSH_HOST="ubuntu@43.135.137.212"
 REMOTE_DIR="/tmp/ai_debug_logs"
 LOCAL_DIR="./debug_logs"
@@ -72,19 +72,48 @@ remote_file_count() {
 
 pull_files() {
     local files="$1"
+    local archive="/tmp/ai_debug_logs_pull_$$.tar.gz"
+    local local_archive="$LOCAL_DIR/.pull_tmp_$$.tar.gz"
+
+    # 在服务器上打包
+    echo -e "${YELLOW}服务器打包中...${NC}"
+    local file_list=""
+    while IFS= read -r fname; do
+        [[ -z "$fname" ]] && continue
+        file_list="$file_list $fname"
+    done <<< "$files"
+
+    $SSH_CMD "cd $REMOTE_DIR && tar czf $archive $file_list 2>/dev/null" 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}服务器打包失败${NC}"
+        return 1
+    fi
+
+    # 下载压缩包
+    echo -e "${YELLOW}下载中...${NC}"
+    $SCP_CMD "$SSH_HOST:$archive" "$local_archive" 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}下载失败${NC}"
+        $SSH_CMD "rm -f $archive" 2>/dev/null
+        return 1
+    fi
+
+    # 解压（跳过已有文件）
+    mkdir -p "$LOCAL_DIR"
     local count=0
     while IFS= read -r fname; do
         [[ -z "$fname" ]] && continue
-        local local_path="$LOCAL_DIR/$fname"
-        if [[ -f "$local_path" ]]; then
-            continue  # 本地已有，跳过
-        fi
-        $SCP_CMD "$SSH_HOST:$REMOTE_DIR/$fname" "$local_path" 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}[新增]${NC} $fname"
-            ((count++))
+        if [[ ! -f "$LOCAL_DIR/$fname" ]]; then
+            tar xzf "$local_archive" -C "$LOCAL_DIR" "$fname" 2>/dev/null && {
+                echo -e "${GREEN}[新增]${NC} $fname"
+                ((count++))
+            }
         fi
     done <<< "$files"
+
+    # 清理
+    rm -f "$local_archive"
+    $SSH_CMD "rm -f $archive" 2>/dev/null
     echo "$count"
 }
 

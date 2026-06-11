@@ -6,6 +6,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, StreamEvent, TextBlock
 from claude_agent_sdk.actiondesign_gateway.claude_code_provider import (
     call_claude_code,
+    call_claude_code_review,
 )
 from claude_agent_sdk.actiondesign_gateway.mimo_provider import call_mimo
 from claude_agent_sdk.actiondesign_gateway.settings import Settings
@@ -20,6 +21,12 @@ from claude_agent_sdk.actiondesign_gateway.tool_protocol import (
 
 def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def full_log_path(root, conversation_id):
+    matches = sorted(root.glob(f"????????_??????_{conversation_id}.jsonl"))
+    assert len(matches) == 1
+    return matches[0]
 
 
 def test_extracts_typo_tool_call_marker():
@@ -274,7 +281,7 @@ def test_claude_code_full_conversation_log_records_model_and_backend_tool_events
     )
 
     assert response["content"] == "final answer"
-    events = read_jsonl(tmp_path / "conv_claude_provider.jsonl")
+    events = read_jsonl(full_log_path(tmp_path, "conv_claude_provider"))
     assert [event["type"] for event in events] == [
         "model_turn",
         "backend_tool_call",
@@ -314,6 +321,47 @@ def test_claude_code_internal_tools_can_be_configured_without_auto_allow(monkeyp
     assert response["success"] is True
     assert captured["options"].tools == ["Read"]
     assert captured["options"].allowed_tools == []
+
+
+def test_claude_code_review_parses_json_response(monkeypatch):
+    async def fake_query(prompt, options):
+        assert "Return only valid JSON" in prompt
+        yield AssistantMessage(
+            content=[
+                TextBlock(
+                    json.dumps(
+                        {
+                            "pass": True,
+                            "summary": "review passed",
+                            "issues": [],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ],
+            model="test",
+        )
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.claude_code_provider.query",
+        fake_query,
+    )
+
+    response = anyio.run(
+        call_claude_code_review,
+        {
+            "prompt": "review code",
+            "conversationId": "conv_claude_review_provider",
+            "runId": "run_claude_review",
+        },
+        Settings(log_root=None),
+    )
+
+    assert response["provider"] == "claude-code"
+    assert response["pass"] is True
+    assert response["summary"] == "review passed"
+    assert response["issues"] == []
+    assert response["success"] is True
 
 
 def test_claude_code_uses_mimo_default_model_when_unconfigured(monkeypatch):

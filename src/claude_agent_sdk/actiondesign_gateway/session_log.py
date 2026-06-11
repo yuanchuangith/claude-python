@@ -5,7 +5,7 @@ import json
 import secrets
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .settings import Settings
 
 _DEFAULT_TTL_SECONDS = 300.0
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def append_log(
@@ -84,7 +85,7 @@ def append_conversation_event(
             Path("logs/actiondesign-agent"),
         )
     )
-    log_path = root / f"{safe_id}.jsonl"
+    log_path = _conversation_log_path(root, safe_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = model_to_dict(event)
@@ -149,6 +150,17 @@ def _normalize_id(value: Any) -> str:
 
 def _iso_time() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _conversation_log_path(root: Path, safe_id: str) -> Path:
+    matches = sorted(root.glob(f"????????_??????_{safe_id}.jsonl"))
+    if matches:
+        return matches[0]
+    return root / f"{_china_log_timestamp()}_{safe_id}.jsonl"
+
+
+def _china_log_timestamp() -> str:
+    return datetime.now(_CHINA_TIMEZONE).strftime("%Y%m%d_%H%M%S")
 
 
 class ToolResultStore:

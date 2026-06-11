@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,6 +25,27 @@ def make_client(**settings_overrides):
 
 def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def full_log_path(root, conversation_id):
+    matches = sorted(root.glob(f"????????_??????_{conversation_id}.jsonl"))
+    assert len(matches) == 1
+    return matches[0]
+
+
+def freeze_conversation_log_time(monkeypatch):
+    from claude_agent_sdk.actiondesign_gateway import session_log
+
+    frozen_utc = datetime(2026, 6, 10, 10, 30, 45, tzinfo=timezone.utc)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return frozen_utc.replace(tzinfo=None)
+            return frozen_utc.astimezone(tz)
+
+    monkeypatch.setattr(session_log, "datetime", FrozenDateTime)
 
 
 def test_models_without_mimo_key_marks_mimo_unavailable(tmp_path):
@@ -147,12 +169,14 @@ def test_full_conversation_log_disabled_does_not_create_jsonl(tmp_path, monkeypa
     )
 
     assert response.status_code == 200
-    assert not (full_log_root / "conv_disabled.jsonl").exists()
+    assert list(full_log_root.glob("*.jsonl")) == []
 
 
 def test_full_conversation_log_chat_writes_request_and_response(
     tmp_path, monkeypatch
 ):
+    freeze_conversation_log_time(monkeypatch)
+
     async def fake_call_mimo(req, settings):
         return {
             "provider": "mimo",
@@ -192,7 +216,8 @@ def test_full_conversation_log_chat_writes_request_and_response(
     assert response.status_code == 200
     assert response.headers["X-Conversation-Id"] == "conv_header"
     assert response.headers["X-Run-Id"] == "run_1"
-    events = read_jsonl(full_log_root / "conv_header.jsonl")
+    log_path = full_log_root / "20260610_183045_conv_header.jsonl"
+    events = read_jsonl(log_path)
     assert [event["type"] for event in events] == ["request", "response"]
     assert events[0]["conversationId"] == "conv_header"
     assert events[0]["runId"] == "run_1"
@@ -245,7 +270,7 @@ def test_full_conversation_log_claude_code_chat_writes_request_and_response(
     assert response.status_code == 200
     assert response.headers["X-Conversation-Id"] == "conv_claude_log"
     assert response.headers["X-Run-Id"] == "run_claude"
-    events = read_jsonl(full_log_root / "conv_claude_log.jsonl")
+    events = read_jsonl(full_log_path(full_log_root, "conv_claude_log"))
     assert [event["type"] for event in events] == ["request", "response"]
     assert events[0]["provider"] == "claude-code"
     assert events[0]["model"] == "mimo-v2.5"
@@ -285,6 +310,8 @@ def test_full_conversation_log_requires_run_id_when_enabled(tmp_path, monkeypatc
 
 
 def test_full_conversation_log_generates_conversation_id(tmp_path, monkeypatch):
+    freeze_conversation_log_time(monkeypatch)
+
     async def fake_call_mimo(req, settings):
         return {
             "provider": "mimo",
@@ -322,12 +349,14 @@ def test_full_conversation_log_generates_conversation_id(tmp_path, monkeypatch):
     assert response.status_code == 200
     conversation_id = response.headers["X-Conversation-Id"]
     assert conversation_id.startswith("conv_server_")
-    assert (full_log_root / f"{conversation_id}.jsonl").exists()
+    assert (full_log_root / f"20260610_183045_{conversation_id}.jsonl").exists()
 
 
 def test_full_conversation_log_stream_writes_request_and_response(
     tmp_path, monkeypatch
 ):
+    freeze_conversation_log_time(monkeypatch)
+
     async def fake_stream_mimo(req, settings):
         yield 'data: {"type":"text_delta","content":"ok"}\n\n'
         yield 'data: {"type":"message_complete","content":"ok","tool_calls":[],"success":true,"provider":"mimo","model":"mimo-v2.5","usage":{}}\n\n'
@@ -356,14 +385,28 @@ def test_full_conversation_log_stream_writes_request_and_response(
     )
 
     assert response.status_code == 200
-    events = read_jsonl(full_log_root / "conv_stream_log.jsonl")
+    events = read_jsonl(full_log_root / "20260610_183045_conv_stream_log.jsonl")
     assert [event["type"] for event in events] == ["request", "response"]
     assert events[0]["model"] == "mimo-v2.5"
     assert events[1]["content"] == "ok"
 
 
-def test_full_conversation_log_tool_result_appends_same_file(tmp_path):
+def test_full_conversation_log_tool_result_appends_same_file(tmp_path, monkeypatch):
+    freeze_conversation_log_time(monkeypatch)
     full_log_root = tmp_path / "full"
+    existing_log_path = full_log_root / "20260609_093000_conv_tool.jsonl"
+    existing_log_path.parent.mkdir(parents=True)
+    existing_log_path.write_text(
+        json.dumps(
+            {
+                "type": "request",
+                "conversationId": "conv_tool",
+                "runId": "run_1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     client = make_client(
         log_root=tmp_path / "legacy",
         full_conversation_log_enabled=True,
@@ -382,12 +425,15 @@ def test_full_conversation_log_tool_result_appends_same_file(tmp_path):
     response = client.post("/api/actiondesign-agent/tool-result", json=payload)
 
     assert response.status_code == 200
-    events = read_jsonl(full_log_root / "conv_tool.jsonl")
-    assert [event["type"] for event in events] == ["tool_result"]
-    assert events[0]["conversationId"] == "conv_tool"
-    assert events[0]["runId"] == "run_1"
-    assert events[0]["toolName"] == "create_node"
-    assert events[0]["result"] == {"ok": True}
+    assert sorted(path.name for path in full_log_root.glob("*.jsonl")) == [
+        "20260609_093000_conv_tool.jsonl"
+    ]
+    events = read_jsonl(existing_log_path)
+    assert [event["type"] for event in events] == ["request", "tool_result"]
+    assert events[1]["conversationId"] == "conv_tool"
+    assert events[1]["runId"] == "run_1"
+    assert events[1]["toolName"] == "create_node"
+    assert events[1]["result"] == {"ok": True}
 
 
 def test_chat_rejects_unsafe_conversation_id_before_provider_call(tmp_path):
@@ -508,6 +554,96 @@ def test_mimo_chat_route_preserves_structured_error_code(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["success"] is False
     assert response.json()["code"] == "MIMO_RESPONSE_INCOMPLETE"
+
+
+def test_mimo_review_route_returns_structured_review_without_tool_calls(
+    tmp_path, monkeypatch
+):
+    async def fake_call_mimo_review(req, settings):
+        return {
+            "provider": "mimo",
+            "model": req.model,
+            "pass": False,
+            "summary": "裸 return 会绕过提交阻止语义",
+            "issues": [
+                {
+                    "severity": "error",
+                    "code": "BARE_RETURN",
+                    "message": "BeforeSubmit 阻止类校验必须明确 return false",
+                    "actionKey": "beforeSubmit",
+                    "nodeKey": "exit_1",
+                }
+            ],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 9,
+            "usage": {"input_tokens": 1},
+            "raw": '{"pass":false}',
+        }
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.app.call_mimo_review",
+        fake_call_mimo_review,
+    )
+    client = make_client(log_root=tmp_path, mimo_api_key="secret")
+
+    response = client.post(
+        "/api/actiondesign-agent/mimo/review",
+        json={
+            "provider": "claude-code",
+            "conversationId": "conv_review",
+            "runId": "run_review",
+            "prompt": "review generated code",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-Conversation-Id"] == "conv_review"
+    assert response.headers["X-Run-Id"] == "run_review"
+    assert response.json()["provider"] == "mimo"
+    assert response.json()["model"] == "mimo-v2.5"
+    assert response.json()["pass"] is False
+    assert response.json()["issues"][0]["code"] == "BARE_RETURN"
+    assert "tool_calls" not in response.json()
+
+
+def test_claude_code_review_route_forces_claude_provider(tmp_path, monkeypatch):
+    async def fake_call_claude_code_review(req, settings):
+        return {
+            "provider": "claude-code",
+            "model": req.model,
+            "pass": True,
+            "summary": "review passed",
+            "issues": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 7,
+            "usage": {"total_cost_usd": 0.01},
+            "raw": '{"pass":true}',
+        }
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.app.call_claude_code_review",
+        fake_call_claude_code_review,
+    )
+    client = make_client(log_root=tmp_path)
+
+    response = client.post(
+        "/api/actiondesign-agent/claude-code/review",
+        json={
+            "provider": "mimo",
+            "conversationId": "conv_claude_review",
+            "runId": "run_claude_review",
+            "prompt": "review generated code",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "claude-code"
+    assert response.json()["model"] == "mimo-v2.5"
+    assert response.json()["pass"] is True
 
 
 def test_claude_code_chat_route_forces_claude_provider_with_same_shape(

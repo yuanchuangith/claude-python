@@ -1,0 +1,276 @@
+{
+  "timestamp": "2026-06-02T22:20:43.940662",
+  "request": {
+    "mode": "sse-stream",
+    "prompt_len": 174509,
+    "prompt_preview": "# Low-Code Orchestration Agent\n\nYou are a low-code orchestration agent for ActionDesign. Your job is to understand the user's business request, choose registered orchestration elements, and create valid action nodes through tools. Static instructions are in English; business data such as component names, field labels, and user-provided text may appear in their original language and must be preserved.\n\n## Core Constraints\n\n1. Use only registered elements from the compact element catalog below.\n2.",
+    "model": "default",
+    "max_turns": 99999,
+    "max_tokens": 8192,
+    "tool_names": [
+      "exit_plan_mode",
+      "create_node",
+      "get_element_detail",
+      "enter_plan_mode",
+      "get_component_methods",
+      "insert_node",
+      "preview_code",
+      "delete_node",
+      "list_elements",
+      "get_page_actions",
+      "propose_plan",
+      "ask_user",
+      "create_action"
+    ],
+    "auto_repair": true,
+    "images_count": 0
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "type": "AssistantMessage",
+      "blocks": []
+    },
+    {
+      "turn": 2,
+      "type": "AssistantMessage",
+      "blocks": [
+        {
+          "type": "TextBlock",
+          "length": 4011,
+          "text": "继续为培训地点的空值判断添加提示和退出节点，然后完成剩余字段验证。\n\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写培训地点\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写培训地点\", \"dataType\": \"string\", \"label\": \"请填写培训地点\", \"code\": \"'请填写培训地点'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训师是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"trainer_id\", \"dataType\": \"string\", \"label\": \"页面组件-trainer_id\", \"code\": \"inbiz('trainer_id').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请选择培训师\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请选择培训师\", \"dataType\": \"string\", \"label\": \"请选择培训师\", \"code\": \"'请选择培训师'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断课时是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"class_hour\", \"dataType\": \"string\", \"label\": \"页面组件-class_hour\", \"code\": \"inbiz('class_hour').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写课时\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写课时\", \"dataType\": \"string\", \"label\": \"请填写课时\", \"code\": \"'请填写课时'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断可自主学习是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"self_learning\", \"dataType\": \"string\", \"label\": \"页面组件-self_learning\", \"code\": \"inbiz('self_learning').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请选择可自主学习\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请选择可自主学习\", \"dataType\": \"string\", \"label\": \"请选择可自主学习\", \"code\": \"'请选择可自主学习'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})"
+        }
+      ]
+    },
+    {
+      "type": "ResultMessage",
+      "subtype": "success",
+      "is_error": false,
+      "errors": null,
+      "cost_usd": 0.431512,
+      "duration_ms": 33511
+    }
+  ],
+  "raw_content": "继续为培训地点的空值判断添加提示和退出节点，然后完成剩余字段验证。\n\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写培训地点\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写培训地点\", \"dataType\": \"string\", \"label\": \"请填写培训地点\", \"code\": \"'请填写培训地点'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训师是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"trainer_id\", \"dataType\": \"string\", \"label\": \"页面组件-trainer_id\", \"code\": \"inbiz('trainer_id').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请选择培训师\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请选择培训师\", \"dataType\": \"string\", \"label\": \"请选择培训师\", \"code\": \"'请选择培训师'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断课时是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"class_hour\", \"dataType\": \"string\", \"label\": \"页面组件-class_hour\", \"code\": \"inbiz('class_hour').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写课时\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写课时\", \"dataType\": \"string\", \"label\": \"请填写课时\", \"code\": \"'请填写课时'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断可自主学习是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"self_learning\", \"dataType\": \"string\", \"label\": \"页面组件-self_learning\", \"code\": \"inbiz('self_learning').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请选择可自主学习\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请选择可自主学习\", \"dataType\": \"string\", \"label\": \"请选择可自主学习\", \"code\": \"'请选择可自主学习'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})",
+  "tool_calls": [
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请填写培训地点",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请填写培训地点",
+            "dataType": "string",
+            "label": "请填写培训地点",
+            "code": "'请填写培训地点'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "ExitAction",
+        "title": "退出验证",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "returnValue": {
+            "paramTypes": "custom",
+            "value": false,
+            "dataType": "boolean",
+            "label": "false",
+            "code": "false"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断培训师是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "trainer_id",
+            "dataType": "string",
+            "label": "页面组件-trainer_id",
+            "code": "inbiz('trainer_id').value"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请选择培训师",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请选择培训师",
+            "dataType": "string",
+            "label": "请选择培训师",
+            "code": "'请选择培训师'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断课时是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "class_hour",
+            "dataType": "string",
+            "label": "页面组件-class_hour",
+            "code": "inbiz('class_hour').value"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请填写课时",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请填写课时",
+            "dataType": "string",
+            "label": "请填写课时",
+            "code": "'请填写课时'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断可自主学习是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "self_learning",
+            "dataType": "string",
+            "label": "页面组件-self_learning",
+            "code": "inbiz('self_learning').value"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请选择可自主学习",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请选择可自主学习",
+            "dataType": "string",
+            "label": "请选择可自主学习",
+            "code": "'请选择可自主学习'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    }
+  ],
+  "clean_content": "继续为培训地点的空值判断添加提示和退出节点，然后完成剩余字段验证。",
+  "result": {
+    "success": true,
+    "cost_usd": 0.431512,
+    "duration_ms": 34621,
+    "total_messages": 373,
+    "total_turns": 2,
+    "stream_events": 366,
+    "tool_calls_count": 8,
+    "full_text_len": 4011,
+    "clean_content_len": 33,
+    "has_streamed_text": true,
+    "has_typo_tool_calls": false,
+    "diagnostics": {
+      "raw_length": 4011,
+      "tool_calls_count": 8,
+      "typo_markers": [],
+      "has_typo_tool_calls": false,
+      "auto_repair_used": false,
+      "json_actions_removed_chars": 0
+    }
+  }
+}

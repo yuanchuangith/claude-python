@@ -1,0 +1,221 @@
+{
+  "timestamp": "2026-06-02T22:20:06.632995",
+  "request": {
+    "mode": "sse-stream",
+    "prompt_len": 170586,
+    "prompt_preview": "# Low-Code Orchestration Agent\n\nYou are a low-code orchestration agent for ActionDesign. Your job is to understand the user's business request, choose registered orchestration elements, and create valid action nodes through tools. Static instructions are in English; business data such as component names, field labels, and user-provided text may appear in their original language and must be preserved.\n\n## Core Constraints\n\n1. Use only registered elements from the compact element catalog below.\n2.",
+    "model": "default",
+    "max_turns": 99999,
+    "max_tokens": 8192,
+    "tool_names": [
+      "exit_plan_mode",
+      "create_node",
+      "get_element_detail",
+      "enter_plan_mode",
+      "get_component_methods",
+      "insert_node",
+      "preview_code",
+      "delete_node",
+      "list_elements",
+      "get_page_actions",
+      "propose_plan",
+      "ask_user",
+      "create_action"
+    ],
+    "auto_repair": true,
+    "images_count": 0
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "type": "AssistantMessage",
+      "blocks": []
+    },
+    {
+      "turn": 2,
+      "type": "AssistantMessage",
+      "blocks": [
+        {
+          "type": "TextBlock",
+          "length": 2656,
+          "text": "计划已批准，开始执行。首先创建验证子动作 `validateBeforeSubmit`。\n\n[TOOL_CALL] create_action({\"actionKey\": \"validateBeforeSubmit\", \"title\": \"提交前数据完整性验证\", \"actionType\": \"js\", \"description\": \"表单提交前验证所有可见表单字段是否已填写\"})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断计划培训月份是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"month\", \"dataType\": \"string\", \"label\": \"页面组件-month\", \"code\": \"inbiz('month').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写计划培训月份\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写计划培训月份\", \"dataType\": \"string\", \"label\": \"请填写计划培训月份\", \"code\": \"'请填写计划培训月份'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训主题是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"training_theme\", \"dataType\": \"string\", \"label\": \"页面组件-training_theme\", \"code\": \"inbiz('training_theme').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写培训主题\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写培训主题\", \"dataType\": \"string\", \"label\": \"请填写培训主题\", \"code\": \"'请填写培训主题'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训地点是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"training_location\", \"dataType\": \"string\", \"label\": \"页面组件-training_location\", \"code\": \"inbiz('training_location').value\"}}})"
+        }
+      ]
+    },
+    {
+      "type": "ResultMessage",
+      "subtype": "success",
+      "is_error": false,
+      "errors": null,
+      "cost_usd": 0.415672,
+      "duration_ms": 20678
+    }
+  ],
+  "raw_content": "计划已批准，开始执行。首先创建验证子动作 `validateBeforeSubmit`。\n\n[TOOL_CALL] create_action({\"actionKey\": \"validateBeforeSubmit\", \"title\": \"提交前数据完整性验证\", \"actionType\": \"js\", \"description\": \"表单提交前验证所有可见表单字段是否已填写\"})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断计划培训月份是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"month\", \"dataType\": \"string\", \"label\": \"页面组件-month\", \"code\": \"inbiz('month').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写计划培训月份\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写计划培训月份\", \"dataType\": \"string\", \"label\": \"请填写计划培训月份\", \"code\": \"'请填写计划培训月份'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训主题是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"training_theme\", \"dataType\": \"string\", \"label\": \"页面组件-training_theme\", \"code\": \"inbiz('training_theme').value\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"OpenMessageDialog\", \"title\": \"提示：请填写培训主题\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"message\": {\"paramTypes\": \"custom\", \"value\": \"请填写培训主题\", \"dataType\": \"string\", \"label\": \"请填写培训主题\", \"code\": \"'请填写培训主题'\"}, \"type\": {\"paramTypes\": \"custom\", \"value\": \"error\", \"dataType\": \"string\", \"label\": \"错误\", \"code\": \"'error'\"}, \"duration\": {\"paramTypes\": \"custom\", \"value\": 3, \"dataType\": \"number\", \"label\": \"3\", \"code\": \"3\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证\", \"targetAction\": \"validateBeforeSubmit\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": false, \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n[TOOL_CALL] create_node({\"elementKey\": \"NullCondition\", \"title\": \"判断培训地点是否为空\", \"targetAction\": \"validateBeforeSubmit\", \"inputParams\": {\"parameter\": {\"paramTypes\": \"componentsVariable\", \"value\": \"training_location\", \"dataType\": \"string\", \"label\": \"页面组件-training_location\", \"code\": \"inbiz('training_location').value\"}}})",
+  "tool_calls": [
+    {
+      "name": "create_action",
+      "arguments": {
+        "actionKey": "validateBeforeSubmit",
+        "title": "提交前数据完整性验证",
+        "actionType": "js",
+        "description": "表单提交前验证所有可见表单字段是否已填写"
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断计划培训月份是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "month",
+            "dataType": "string",
+            "label": "页面组件-month",
+            "code": "inbiz('month').value"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请填写计划培训月份",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请填写计划培训月份",
+            "dataType": "string",
+            "label": "请填写计划培训月份",
+            "code": "'请填写计划培训月份'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "ExitAction",
+        "title": "退出验证",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "returnValue": {
+            "paramTypes": "custom",
+            "value": false,
+            "dataType": "boolean",
+            "label": "false",
+            "code": "false"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断培训主题是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "training_theme",
+            "dataType": "string",
+            "label": "页面组件-training_theme",
+            "code": "inbiz('training_theme').value"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "OpenMessageDialog",
+        "title": "提示：请填写培训主题",
+        "targetAction": "validateBeforeSubmit",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "message": {
+            "paramTypes": "custom",
+            "value": "请填写培训主题",
+            "dataType": "string",
+            "label": "请填写培训主题",
+            "code": "'请填写培训主题'"
+          },
+          "type": {
+            "paramTypes": "custom",
+            "value": "error",
+            "dataType": "string",
+            "label": "错误",
+            "code": "'error'"
+          },
+          "duration": {
+            "paramTypes": "custom",
+            "value": 3,
+            "dataType": "number",
+            "label": "3",
+            "code": "3"
+          }
+        }
+      }
+    },
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "NullCondition",
+        "title": "判断培训地点是否为空",
+        "targetAction": "validateBeforeSubmit",
+        "inputParams": {
+          "parameter": {
+            "paramTypes": "componentsVariable",
+            "value": "training_location",
+            "dataType": "string",
+            "label": "页面组件-training_location",
+            "code": "inbiz('training_location').value"
+          }
+        }
+      }
+    }
+  ],
+  "clean_content": "计划已批准，开始执行。首先创建验证子动作 `validateBeforeSubmit`。",
+  "result": {
+    "success": true,
+    "cost_usd": 0.415672,
+    "duration_ms": 21724,
+    "total_messages": 275,
+    "total_turns": 2,
+    "stream_events": 268,
+    "tool_calls_count": 7,
+    "full_text_len": 2656,
+    "clean_content_len": 44,
+    "has_streamed_text": true,
+    "has_typo_tool_calls": false,
+    "diagnostics": {
+      "raw_length": 2656,
+      "tool_calls_count": 7,
+      "typo_markers": [],
+      "has_typo_tool_calls": false,
+      "auto_repair_used": false,
+      "json_actions_removed_chars": 0
+    }
+  }
+}

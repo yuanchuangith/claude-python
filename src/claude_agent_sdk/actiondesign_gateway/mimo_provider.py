@@ -33,6 +33,7 @@ from .mimo_stream import (
     stream_text_delta,
 )
 from .models import DESIGN_TOOLS, MIMO_IMAGE_MODELS
+from .review_protocol import REVIEW_SYSTEM_PROMPT, parse_code_review_response
 from .session_log import append_conversation_event, model_to_dict
 from .tool_protocol import (
     clean_tool_protocol_text,
@@ -42,10 +43,23 @@ from .tool_protocol import (
 
 _MIMO_INCOMPLETE_CODE = "MIMO_RESPONSE_INCOMPLETE"
 _MIMO_BACKEND_TOOL_PROMPT = """Backend-only tools:
-- When you need ActionDesign component parameters, events, usage, or examples,
-  first call [BACKEND_TOOL_CALL] knowledge.search({"query":"..."}).
+Read-before-write rule:
+- If you are not certain about an ActionDesign element's inputParams,
+  outputParams, events, methods, examples, constraints, or required parameter
+  shape, do not guess and do not write canvas nodes yet.
+- First call [BACKEND_TOOL_CALL] knowledge.search({"query":"..."}).
 - If search snippets are not enough, call
   [BACKEND_TOOL_CALL] knowledge.read({"path":"...", "heading":"..."}).
+- A response that contains knowledge.search or knowledge.read must not also
+  contain frontend write tool calls such as create_action, create_node,
+  insert_node, or delete_node. Wait for backend results, then continue in the
+  next turn.
+- Use knowledge.search/read for general ActionDesign element rules, component
+  conventions, method/event contracts, examples, and constraints.
+- Use frontend read-only tools for live page state: inspect_action for current
+  canvas nodes, get_page_actions for existing page actions, get_element_detail
+  for registered element details, and get_component_methods for actual page
+  component methods.
 - You may also use backend MCP or Skill tools with [BACKEND_TOOL_CALL] tool_name({...}).
 - Available backend tool namespaces are knowledge.*, mcp.*, and skill.*.
 - Backend tool calls are executed only by the backend and must never be shown to the frontend.
@@ -54,7 +68,17 @@ _MIMO_BACKEND_TOOL_PROMPT = """Backend-only tools:
 
 ActionDesign frontend tools:
 - Final answers should only use [TOOL_CALL] tool_name({...}) for ActionDesign frontend tools such as create_node, preview_code, and propose_plan.
-- Frontend tool calls are executed by the frontend after the backend returns."""
+- Frontend tool calls are executed by the frontend after the backend returns.
+
+Examples:
+- If you need to create submit-time form validation but are unsure about
+  NullCondition or BeforeSubmit parameters, first call
+  [BACKEND_TOOL_CALL] knowledge.search({"query":"NullCondition BeforeSubmit inputParams validation examples"}).
+- If you need to call a page component method and the concrete methods are
+  unknown, use [TOOL_CALL] get_component_methods({"componentId":"C:<componentId>"})
+  before creating ComponentMethod nodes.
+- If you need general BeforeSubmit binding constraints or examples, first call
+  [BACKEND_TOOL_CALL] knowledge.search({"query":"BeforeSubmit binding constraints examples"})."""
 
 
 async def call_mimo(req: Any, settings: Any) -> dict[str, Any]:
@@ -89,6 +113,30 @@ async def call_mimo(req: Any, settings: Any) -> dict[str, Any]:
     if loop_result.get("code"):
         payload["code"] = loop_result["code"]
     return payload
+
+
+async def call_mimo_review(req: Any, settings: Any) -> dict[str, Any]:
+    """Call MiMo for a JSON-only ActionDesign code review."""
+    started = time.time()
+    model = _model(req, settings)
+    _reject_unsupported_images(req, model)
+    body = _messages_body(
+        req,
+        settings,
+        model,
+        stream=False,
+        messages=_initial_messages(req),
+        system_prompt=_review_system_prompt(req),
+    )
+    payload = await _post_mimo(body, settings)
+    content = _extract_response_text(payload)
+    return parse_code_review_response(
+        content,
+        provider="mimo",
+        model=model,
+        duration_ms=_duration_ms(started),
+        usage=_payload_usage(payload),
+    )
 
 
 async def stream_mimo(req: Any, settings: Any) -> AsyncIterator[str]:
@@ -420,6 +468,16 @@ def _system_prompt(req: Any) -> str:
     if system_prompt:
         return f"{system_prompt}\n\n{_MIMO_BACKEND_TOOL_PROMPT}"
     return _MIMO_BACKEND_TOOL_PROMPT
+
+
+def _review_system_prompt(req: Any) -> str:
+    system_prompt = str(
+        _request_value(req, "systemPrompt", "system_prompt", default="")
+        or ""
+    )
+    if system_prompt:
+        return f"{system_prompt}\n\n{REVIEW_SYSTEM_PROMPT}"
+    return REVIEW_SYSTEM_PROMPT
 
 
 def _message_content(req: Any) -> str | list[dict[str, Any]]:

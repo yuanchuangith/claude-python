@@ -1,0 +1,108 @@
+{
+  "timestamp": "2026-06-02T16:34:51.267685",
+  "request": {
+    "mode": "sse-stream",
+    "prompt_len": 94056,
+    "prompt_preview": "# 低代码编排助手\n\n你是一个专业的低代码编排助手，擅长分析业务需求并生成编排动作数据。你的核心能力是：\n- 理解用户的业务逻辑需求\n- 从元件精简目录中选择合适的元件组合\n- 生成符合规范的 ActionDataType[] 数据\n- 自动拆分功能模块为子动作\n\n## 核心约束（必须严格遵守）\n1. **只能使用下方元件精简目录中列出的元件**，不得使用任何未注册的元件\n2. **不得自由编写代码**，所有代码必须通过元件的 generateJsCode/generateCsharpCode 生成\n3. **参数值必须严格匹配元件定义的结构**，参考每个元件的参数说明和示例\n4. **动作类型**: 前端动作 (JavaScript)\n5. **效率优先**: 尽量使用最少的元件组合实现需求，避免过度设计\n6. **⚠️ 当用户说\"帮我在 XX 动作里加一个 XX\"时，所有新增节点必须放在 \"main\" key 下，不要创建其他 key！**\n7. **⚠️ 元件精简目录已按当前动作类型过滤，只能使用目录中列出的元件，不要使用任何其他元件！**\n\n## 意图判断（重要 — 决定是否调",
+    "model": "default",
+    "max_turns": 99999,
+    "max_tokens": 8192,
+    "tool_names": [
+      "create_node",
+      "insert_node",
+      "list_elements",
+      "get_element_detail",
+      "get_page_actions",
+      "propose_plan",
+      "exit_plan_mode",
+      "create_action",
+      "get_component_methods",
+      "delete_node",
+      "enter_plan_mode",
+      "ask_user",
+      "preview_code"
+    ],
+    "auto_repair": true,
+    "images_count": 0
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "type": "AssistantMessage",
+      "blocks": []
+    },
+    {
+      "turn": 2,
+      "type": "AssistantMessage",
+      "blocks": [
+        {
+          "type": "TextBlock",
+          "length": 410,
+          "text": "继续创建申请部门验证的退出动作，并预览代码。\n\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证（申请部门为空）\", \"targetAction\": \"validateForm\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": \"false\", \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n\n[TOOL_CALL] preview_code({\"targetAction\": \"validateForm\"})\n\n[TOOL_CALL] preview_code({\"targetAction\": \"main\"})"
+        }
+      ]
+    },
+    {
+      "type": "ResultMessage",
+      "subtype": "success",
+      "is_error": false,
+      "errors": null,
+      "cost_usd": 0.049029,
+      "duration_ms": 15178
+    }
+  ],
+  "raw_content": "继续创建申请部门验证的退出动作，并预览代码。\n\n[TOOL_CALL] create_node({\"elementKey\": \"ExitAction\", \"title\": \"退出验证（申请部门为空）\", \"targetAction\": \"validateForm\", \"insertAfterKey\": \"__last__\", \"inputParams\": {\"returnValue\": {\"paramTypes\": \"custom\", \"value\": \"false\", \"dataType\": \"boolean\", \"label\": \"false\", \"code\": \"false\"}}})\n\n[TOOL_CALL] preview_code({\"targetAction\": \"validateForm\"})\n\n[TOOL_CALL] preview_code({\"targetAction\": \"main\"})",
+  "tool_calls": [
+    {
+      "name": "create_node",
+      "arguments": {
+        "elementKey": "ExitAction",
+        "title": "退出验证（申请部门为空）",
+        "targetAction": "validateForm",
+        "insertAfterKey": "__last__",
+        "inputParams": {
+          "returnValue": {
+            "paramTypes": "custom",
+            "value": "false",
+            "dataType": "boolean",
+            "label": "false",
+            "code": "false"
+          }
+        }
+      }
+    },
+    {
+      "name": "preview_code",
+      "arguments": {
+        "targetAction": "validateForm"
+      }
+    },
+    {
+      "name": "preview_code",
+      "arguments": {
+        "targetAction": "main"
+      }
+    }
+  ],
+  "clean_content": "继续创建申请部门验证的退出动作，并预览代码。",
+  "result": {
+    "success": true,
+    "cost_usd": 0.049029,
+    "duration_ms": 16187,
+    "total_messages": 127,
+    "total_turns": 2,
+    "stream_events": 120,
+    "tool_calls_count": 3,
+    "full_text_len": 410,
+    "clean_content_len": 22,
+    "has_streamed_text": true,
+    "has_typo_tool_calls": false,
+    "diagnostics": {
+      "raw_length": 410,
+      "tool_calls_count": 3,
+      "typo_markers": [],
+      "has_typo_tool_calls": false,
+      "auto_repair_used": false
+    }
+  }
+}

@@ -12,12 +12,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .actiondesign_backend_executor import warm_knowledge_index
 from .backend_tools import BackendToolCall, BackendToolResult, execute_backend_tool_calls
-from .claude_code_provider import call_claude_code, stream_claude_code
-from .mimo_provider import call_mimo, stream_mimo
+from .claude_code_provider import (
+    call_claude_code,
+    call_claude_code_review,
+    stream_claude_code,
+)
+from .mimo_provider import call_mimo, call_mimo_review, stream_mimo
 from .models import (
     MIMO_MODELS,
     AgentChatRequest,
     AgentChatResponse,
+    CodeReviewRequest,
+    CodeReviewResponse,
     ToolResultRequest,
 )
 from .qdrant_knowledge_store import qdrant_knowledge_store_from_settings
@@ -306,6 +312,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> JSONResponse:
         return await _chat(req, request, "claude-code")
 
+    @app.post(
+        "/api/actiondesign-agent/mimo/review",
+        response_model=CodeReviewResponse,
+    )
+    async def mimo_review(
+        req: CodeReviewRequest, request: Request
+    ) -> JSONResponse:
+        return await _review(req, request, "mimo")
+
+    @app.post(
+        "/api/actiondesign-agent/claude-code/review",
+        response_model=CodeReviewResponse,
+    )
+    async def claude_code_review(
+        req: CodeReviewRequest, request: Request
+    ) -> JSONResponse:
+        return await _review(req, request, "claude-code")
+
     @app.post("/api/actiondesign-agent/mimo/chat/stream")
     async def mimo_chat_stream(
         req: AgentChatRequest, request: Request
@@ -396,6 +420,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers=_conversation_headers(conversation_id, run_id),
         )
 
+    async def _review(
+        req: CodeReviewRequest,
+        request: Request,
+        provider: Literal["mimo", "claude-code"],
+    ) -> JSONResponse:
+        started = time.time()
+        conversation_id = resolve_conversation_id(request, req)
+        req.conversation_id = conversation_id
+        req.provider = provider
+        req.model = _resolved_request_model(req, gateway_settings, provider)
+        run_id = require_run_id_for_full_log(gateway_settings, req)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            _review_request_event(req, provider, run_id),
+        )
+
+        try:
+            raw_response = (
+                await call_mimo_review(req, gateway_settings)
+                if provider == "mimo"
+                else await call_claude_code_review(req, gateway_settings)
+            )
+        except Exception as exc:
+            append_conversation_event(
+                gateway_settings,
+                conversation_id,
+                _review_response_event(
+                    _review_exception_response_payload(exc, provider, req.model),
+                    conversation_id,
+                    run_id,
+                    started,
+                ),
+            )
+            raise
+        content = _code_review_response_payload(raw_response)
+        append_conversation_event(
+            gateway_settings,
+            conversation_id,
+            _review_response_event(content, conversation_id, run_id, started),
+        )
+        return JSONResponse(
+            content=content,
+            headers=_conversation_headers(conversation_id, run_id),
+        )
+
     def _chat_stream(
         req: AgentChatRequest,
         request: Request,
@@ -466,6 +536,14 @@ def _agent_response_payload(raw_response: dict) -> dict:
     return response.dict()
 
 
+def _code_review_response_payload(raw_response: dict) -> dict:
+    response = CodeReviewResponse(**raw_response)
+    dump = getattr(response, "model_dump", None)
+    if callable(dump):
+        return dump(mode="json", by_alias=True)
+    return response.dict(by_alias=True)
+
+
 def _response_event(
     response: dict,
     conversation_id: str,
@@ -483,6 +561,53 @@ def _response_event(
         "model": response.get("model"),
         "content": response.get("content", ""),
         "toolCalls": response.get("tool_calls", []),
+        "success": bool(response.get("success", False)),
+        "error": response.get("error"),
+        "code": response.get("code"),
+        "usage": response.get("usage", {}),
+        "duration": duration,
+    }
+
+
+def _review_request_event(
+    req: CodeReviewRequest,
+    provider: Literal["mimo", "claude-code"],
+    run_id: str,
+) -> dict:
+    request_body = model_to_dict(req)
+    if isinstance(request_body, dict):
+        request_body["provider"] = provider
+        request_body["conversationId"] = req.conversation_id
+        request_body["runId"] = run_id
+    return {
+        "type": "review_request",
+        "conversationId": req.conversation_id,
+        "runId": run_id,
+        "provider": provider,
+        "model": req.model,
+        "userPrompt": req.prompt,
+        "requestBody": request_body,
+    }
+
+
+def _review_response_event(
+    response: dict,
+    conversation_id: str,
+    run_id: str,
+    started: float,
+) -> dict:
+    duration = response.get("duration_ms")
+    if duration is None:
+        duration = int((time.time() - started) * 1000)
+    return {
+        "type": "review_response",
+        "conversationId": conversation_id,
+        "runId": run_id,
+        "provider": response.get("provider"),
+        "model": response.get("model"),
+        "pass": bool(response.get("pass", False)),
+        "summary": response.get("summary", ""),
+        "issues": response.get("issues", []),
         "success": bool(response.get("success", False)),
         "error": response.get("error"),
         "code": response.get("code"),
@@ -519,6 +644,45 @@ def _exception_response_payload(
         "error": error,
         "code": code,
         "usage": {},
+    }
+
+
+def _review_exception_response_payload(
+    exc: Exception,
+    provider: Literal["mimo", "claude-code"],
+    model: str,
+) -> dict:
+    code = "PROVIDER_ERROR"
+    error = str(exc)
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or code)
+            error = str(
+                detail.get("message")
+                or detail.get("error")
+                or detail.get("code")
+                or error
+            )
+        else:
+            error = str(detail or error)
+    return {
+        "provider": provider,
+        "model": model,
+        "pass": False,
+        "summary": "Review provider failed.",
+        "issues": [
+            {
+                "severity": "error",
+                "code": code,
+                "message": error,
+            }
+        ],
+        "success": False,
+        "error": error,
+        "code": code,
+        "usage": {},
+        "raw": "",
     }
 
 

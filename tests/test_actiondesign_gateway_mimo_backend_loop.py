@@ -7,7 +7,11 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from claude_agent_sdk.actiondesign_gateway import backend_tools, mimo_provider
+from claude_agent_sdk.actiondesign_gateway import (
+    backend_tools,
+    claude_code_provider,
+    mimo_provider,
+)
 from claude_agent_sdk.actiondesign_gateway.backend_tools import (
     BackendToolCall,
     BackendToolResult,
@@ -29,6 +33,12 @@ def sse_payloads(events: list[str]) -> list[dict[str, Any]]:
 
 def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def full_log_path(root, conversation_id):
+    matches = sorted(root.glob(f"????????_??????_{conversation_id}.jsonl"))
+    assert len(matches) == 1
+    return matches[0]
 
 
 async def _aiter(items: list[str]):
@@ -90,6 +100,38 @@ NullCondition validates required form fields before submit.
 """,
         encoding="utf-8",
     )
+
+
+def assert_read_before_write_prompt(prompt: str):
+    assert "Read-before-write rule" in prompt
+    assert "inputParams" in prompt
+    assert "outputParams" in prompt
+    assert "events" in prompt
+    assert "methods" in prompt
+    assert "examples" in prompt
+    assert "constraints" in prompt
+    assert "[BACKEND_TOOL_CALL] knowledge.search" in prompt
+    assert "[BACKEND_TOOL_CALL] knowledge.read" in prompt
+    assert "must not also" in prompt
+    assert "create_node" in prompt
+    assert "insert_node" in prompt
+    assert "inspect_action" in prompt
+    assert "get_element_detail" in prompt
+    assert "get_component_methods" in prompt
+    assert "NullCondition BeforeSubmit inputParams validation examples" in prompt
+
+
+def test_mimo_system_prompt_requires_knowledge_read_before_write():
+    prompt = mimo_provider._system_prompt({"prompt": "x"})
+
+    assert_read_before_write_prompt(prompt)
+
+
+def test_claude_code_prompt_requires_knowledge_read_before_write():
+    prompt = claude_code_provider._prompt({"prompt": "x"})
+
+    assert_read_before_write_prompt(prompt)
+    assert "Claude Code internal tools" in prompt
 
 
 def test_mimo_messages_url_accepts_anthropic_base_url():
@@ -233,7 +275,7 @@ def test_mimo_full_conversation_log_records_model_and_backend_tool_events(
     )
 
     assert response["content"] == "final answer"
-    events = read_jsonl(tmp_path / "conv_provider.jsonl")
+    events = read_jsonl(full_log_path(tmp_path, "conv_provider"))
     assert [event["type"] for event in events] == [
         "model_turn",
         "backend_tool_call",
@@ -535,7 +577,7 @@ def test_mimo_stream_full_conversation_log_records_assembled_turn(
         ]
 
     payloads = sse_payloads(anyio.run(collect_events))
-    events = read_jsonl(tmp_path / "conv_stream_provider.jsonl")
+    events = read_jsonl(full_log_path(tmp_path, "conv_stream_provider"))
 
     assert [
         payload["content"] for payload in payloads if payload["type"] == "text_delta"
@@ -543,6 +585,86 @@ def test_mimo_stream_full_conversation_log_records_assembled_turn(
     assert [event["type"] for event in events] == ["model_turn"]
     assert events[0]["content"] == "hello"
     assert events[0]["runId"] == "run_stream"
+
+
+def test_mimo_review_parses_json_response(monkeypatch):
+    captured_bodies = []
+
+    async def fake_post_mimo(body, _settings):
+        captured_bodies.append(body)
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "pass": False,
+                            "summary": "需要显式 return false",
+                            "issues": [
+                                {
+                                    "severity": "error",
+                                    "code": "EXIT_RETURN_VALUE",
+                                    "message": "ExitAction 缺少 returnValue=false",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 5},
+        }
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo_review,
+        {
+            "prompt": "review code",
+            "conversationId": "conv_review_provider",
+            "runId": "run_review",
+            "model": "mimo-v2.5",
+        },
+        make_settings(),
+    )
+
+    assert response["provider"] == "mimo"
+    assert response["model"] == "mimo-v2.5"
+    assert response["pass"] is False
+    assert response["issues"][0]["code"] == "EXIT_RETURN_VALUE"
+    assert response["success"] is True
+    assert response["usage"] == {"input_tokens": 3, "output_tokens": 5}
+    assert "Return only valid JSON" in captured_bodies[0]["system"]
+
+
+def test_mimo_review_rejects_frontend_tool_calls(monkeypatch):
+    async def fake_post_mimo(_body, _settings):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '[TOOL_CALL] create_node({"elementKey":"ExitAction"})',
+                }
+            ],
+        }
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo_review,
+        {
+            "prompt": "review code",
+            "conversationId": "conv_review_tool",
+            "runId": "run_review_tool",
+        },
+        make_settings(),
+    )
+
+    assert response["success"] is False
+    assert response["pass"] is False
+    assert response["code"] == "REVIEW_TOOL_CALL_NOT_ALLOWED"
+    assert response["issues"][0]["code"] == "REVIEW_TOOL_CALL_NOT_ALLOWED"
+    assert response["issues"][0]["severity"] == "error"
 
 
 def test_model_turn_log_summarizes_frontend_tools_and_content_diagnostics(tmp_path):
@@ -569,7 +691,9 @@ def test_model_turn_log_summarizes_frontend_tools_and_content_diagnostics(tmp_pa
         False,
     )
 
-    raw = (tmp_path / "conv_tool_diagnostics.jsonl").read_text(encoding="utf-8")
+    raw = full_log_path(tmp_path, "conv_tool_diagnostics").read_text(
+        encoding="utf-8"
+    )
     assert len(raw.splitlines()) == 1
     events = [json.loads(raw)]
     assert events[0]["content"] == content

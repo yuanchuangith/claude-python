@@ -1,0 +1,1 @@
+{"type": "backend_tool_call", "conversationId": "", "runId": "", "provider": "claude-code", "toolName": "knowledge.search", "arguments": {"query": "required validation"}, "time": "2026-06-10T15:08:46.486673+00:00"}

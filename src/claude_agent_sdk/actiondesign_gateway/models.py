@@ -102,6 +102,49 @@ class AgentChatResponse(_GatewayBaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
 
 
+class CodeReviewRequest(_GatewayBaseModel):
+    """Code review request accepted by the ActionDesign gateway."""
+
+    provider: Literal["mimo", "claude-code", "auto"] = "mimo"
+    model: str = ""
+    conversation_id: str = Field(default="", alias="conversationId")
+    run_id: str = Field(default="", alias="runId")
+    prompt: str
+    max_tokens: int = Field(default=8192, alias="maxTokens")
+    project_path: str = Field(
+        default="src/core/common/ActionDesign",
+        alias="projectPath",
+    )
+
+
+class CodeReviewIssue(_GatewayBaseModel):
+    """Single issue returned by a code review provider."""
+
+    severity: str = "error"
+    code: str = ""
+    message: str = ""
+    action_key: str = Field(default="", alias="actionKey")
+    node_key: str = Field(default="", alias="nodeKey")
+    evidence: str = ""
+    fix: str = ""
+
+
+class CodeReviewResponse(_GatewayBaseModel):
+    """Structured code review response returned by review endpoints."""
+
+    provider: Literal["mimo", "claude-code"]
+    model: str
+    passed: bool = Field(default=False, alias="pass")
+    summary: str = ""
+    issues: list[CodeReviewIssue] = Field(default_factory=list)
+    success: bool = True
+    error: str | None = None
+    code: str | None = None
+    duration_ms: int = 0
+    usage: dict[str, Any] = Field(default_factory=dict)
+    raw: str = ""
+
+
 class ToolResultRequest(_GatewayBaseModel):
     """Tool execution result posted back by the ActionDesign client."""
 

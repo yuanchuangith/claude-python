@@ -27,6 +27,7 @@ from .backend_tools import (
 )
 from .mimo_protocol import has_malformed_backend_tool_call
 from .models import DESIGN_TOOLS
+from .review_protocol import parse_code_review_response, review_prompt
 from .session_log import append_conversation_event, model_to_dict
 from .tool_protocol import clean_tool_protocol_text, extract_tool_calls
 
@@ -40,13 +41,36 @@ ActionDesign frontend tools:
 - Backend filtering will only return ActionDesign frontend tools to the frontend executor."""
 
 _CLAUDE_CODE_BACKEND_TOOL_PROMPT = """Backend-only knowledge tools:
-- When you need ActionDesign component parameters, events, usage, examples, or constraints,
-  first call [BACKEND_TOOL_CALL] knowledge.search({"query":"..."}).
+Read-before-write rule:
+- If you are not certain about an ActionDesign element's inputParams,
+  outputParams, events, methods, examples, constraints, or required parameter
+  shape, do not guess and do not write canvas nodes yet.
+- First call [BACKEND_TOOL_CALL] knowledge.search({"query":"..."}).
 - If search snippets are not enough, call
   [BACKEND_TOOL_CALL] knowledge.read({"path":"...", "heading":"..."}).
+- A response that contains knowledge.search or knowledge.read must not also
+  contain frontend write tool calls such as create_action, create_node,
+  insert_node, or delete_node. Wait for backend results, then continue in the
+  next turn.
+- Use knowledge.search/read for general ActionDesign element rules, component
+  conventions, method/event contracts, examples, and constraints.
+- Use frontend read-only tools for live page state: inspect_action for current
+  canvas nodes, get_page_actions for existing page actions, get_element_detail
+  for registered element details, and get_component_methods for actual page
+  component methods.
 - Backend tool calls are executed only by the backend and must never be shown to the frontend.
 - Do not use [BACKEND_TOOL_CALL] for ActionDesign canvas operations.
-- get_element_detail, list_elements, get_page_actions, propose_plan, create_node, insert_node, delete_node, and preview_code are frontend tools and must never be used with [BACKEND_TOOL_CALL]."""
+- get_element_detail, list_elements, get_page_actions, propose_plan, create_node, insert_node, delete_node, and preview_code are frontend tools and must never be used with [BACKEND_TOOL_CALL].
+
+Examples:
+- If you need to create submit-time form validation but are unsure about
+  NullCondition or BeforeSubmit parameters, first call
+  [BACKEND_TOOL_CALL] knowledge.search({"query":"NullCondition BeforeSubmit inputParams validation examples"}).
+- If you need to call a page component method and the concrete methods are
+  unknown, use [TOOL_CALL] get_component_methods({"componentId":"C:<componentId>"})
+  before creating ComponentMethod nodes.
+- If you need general BeforeSubmit binding constraints or examples, first call
+  [BACKEND_TOOL_CALL] knowledge.search({"query":"BeforeSubmit binding constraints examples"})."""
 
 
 async def call_claude_code(req: Any, settings: Any) -> dict[str, Any]:
@@ -70,6 +94,24 @@ async def call_claude_code(req: Any, settings: Any) -> dict[str, Any]:
         usage={"total_cost_usd": loop_result["total_cost_usd"]},
         model=_model(req, settings),
         provider="claude-code",
+    )
+
+
+async def call_claude_code_review(req: Any, settings: Any) -> dict[str, Any]:
+    started = time.time()
+    response = await _collect_claude_code_response(
+        req,
+        settings,
+        review_prompt(str(_request_value(req, "prompt", default=""))),
+        include_partial_messages=False,
+    )
+    return parse_code_review_response(
+        response["content"],
+        provider="claude-code",
+        model=_model(req, settings),
+        duration_ms=_duration_ms(started),
+        usage={"total_cost_usd": response["total_cost_usd"]},
+        tool_calls=response["native_tool_calls"],
     )
 
 
