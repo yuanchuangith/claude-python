@@ -27,6 +27,7 @@ _REDACTED = "[REDACTED]"
 def safe_conversation_id(value: str) -> str:
     if value == "":
         return f"unknown_{int(time.time() * 1000)}"
+    value = value.replace(":", "_")
     if not _CONVERSATION_ID_RE.fullmatch(value):
         raise HTTPException(
             status_code=400,

@@ -92,7 +92,7 @@
 
 ## 请求和响应模型
 
-`AgentChatRequest` 描述前端发给后端的请求，包含 provider、model、conversationId、prompt、stream、toolNames、images、maxTokens、thinking、projectPath 等字段。
+`AgentChatRequest` 描述前端发给后端的请求，包含 provider、model、conversationId、runId、prompt、stream、toolNames、images、maxTokens、thinking、projectPath 等字段。
 
 响应格式保持一致：
 
@@ -119,6 +119,8 @@ data: {"type":"message_complete","content":"...","tool_calls":[],"success":true}
 ```
 
 前端判断一次 provider 调用完成时，以 `message_complete` 为准。
+
+provider 专用 chat 入口遇到 review 兼容请求时，仍返回 `AgentChatResponse` 形状；但 `content` 是前端 review/repair 闸门使用的 JSON 字符串，`tool_calls` 固定为空。触发条件是 `runId` 包含 `:review`，或 prompt 包含 `ActionDesign Reviewer Agent`。
 
 Review 响应格式保持结构化 JSON，不返回前端工具调用：
 
@@ -149,6 +151,8 @@ Review 响应格式保持结构化 JSON，不返回前端工具调用：
 ```
 
 `/review` endpoint 强制模型只输出 JSON。若模型返回 `[TOOL_CALL]` / `[TOL_CALL]` 或任何前端工具调用，后端直接返回 `success: false`、`pass: false`、`code: REVIEW_TOOL_CALL_NOT_ALLOWED`。若模型没有返回单个合法 JSON object，返回 `REVIEW_RESPONSE_INVALID_JSON`。
+
+现有 provider 专用 `/review` 路由保持不变。chat 入口的 review 兼容层只负责识别历史前端请求，内部调用对应 provider 的 review 实现，再转换成前端 `ReviewTOW` 风格 payload：issue 映射字段包括 `id/severity/category/message/targetAction/nodeKey/evidence/repairHint`，并聚合 `repairInstructions`。其中 `REVIEW_TOOL_CALL_NOT_ALLOWED` 映射为 `tool_execution`，`REVIEW_RESPONSE_INVALID_JSON` 映射为 `conversation_error`，其它 review issue 默认映射为 `semantic_error`。
 
 ## Provider 行为
 
@@ -224,6 +228,17 @@ Claude Code review 入口 `call_claude_code_review()` 复用 Claude Code 只读�
 [TOOL_CALL] create_node({"elementKey":"ExitAction","targetAction":"main"})
 ```
 
+也兼容 MiMo 可能输出的 XML 风格前端工具协议：
+
+```xml
+<tool_call>
+<function=propose_plan>
+<parameter=summary>计划摘要</parameter>
+<parameter=approaches>[{"title":"方案","steps":["读取组件方法","创建节点"]}]</parameter>
+</function>
+</tool_call>
+```
+
 后端通过 `extract_tool_calls()` 解析，生成：
 
 ```json
@@ -240,12 +255,13 @@ Claude Code review 入口 `call_claude_code_review()` 复用 Claude Code 只读�
 
 - 支持 `[TOOL_CALL]`
 - 兼容误写 `[TOL_CALL]`
+- 支持 `<tool_call><function=...><parameter=...>` XML 风格前端工具协议，并把参数恢复为标准 `arguments`
 - 支持未加引号 key 的 JSON repair
 - 避免破坏 URL 中的冒号
 - 支持 JSON actions 提取
 - 支持 `Question -> ask_user`
 - 支持图片 data URL 前缀剥离
-- 支持跨 chunk 隐藏工具协议
+- 支持跨 chunk 隐藏 `[TOOL_CALL]` 和 XML 工具协议
 - 工具调用清理只移除完整工具表达式，不截断后续普通说明文本
 
 ## JSON actions 恢复
@@ -420,6 +436,7 @@ GET /api/actiondesign-agent/tool-results/{conversation_id}/{run_id}
 
 - prompt 预览和尾部预览。
 - provider、model、duration、success、error。
+- 前端传入的 `agentMode`，用于排查当前轮次是 normal、plan 还是 chat。
 - 原始模型文本、clean content、tool_calls。
 - backend tool 调用和回灌结果。
 - 前端 tool-result 回传。
@@ -447,9 +464,10 @@ GET /api/actiondesign-agent/tool-results/{conversation_id}/{run_id}
 
 - provider API key、embedding API key 只从后端环境变量读取，不进入前端，也不写 localStorage。
 - 日志脱敏会处理 secret、Authorization、api-key、图片 base64 等敏感内容。
-- `conversationId` 做安全校验，非法 id 返回 400。
+- `conversationId` 做安全校验，校验前会把 `:` 归一化为 `_`，例如 `conv_x:review` 变为 `conv_x_review`；其它非法字符仍返回 `INVALID_CONVERSATION_ID`。`runId` 不做同样归一化，响应头仍回写原始 `X-Run-Id`。
 - `projectPath` 只在路径存在时用于 Claude Code cwd，不存在不失败。
 - 后端不直接修改 ActionDesign 画布状态。
+- 后端只记录/转发 `agentMode`，不按该字段执行画布权限判断；真正的 normal/plan/chat 权限仍由前端 AgentLoop 硬拦截。
 - 第一版不执行 shell，不写项目文件，不自动运行 skill 中的命令。
 - 前端可执行工具必须来自 ActionDesign 白名单。
 - backend-only 工具结果不暴露给前端。
@@ -559,9 +577,9 @@ MiMo provider 已完成以下修复：
 - 开启完整日志时，chat/stream 请求必须由前端在 body 传入 `runId`；缺失返回 400，code 为 `RUN_ID_REQUIRED`。后端不自动生成 `runId`。
 - chat/stream 响应 header 会回写 `X-Conversation-Id` 和 `X-Run-Id`，方便前端和日志文件对齐。
 - 不使用 IP、cookie 或 provider 判断同一对话；`conversationId` 是唯一会话主键，`runId` 只区分同一对话里的某一次用户发送。
-- `request` 事件在进入 provider 前写入，包含 provider、model、userPrompt、requestBody 等。
+- `request` 事件在进入 provider 前写入，包含 provider、model、agentMode、userPrompt、requestBody 等。
 - `request.model` 记录进入 provider 前解析出的实际模型；前端没传 `model` 时也会落到默认模型，例如 `mimo-v2.5`。
-- `model_turn` 事件由 MiMo/Claude Code provider 在每个模型轮次完成后写入，记录完整 assembled 文本、stopReason、usage、是否包含 backend tool call。
+- `model_turn` 事件由 MiMo/Claude Code provider 在每个模型轮次完成后写入，记录 agentMode、完整 assembled 文本、stopReason、usage、是否包含 backend tool call。
 - `backend_tool_call` 和 `backend_tool_result` 事件记录 provider 内部 backend-only tool 执行；`knowledge.search/read` 也按 backend tool 记录。
 - `response` 事件在最终返回前写入；stream 不记录每个 `text_delta`，只记录 assembled model turn 和最终 response。
 - `/api/actiondesign-agent/tool-result` 收到前端工具结果后，额外追加 `tool_result` 到同一个 `yyyyMMdd_HHmmss_{conversationId}.jsonl` 文件；如果该 conversationId 的时间前缀日志文件已存在，会复用已有文件而不是按回传时间新建文件。
@@ -609,6 +627,9 @@ Gateway 相关测试：
 - `/models` 无 key 时显示 `mimo.unavailable`。
 - `/models` 返回 provider 专用 `chatPath/streamPath`。
 - provider 专用 `/review` endpoint 返回 CodeReview JSON，且不包含 `tool_calls`。
+- chat review 兼容请求会触发对应 provider 的 review 调用。
+- `conversationId` 中的 `:` 会归一化为 `_`。
+- review chat 响应会转换为前端 repair payload，且不返回 `tool_calls`。
 - `/models` 中 Claude Code 默认复用 MiMo 模型列表和 `defaultModel`，前端可展示/切换同一套 MiMo 模型。
 - `CLAUDE_CODE_MODELS` 仅作为显式覆盖；`CLAUDE_CODE_DEFAULT_MODEL` 会自动并入列表。
 - `/tool-result` 幂等。
@@ -693,6 +714,19 @@ python -m pytest tests/test_actiondesign_gateway_knowledge_vector_index.py tests
 已执行：
 
 ```powershell
+$env:PYTHONPATH='src'
+python -m pytest tests/test_actiondesign_gateway_app.py -q
+```
+
+结果：
+
+```text
+27 passed
+```
+
+已执行：
+
+```powershell
 python -m compileall src\claude_agent_sdk\actiondesign_gateway examples\actiondesign_agent_gateway.py
 ```
 
@@ -740,3 +774,35 @@ git diff --check
 - 新增 `review_protocol.py`，集中处理 reviewer system prompt、JSON 解析、invalid JSON 失败和工具调用拦截。
 - MiMo review 使用 Anthropic-compatible Messages API 单轮调用，不执行 backend tool loop；Claude Code review 复用 Claude Code 只读能力，但最终也必须返回 JSON。
 - 如果 reviewer 返回 `[TOOL_CALL]` / `[TOL_CALL]` 或 native frontend tool call，后端返回 `REVIEW_TOOL_CALL_NOT_ALLOWED`，用于防止 Reviewer endpoint 写画布。
+
+## 2026-06-11 review chat 兼容和部署脚本更新
+
+- provider 专用 chat 入口支持 review 兼容请求，不新增公开路由；当 `runId` 包含 `:review` 或 prompt 包含 `ActionDesign Reviewer Agent` 时，后端内部调用对应 provider 的 review 实现。
+- review chat 兼容响应仍使用 `AgentChatResponse` 外壳，`content` 内嵌前端 review/repair 闸门 JSON，`tool_calls` 为空；完整会话 JSONL 会同时记录普通 `request/response` 和 `review_request/review_response`。
+- `conversationId` 新增冒号归一化，校验前把 `:` 转为 `_`；`runId` 保留原始值并继续通过 `X-Run-Id` 回写。
+- `deploy.sh` 改为使用 `pip install -e ".[actiondesign]"` 安装依赖；`deploy.sh` 和 `downLog.py` 的 SSH key 路径更新为当前 Windows 用户目录下的 `code_new.pem`。
+
+## 2026-06-16 XML 前端工具协议兼容
+
+- `tool_protocol.py` 新增 XML 风格前端工具调用解析，支持 `<tool_call><function=propose_plan><parameter=summary>...</parameter></function></tool_call>`，并把参数转换为标准 `{"name": "...", "arguments": {...}}`；参数值能解析为 JSON 时保留数组/对象等结构，否则作为字符串。
+- `clean_tool_protocol_text()` 会移除完整 XML tool call，避免非流式响应已有 `tool_calls` 时聊天区仍展示 XML 协议文本。
+- `emit_safe_text()` / `flush_pending()` 增加 XML 协议起始识别，跨 chunk 输出时会缓存到 `</tool_call>` 完整后解析，不把半截 XML 透传给前端。
+- `mimo_protocol.py`、MiMo provider 和 Claude Code provider 的 frontend malformed 诊断纳入 `<tool_call` marker；完整会话 JSONL 的 `frontendToolCallCount/frontendToolCallNames/contentDiagnostics` 能记录 XML tool call 和 malformed XML。
+- 已执行验证：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m pytest tests/test_actiondesign_gateway_tool_protocol.py tests/test_actiondesign_gateway_mimo_backend_loop.py -q
+```
+
+结果：
+
+```text
+57 passed
+```
+
+## 2026-06-22 agentMode 日志透传
+
+- `AgentChatRequest` 新增 `agentMode` 请求字段，允许值为 `normal`、`plan`、`chat` 或空字符串，用于接收前端当前 AgentLoop 模式。
+- 完整会话 JSONL 的 `request` 事件和 MiMo/Claude Code 的 `model_turn` 事件都会记录 `agentMode`，方便排查某一轮模型为什么生成了写画布工具。
+- 后端只记录/转发 `agentMode`，不按 `agentMode=chat` 过滤写入工具；画布写入权限仍由前端 AgentLoop 硬拦截，避免后端静默过滤削弱前端拦截闭环。

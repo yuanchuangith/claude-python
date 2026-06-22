@@ -7,7 +7,9 @@ from .tool_protocol import clean_tool_protocol_text, extract_tool_calls
 
 BACKEND_TOOL_CALL_MARKER = "[BACKEND_TOOL_CALL]"
 BACKEND_TOOL_RESULT_MARKER = "[BACKEND_TOOL_RESULT]"
-FRONTEND_TOOL_MARKERS = ("[TOOL_CALL]", "[TOL_CALL]")
+XML_FRONTEND_TOOL_MARKER = "<tool_call"
+XML_FRONTEND_TOOL_END_MARKER = "</tool_call>"
+FRONTEND_TOOL_MARKERS = ("[TOOL_CALL]", "[TOL_CALL]", XML_FRONTEND_TOOL_MARKER)
 PROTOCOL_CALL_MARKERS = (*FRONTEND_TOOL_MARKERS, BACKEND_TOOL_CALL_MARKER)
 PROTOCOL_MARKERS = (*PROTOCOL_CALL_MARKERS, BACKEND_TOOL_RESULT_MARKER)
 
@@ -70,7 +72,7 @@ def emit_safe_text_after_turn(
     pending += chunk
     chunks: list[str] = []
     while pending:
-        marker_index = pending.find("[")
+        marker_index = _next_protocol_marker_index(pending)
         if marker_index == -1:
             chunks.append(pending)
             pending = ""
@@ -85,7 +87,7 @@ def emit_safe_text_after_turn(
         if marker is None:
             if is_protocol_marker_prefix(pending):
                 break
-            next_marker = pending.find("[", 1)
+            next_marker = _next_protocol_marker_index(pending, start=1)
             if next_marker == -1:
                 chunks.append(pending)
                 pending = ""
@@ -108,7 +110,7 @@ def emit_safe_text_after_turn(
 
 
 def flush_safe_text_after_turn(pending: str) -> str:
-    if contains_protocol_marker(pending):
+    if contains_protocol_marker(pending) or contains_protocol_marker_prefix(pending):
         return ""
     return pending
 
@@ -128,7 +130,17 @@ def contains_protocol_marker(text: str) -> bool:
     return any(marker in text for marker in PROTOCOL_MARKERS)
 
 
+def contains_protocol_marker_prefix(text: str) -> bool:
+    return any(is_protocol_marker_prefix(text[index:]) for index in range(len(text)))
+
+
 def find_protocol_call_end(text: str) -> int | None:
+    if text.startswith(XML_FRONTEND_TOOL_MARKER):
+        end = text.find(XML_FRONTEND_TOOL_END_MARKER)
+        if end == -1:
+            return None
+        return end + len(XML_FRONTEND_TOOL_END_MARKER)
+
     paren_start = text.find("(")
     if paren_start == -1:
         return None
@@ -155,6 +167,15 @@ def find_protocol_call_end(text: str) -> int | None:
             if depth == 0:
                 return index + 1
     return None
+
+
+def _next_protocol_marker_index(text: str, start: int = 0) -> int:
+    indexes = [
+        index
+        for index in (text.find("[", start), text.find("<", start))
+        if index != -1
+    ]
+    return min(indexes) if indexes else -1
 
 
 def has_complete_frontend_tool_call(content: str) -> bool:

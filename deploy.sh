@@ -3,7 +3,7 @@ set -e
 
 SERVER="43.135.137.212"
 USER="ubuntu"
-KEY="F:/Desktop/code_new.pem"
+KEY="C:/Users/yuanchuan/Desktop/code_new.pem"
 REMOTE_DIR="/home/ubuntu/claude-agent-sdk"
 PORT=8888
 
@@ -28,7 +28,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 # Install Python dependencies
-pip install uvicorn fastapi httpx python-multipart pydantic
+pip install -e ".[actiondesign]"
 
 # Create systemd service file
 sudo tee /etc/systemd/system/claude-agent-gateway.service > /dev/null << 'SERVICE'
@@ -40,6 +40,7 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/claude-agent-sdk
+EnvironmentFile=/home/ubuntu/actiondesign-agent-gateway/.env
 Environment="PATH=/home/ubuntu/claude-agent-sdk/venv/bin:/usr/bin:/bin"
 Environment="PYTHONPATH=/home/ubuntu/claude-agent-sdk/src"
 ExecStart=/home/ubuntu/claude-agent-sdk/venv/bin/uvicorn claude_agent_sdk.actiondesign_gateway.app:app --host 0.0.0.0 --port 8888

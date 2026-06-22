@@ -208,6 +208,7 @@ def test_full_conversation_log_chat_writes_request_and_response(
             "provider": "mimo",
             "conversationId": "conv_body",
             "runId": "run_1",
+            "agentMode": "chat",
             "prompt": "hello raw prompt",
             "toolNames": [],
         },
@@ -221,11 +222,13 @@ def test_full_conversation_log_chat_writes_request_and_response(
     assert [event["type"] for event in events] == ["request", "response"]
     assert events[0]["conversationId"] == "conv_header"
     assert events[0]["runId"] == "run_1"
+    assert events[0]["agentMode"] == "chat"
     assert events[0]["provider"] == "mimo"
     assert events[0]["model"] == "mimo-v2.5"
     assert events[0]["userPrompt"] == "hello raw prompt"
     assert events[0]["requestBody"]["conversationId"] == "conv_header"
     assert events[0]["requestBody"]["model"] == "mimo-v2.5"
+    assert events[0]["requestBody"]["agentMode"] == "chat"
     assert events[1]["content"] == "mimo ok"
     assert events[1]["toolCalls"] == [{"name": "preview_code", "arguments": {}}]
 
@@ -606,6 +609,105 @@ def test_mimo_review_route_returns_structured_review_without_tool_calls(
     assert response.json()["pass"] is False
     assert response.json()["issues"][0]["code"] == "BARE_RETURN"
     assert "tool_calls" not in response.json()
+
+
+def test_mimo_chat_review_compat_normalizes_review_conversation_id(
+    tmp_path, monkeypatch
+):
+    async def fake_call_mimo_review(req, settings):
+        assert req.conversation_id == "conv_x_review"
+        assert req.run_id == "run_x:review:1"
+        return {
+            "provider": "mimo",
+            "model": req.model,
+            "pass": True,
+            "summary": "review passed",
+            "issues": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 5,
+            "usage": {"input_tokens": 1},
+            "raw": '{"pass":true}',
+        }
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.app.call_mimo_review",
+        fake_call_mimo_review,
+    )
+    client = make_client(log_root=tmp_path, mimo_api_key="secret")
+
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        json={
+            "provider": "mimo",
+            "conversationId": "conv_x:review",
+            "runId": "run_x:review:1",
+            "prompt": "review generated code",
+            "toolNames": ["inspect_action", "preview_code"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-Conversation-Id"] == "conv_x_review"
+    assert response.headers["X-Run-Id"] == "run_x:review:1"
+    assert response.json()["tool_calls"] == []
+    assert json.loads(response.json()["content"])["passed"] is True
+
+
+def test_mimo_chat_review_compat_returns_reviewtow_json(tmp_path, monkeypatch):
+    async def fake_call_mimo_review(req, settings):
+        return {
+            "provider": "mimo",
+            "model": req.model,
+            "pass": False,
+            "summary": "return contract failed",
+            "issues": [
+                {
+                    "severity": "error",
+                    "code": "EXIT_RETURN_VALUE",
+                    "message": "ExitAction must return false",
+                    "actionKey": "validateForm",
+                    "nodeKey": "exit_1",
+                    "evidence": "return;",
+                    "fix": "Recreate ExitAction with returnValue=false.",
+                }
+            ],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 8,
+            "usage": {"input_tokens": 3, "output_tokens": 5},
+            "raw": '{"pass":false}',
+        }
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.actiondesign_gateway.app.call_mimo_review",
+        fake_call_mimo_review,
+    )
+    client = make_client(log_root=tmp_path, mimo_api_key="secret")
+
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        json={
+            "provider": "mimo",
+            "conversationId": "conv_review_compat",
+            "runId": "run_review_compat",
+            "prompt": "You are the ActionDesign Reviewer Agent, not the Generator.",
+            "toolNames": ["inspect_action", "preview_code"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["tool_calls"] == []
+    content = json.loads(body["content"])
+    assert content["passed"] is False
+    assert content["issues"][0]["category"] == "semantic_error"
+    assert content["issues"][0]["targetAction"] == "validateForm"
+    assert content["issues"][0]["nodeKey"] == "exit_1"
+    assert "returnValue=false" in content["issues"][0]["repairHint"]
 
 
 def test_claude_code_review_route_forces_claude_provider(tmp_path, monkeypatch):

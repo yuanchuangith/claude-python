@@ -199,6 +199,56 @@ def test_mimo_executes_backend_tool_then_returns_only_frontend_tool(monkeypatch)
     assert "mcp.search" not in str(response["tool_calls"])
 
 
+def test_mimo_returns_xml_frontend_tool_call(monkeypatch):
+    async def fake_post_mimo(_body, _settings):
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "计划已生成\n"
+                        "<tool_call>\n"
+                        "<function=propose_plan>\n"
+                        "<parameter=summary>创建提交校验计划</parameter>\n"
+                        "<parameter=approaches>"
+                        '[{"title":"先检查","steps":["读取组件方法","创建节点"]}]'
+                        "</parameter>\n"
+                        "</function>\n"
+                        "</tool_call>"
+                    ),
+                }
+            ]
+        }
+
+    monkeypatch.setattr(mimo_provider, "_post_mimo", fake_post_mimo)
+
+    response = anyio.run(
+        mimo_provider.call_mimo,
+        {
+            "prompt": "make a plan",
+            "toolNames": ["propose_plan"],
+        },
+        make_settings(),
+    )
+
+    assert response["content"] == "计划已生成"
+    assert response["tool_calls"] == [
+        {
+            "name": "propose_plan",
+            "arguments": {
+                "summary": "创建提交校验计划",
+                "approaches": [
+                    {
+                        "title": "先检查",
+                        "steps": ["读取组件方法", "创建节点"],
+                    }
+                ],
+            },
+        }
+    ]
+    assert "<tool_call" not in response["content"]
+
+
 def test_mimo_executes_knowledge_search_then_returns_only_frontend_tool(
     tmp_path,
     monkeypatch,
@@ -671,14 +721,21 @@ def test_model_turn_log_summarizes_frontend_tools_and_content_diagnostics(tmp_pa
     content = (
         '[TOOL_CALL] create_node({"elementKey":"ExitAction"})\n'
         '[TOOL_CALL] preview_code({"targetAction":"main"})\n'
-        'bad fragment \x00 [TOOL_CALL] create_node({"elementKey":"x"'
+        '<tool_call>\n'
+        '<function=propose_plan>\n'
+        '<parameter=summary>计划</parameter>\n'
+        '</function>\n'
+        '</tool_call>\n'
+        'bad fragment \x00 [TOOL_CALL] create_node({"elementKey":"x"\n'
+        'bad xml <tool_call><function=propose_plan>'
     )
 
     mimo_provider._log_model_turn(
         {
             "conversationId": "conv_tool_diagnostics",
             "runId": "run_tool_diagnostics",
-            "toolNames": ["create_node", "preview_code"],
+            "agentMode": "plan",
+            "toolNames": ["create_node", "preview_code", "propose_plan"],
         },
         make_settings(
             full_conversation_log_enabled=True,
@@ -697,8 +754,13 @@ def test_model_turn_log_summarizes_frontend_tools_and_content_diagnostics(tmp_pa
     assert len(raw.splitlines()) == 1
     events = [json.loads(raw)]
     assert events[0]["content"] == content
-    assert events[0]["frontendToolCallCount"] == 2
-    assert events[0]["frontendToolCallNames"] == ["create_node", "preview_code"]
+    assert events[0]["agentMode"] == "plan"
+    assert events[0]["frontendToolCallCount"] == 3
+    assert events[0]["frontendToolCallNames"] == [
+        "create_node",
+        "preview_code",
+        "propose_plan",
+    ]
     assert events[0]["contentDiagnostics"]["containsControlCharacters"] is True
     assert events[0]["contentDiagnostics"]["containsMalformedFrontendToolCall"] is True
 
@@ -791,6 +853,52 @@ def test_mimo_stream_cleans_malformed_frontend_tool_marker(monkeypatch):
     assert "TOL_CALL" not in payload
     assert "TOOL_CALL" not in payload
     assert '"content": "visible"' in payload
+
+
+def test_mimo_stream_hides_split_xml_frontend_tool_call(monkeypatch):
+    async def fake_stream_post_mimo(_body, _settings):
+        for text in [
+            "计划已生成 <tool",
+            "_call>\n<function=propose_plan>\n",
+            "<parameter=summary>创建提交校验计划</parameter>\n",
+            "</function>\n</tool_call>",
+        ]:
+            yield {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": text},
+            }
+        yield {"type": "message_stop"}
+
+    monkeypatch.setattr(
+        mimo_provider,
+        "_stream_post_mimo",
+        fake_stream_post_mimo,
+        raising=False,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in mimo_provider.stream_mimo(
+                {"prompt": "make a plan", "toolNames": ["propose_plan"]},
+                make_settings(),
+            )
+        ]
+
+    events = anyio.run(collect_events)
+    payloads = sse_payloads(events)
+    payload = "".join(events)
+
+    assert "<tool_call" not in payload
+    assert "</tool_call>" not in payload
+    assert payloads[-1]["type"] == "message_complete"
+    assert payloads[-1]["content"] == "计划已生成"
+    assert payloads[-1]["tool_calls"] == [
+        {
+            "name": "propose_plan",
+            "arguments": {"summary": "创建提交校验计划"},
+        }
+    ]
 
 
 def test_mimo_stream_hides_backend_tool_protocol(monkeypatch):

@@ -25,7 +25,7 @@ from .backend_tools import (
     format_backend_tool_results,
     frontend_tool_misuse_result,
 )
-from .mimo_protocol import has_malformed_backend_tool_call
+from .mimo_protocol import FRONTEND_TOOL_MARKERS, has_malformed_backend_tool_call
 from .models import DESIGN_TOOLS
 from .review_protocol import parse_code_review_response, review_prompt
 from .session_log import append_conversation_event, model_to_dict
@@ -477,6 +477,7 @@ def _log_model_turn(
             "type": "model_turn",
             "conversationId": conversation_id,
             "runId": _run_id(req),
+            "agentMode": _agent_mode(req),
             "provider": "claude-code",
             "model": _model(req, settings),
             "content": content,
@@ -548,6 +549,10 @@ def _run_id(req: Any) -> str:
     return str(_request_value(req, "runId", "run_id", default="") or "")
 
 
+def _agent_mode(req: Any) -> str:
+    return str(_request_value(req, "agentMode", "agent_mode", default="") or "")
+
+
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(_response(**payload), ensure_ascii=False)}\n\n"
 
@@ -594,11 +599,11 @@ def _contains_malformed_frontend_tool_call(
     content: str,
     frontend_tool_calls: list[dict[str, Any]],
 ) -> bool:
-    has_marker = "[TOOL_CALL]" in content or "[TOL_CALL]" in content
+    has_marker = any(marker in content for marker in FRONTEND_TOOL_MARKERS)
     if has_marker and not frontend_tool_calls:
         return True
     cleaned = clean_tool_protocol_text(content)
-    return "[TOOL_CALL]" in cleaned or "[TOL_CALL]" in cleaned
+    return any(marker in cleaned for marker in FRONTEND_TOOL_MARKERS)
 
 
 def _duration_ms(started: float) -> int:

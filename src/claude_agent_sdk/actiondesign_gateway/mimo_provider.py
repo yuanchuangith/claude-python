@@ -19,6 +19,7 @@ from .backend_tools import (
 )
 from .mimo_http import post_mimo, stream_post_mimo
 from .mimo_protocol import (
+    FRONTEND_TOOL_MARKERS,
     clean_malformed_frontend_tool_text,
     has_malformed_backend_tool_call,
     has_malformed_frontend_tool_call,
@@ -636,6 +637,7 @@ def _log_model_turn(
             "type": "model_turn",
             "conversationId": conversation_id,
             "runId": _run_id(req),
+            "agentMode": _agent_mode(req),
             "provider": "mimo",
             "model": model,
             "content": content,
@@ -707,6 +709,10 @@ def _run_id(req: Any) -> str:
     return str(_request_value(req, "runId", "run_id", default="") or "")
 
 
+def _agent_mode(req: Any) -> str:
+    return str(_request_value(req, "agentMode", "agent_mode", default="") or "")
+
+
 def _clean_final_content(content: str) -> str:
     return clean_tool_protocol_text(
         clean_backend_tool_protocol_text(content)
@@ -761,7 +767,7 @@ def _contains_malformed_frontend_tool_call(
     if has_malformed_frontend_tool_call(content, frontend_tool_calls):
         return True
     cleaned = clean_tool_protocol_text(content)
-    return "[TOOL_CALL]" in cleaned or "[TOL_CALL]" in cleaned
+    return any(marker in cleaned for marker in FRONTEND_TOOL_MARKERS)
 
 
 def _duration_ms(started: float) -> int:

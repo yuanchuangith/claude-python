@@ -26,9 +26,9 @@ if sys.platform == "win32":
 
 SERVER = "43.135.137.212"
 USER = "ubuntu"
-KEY = r"F:\Desktop\code_new.pem"
+KEY = r"C:\Users\yuanchuan\Desktop\code_new.pem"
 
-REMOTE_CONVERSATION_LOG_DIR = "/home/ubuntu/actiondesign-agent-gateway/logs/actiondesign-agent"
+REMOTE_CONVERSATION_LOG_DIR = "/home/ubuntu/claude-agent-sdk/logs/actiondesign-agent"
 REMOTE_TOOL_LOG_DIR = "/home/ubuntu/actiondesign-agent-gateway/debug_logs"
 
 LOCAL_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_log")
@@ -161,12 +161,13 @@ def extract_archive(conv_names: list[str], tool_names: list[str]) -> None:
         tar.extractall(path=LOCAL_LOG_DIR)
 
     # 移动文件到正确目录
-    # 对话日志: debug_log/home/ubuntu/actiondesign-agent-gateway/logs/actiondesign-agent/xxx.jsonl
+    # 对话日志: debug_log/home/ubuntu/claude-agent-sdk/logs/actiondesign-agent/xxx.jsonl
     # 工具日志: debug_log/home/ubuntu/actiondesign-agent-gateway/debug_logs/xxx/
-    extracted_base = os.path.join(LOCAL_LOG_DIR, "home", "ubuntu", "actiondesign-agent-gateway")
+    extracted_sdk = os.path.join(LOCAL_LOG_DIR, "home", "ubuntu", "claude-agent-sdk")
+    extracted_gw = os.path.join(LOCAL_LOG_DIR, "home", "ubuntu", "actiondesign-agent-gateway")
 
     # 移动对话日志
-    remote_conv_dir = os.path.join(extracted_base, "logs", "actiondesign-agent")
+    remote_conv_dir = os.path.join(extracted_sdk, "logs", "actiondesign-agent")
     if os.path.exists(remote_conv_dir):
         for name in conv_names:
             src = os.path.join(remote_conv_dir, name)
@@ -175,7 +176,7 @@ def extract_archive(conv_names: list[str], tool_names: list[str]) -> None:
                 shutil.move(src, dst)
 
     # 移动工具日志
-    remote_tool_dir = os.path.join(extracted_base, "debug_logs")
+    remote_tool_dir = os.path.join(extracted_gw, "debug_logs")
     if os.path.exists(remote_tool_dir):
         for name in tool_names:
             src = os.path.join(remote_tool_dir, name)

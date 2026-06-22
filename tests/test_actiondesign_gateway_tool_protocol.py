@@ -96,8 +96,48 @@ def test_question_alias_args_transform_to_ask_user_shape():
     ]
 
 
+def test_extracts_xml_tool_call_parameters():
+    content = """
+<tool_call>
+<function=propose_plan>
+<parameter=summary>创建提交校验计划</parameter>
+<parameter=approaches>[{"title":"先检查","steps":["读取组件方法","创建节点"]}]</parameter>
+</function>
+</tool_call>
+"""
+
+    calls = extract_tool_calls(content)
+
+    assert calls == [
+        {
+            "name": "propose_plan",
+            "arguments": {
+                "summary": "创建提交校验计划",
+                "approaches": [
+                    {
+                        "title": "先检查",
+                        "steps": ["读取组件方法", "创建节点"],
+                    }
+                ],
+            },
+        }
+    ]
+
+
 def test_clean_tool_protocol_text_removes_calls_without_truncating_later_text():
     content = 'before [TOL_CALL] preview_code({"targetAction":"main"}) after'
+
+    cleaned = clean_tool_protocol_text(content)
+
+    assert cleaned == "before  after"
+
+
+def test_clean_tool_protocol_text_removes_xml_tool_call():
+    content = """before <tool_call>
+<function=propose_plan>
+<parameter=summary>计划</parameter>
+</function>
+</tool_call> after"""
 
     cleaned = clean_tool_protocol_text(content)
 
@@ -126,6 +166,32 @@ def test_safe_text_emitter_hides_tool_call_split_across_chunks():
     assert pending == ""
 
 
+def test_safe_text_emitter_hides_xml_tool_call_split_across_chunks():
+    pending = ""
+    chunks, calls, pending = emit_safe_text(pending, "hello <tool", {"propose_plan"})
+    assert chunks == ["hello "]
+    assert calls == []
+
+    chunks, calls, pending = emit_safe_text(
+        pending,
+        "_call>\n"
+        "<function=propose_plan>\n"
+        "<parameter=summary>计划</parameter>\n"
+        "</function>\n"
+        "</tool_call> tail",
+        {"propose_plan"},
+    )
+
+    assert chunks == [" tail"]
+    assert calls == [
+        {
+            "name": "propose_plan",
+            "arguments": {"summary": "计划"},
+        }
+    ]
+    assert pending == ""
+
+
 def test_flush_pending_returns_plain_text_or_extracts_tool_call():
     text, calls = flush_pending("[TOOL_CALL] preview_code({})", {"preview_code"})
     assert text is None
@@ -133,6 +199,10 @@ def test_flush_pending_returns_plain_text_or_extracts_tool_call():
 
     text, calls = flush_pending("[TOOL maybe text", {"preview_code"})
     assert text == "[TOOL maybe text"
+    assert calls == []
+
+    text, calls = flush_pending("visible <tool_call><function=propose_plan>")
+    assert text == "visible "
     assert calls == []
 
 
@@ -268,6 +338,7 @@ def test_claude_code_full_conversation_log_records_model_and_backend_tool_events
             "prompt": "build validation flow",
             "conversationId": "conv_claude_provider",
             "runId": "run_claude",
+            "agentMode": "normal",
             "toolNames": [],
         },
         Settings(
@@ -290,10 +361,12 @@ def test_claude_code_full_conversation_log_records_model_and_backend_tool_events
     ]
     assert events[0]["provider"] == "claude-code"
     assert events[0]["runId"] == "run_claude"
+    assert events[0]["agentMode"] == "normal"
     assert events[1]["toolName"] == "knowledge.search"
     assert events[1]["arguments"] == {"query": "required validation"}
     assert events[2]["status"] == "success"
     assert events[3]["content"] == "final answer"
+    assert events[3]["agentMode"] == "normal"
 
 
 def test_claude_code_internal_tools_can_be_configured_without_auto_allow(monkeypatch):

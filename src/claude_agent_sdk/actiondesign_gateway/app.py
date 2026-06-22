@@ -391,6 +391,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             _request_event(req, provider, run_id),
         )
 
+        if _is_review_chat_request(req):
+            append_conversation_event(
+                gateway_settings,
+                conversation_id,
+                _review_request_event(req, provider, run_id),
+            )
+            try:
+                raw_response = (
+                    await call_mimo_review(req, gateway_settings)
+                    if provider == "mimo"
+                    else await call_claude_code_review(req, gateway_settings)
+                )
+            except Exception as exc:
+                append_conversation_event(
+                    gateway_settings,
+                    conversation_id,
+                    _review_response_event(
+                        _review_exception_response_payload(exc, provider, req.model),
+                        conversation_id,
+                        run_id,
+                        started,
+                    ),
+                )
+                raise
+
+            review_event = _code_review_response_payload(raw_response)
+            append_conversation_event(
+                gateway_settings,
+                conversation_id,
+                _review_response_event(review_event, conversation_id, run_id, started),
+            )
+            content = _review_chat_response_payload(raw_response)
+            append_conversation_event(
+                gateway_settings,
+                conversation_id,
+                _response_event(content, conversation_id, run_id, started),
+            )
+            return JSONResponse(
+                content=content,
+                headers=_conversation_headers(conversation_id, run_id),
+            )
+
         try:
             raw_response = (
                 await call_mimo(req, gateway_settings)
@@ -517,10 +559,12 @@ def _request_event(
         request_body["provider"] = provider
         request_body["conversationId"] = req.conversation_id
         request_body["runId"] = run_id
+        request_body["agentMode"] = req.agent_mode
     return {
         "type": "request",
         "conversationId": req.conversation_id,
         "runId": run_id,
+        "agentMode": req.agent_mode,
         "provider": provider,
         "model": req.model,
         "userPrompt": req.prompt,
@@ -534,6 +578,72 @@ def _agent_response_payload(raw_response: dict) -> dict:
     if callable(dump):
         return dump(mode="json")
     return response.dict()
+
+
+def _is_review_chat_request(req: AgentChatRequest) -> bool:
+    run_id = str(getattr(req, "run_id", "") or "")
+    prompt = str(getattr(req, "prompt", "") or "")
+    return ":review" in run_id or "ActionDesign Reviewer Agent" in prompt
+
+
+def _review_chat_response_payload(raw_response: dict) -> dict:
+    review = _code_review_response_payload(raw_response)
+    issues = [
+        _review_tow_issue_payload(issue, index)
+        for index, issue in enumerate(review.get("issues", []))
+    ]
+    repair_instructions = [
+        issue["repairHint"]
+        for issue in issues
+        if issue.get("repairHint")
+    ]
+    content = {
+        "passed": bool(review.get("pass", False)),
+        "summary": str(review.get("summary") or ""),
+        "issues": issues,
+        "repairInstructions": repair_instructions,
+        "needAskUser": False,
+        "userQuestions": [],
+    }
+    return {
+        "provider": review.get("provider"),
+        "model": review.get("model"),
+        "content": json.dumps(content, ensure_ascii=False),
+        "tool_calls": [],
+        "success": True,
+        "error": None,
+        "code": None,
+        "duration_ms": review.get("duration_ms", 0),
+        "usage": review.get("usage", {}),
+    }
+
+
+def _review_tow_issue_payload(issue: dict, index: int) -> dict:
+    code = str(issue.get("code") or "")
+    fix = str(issue.get("fix") or "")
+    message = str(issue.get("message") or code or f"Review issue {index + 1}")
+    return {
+        "id": code or f"review-{index}",
+        "severity": str(issue.get("severity") or "error"),
+        "category": _review_tow_issue_category(code),
+        "message": message,
+        "targetAction": str(issue.get("actionKey") or ""),
+        "nodeKey": str(issue.get("nodeKey") or ""),
+        "elementKey": "",
+        "requirementId": "",
+        "expected": "",
+        "actual": message,
+        "evidence": str(issue.get("evidence") or ""),
+        "repairHint": fix,
+    }
+
+
+def _review_tow_issue_category(code: str) -> str:
+    if code == "REVIEW_TOOL_CALL_NOT_ALLOWED":
+        return "tool_execution"
+    if code == "REVIEW_RESPONSE_INVALID_JSON":
+        return "conversation_error"
+    return "semantic_error"
 
 
 def _code_review_response_payload(raw_response: dict) -> dict:

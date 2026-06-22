@@ -5,16 +5,28 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
+from html import unescape
 from typing import Any
 
 _RE_TOOL_CALL = re.compile(r"\[(?:TOOL_CALL|TOL_CALL)\]\s*(\w+)\s*\(", re.DOTALL)
-_RE_TOOL_CALL_MARKER = re.compile(r"\[(?:TOOL_CALL|TOL_CALL)\]")
+_RE_XML_TOOL_CALL = re.compile(r"<tool_call\b[^>]*>.*?</tool_call\s*>", re.DOTALL)
+_RE_XML_FUNCTION = re.compile(
+    r"<function=([A-Za-z_][\w]*)\s*>(.*?)</function\s*>",
+    re.DOTALL,
+)
+_RE_XML_PARAMETER = re.compile(
+    r"<parameter=([A-Za-z_][\w]*)\s*>(.*?)</parameter\s*>",
+    re.DOTALL,
+)
 _RE_CODE_BLOCK = re.compile(r"```(?:jsonc?|JSON)?\s*\n?(.*?)\n?```", re.DOTALL)
 _RE_DATA_URL = re.compile(r"^data:image/\w+;base64,", re.IGNORECASE)
 _RE_TRAILING_COMMA = re.compile(r",\s*([\]}])")
 _RE_SINGLE_QUOTED_KEY = re.compile(r"'([^']*)'\s*:")
 
-_MARKERS = ("[TOOL_CALL]", "[TOL_CALL]")
+_TEXT_MARKERS = ("[TOOL_CALL]", "[TOL_CALL]")
+_XML_TOOL_CALL_MARKER = "<tool_call>"
+_XML_TOOL_CALL_START = "<tool_call"
+_MARKERS = (*_TEXT_MARKERS, _XML_TOOL_CALL_MARKER)
 
 
 def normalize_image_data(data: str) -> str:
@@ -25,7 +37,7 @@ def normalize_image_data(data: str) -> str:
 def extract_tool_calls(content: str) -> list[dict[str, Any]]:
     """Extract ActionDesign tool calls from protocol text or JSON actions."""
     normalized = content.replace("[TOL_CALL]", "[TOOL_CALL]")
-    tool_calls: list[dict[str, Any]] = []
+    indexed_calls: list[tuple[int, dict[str, Any]]] = []
 
     for match in _RE_TOOL_CALL.finditer(normalized):
         result = _extract_balanced(normalized, match.end() - 1, "(", ")")
@@ -36,7 +48,14 @@ def extract_tool_calls(content: str) -> list[dict[str, Any]]:
         if args is None:
             continue
         name, args = _normalize_tool_call(match.group(1), args)
-        tool_calls.append({"name": name, "arguments": args})
+        indexed_calls.append((match.start(), {"name": name, "arguments": args}))
+
+    for match in _RE_XML_TOOL_CALL.finditer(normalized):
+        call = _extract_xml_tool_call(match.group(0))
+        if call is not None:
+            indexed_calls.append((match.start(), call))
+
+    tool_calls = [call for _, call in sorted(indexed_calls, key=lambda item: item[0])]
 
     for raw in _iter_json_action_sources(normalized):
         data = _parse_jsonish(raw)
@@ -52,16 +71,35 @@ def clean_tool_protocol_text(content: str) -> str:
     pieces: list[str] = []
     cursor = 0
 
-    for match in _RE_TOOL_CALL.finditer(normalized):
-        result = _extract_balanced(normalized, match.end() - 1, "(", ")")
-        if result is None:
-            continue
-        _, end = result
-        pieces.append(normalized[cursor : match.start()])
+    for start, end in _tool_protocol_spans(normalized):
+        pieces.append(normalized[cursor:start])
         cursor = end
 
     pieces.append(normalized[cursor:])
     return "".join(pieces)
+
+
+def _tool_protocol_spans(content: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+
+    for match in _RE_TOOL_CALL.finditer(content):
+        result = _extract_balanced(content, match.end() - 1, "(", ")")
+        if result is None:
+            continue
+        spans.append((match.start(), result[1]))
+
+    spans.extend(match.span() for match in _RE_XML_TOOL_CALL.finditer(content))
+    return _merge_spans(spans)
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start >= merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
 
 
 def emit_safe_text(
@@ -75,7 +113,7 @@ def emit_safe_text(
     tool_calls: list[dict[str, Any]] = []
 
     while pending:
-        marker_index = pending.find("[")
+        marker_index = _next_marker_index(pending)
         if marker_index == -1:
             text_chunks.append(pending)
             pending = ""
@@ -88,7 +126,11 @@ def emit_safe_text(
 
         marker = _matching_marker(pending)
         if marker is not None:
-            end = _find_tool_call_end(pending)
+            end = (
+                _find_xml_tool_call_end(pending)
+                if _is_xml_marker(marker)
+                else _find_tool_call_end(pending)
+            )
             if end is None:
                 break
             parsed = extract_tool_calls(pending[:end])
@@ -99,7 +141,7 @@ def emit_safe_text(
         if _is_marker_prefix(pending):
             break
 
-        next_marker = pending.find("[", 1)
+        next_marker = _next_marker_index(pending, start=1)
         if next_marker == -1:
             text_chunks.append(pending)
             pending = ""
@@ -118,9 +160,15 @@ def flush_pending(
     if not pending:
         return None, []
 
-    parsed = _filter_allowed(extract_tool_calls(pending), allowed_tools)
+    all_parsed = extract_tool_calls(pending)
+    parsed = _filter_allowed(all_parsed, allowed_tools)
     if parsed:
         return None, parsed
+    if all_parsed or _contains_tool_protocol_start_or_prefix(pending):
+        cleaned = clean_tool_protocol_text(pending)
+        if cleaned == pending:
+            cleaned = _strip_from_first_tool_protocol_start(pending)
+        return (cleaned or None), []
     return pending, []
 
 
@@ -142,6 +190,19 @@ def _is_marker_prefix(text: str) -> bool:
     return any(marker.startswith(text) for marker in _MARKERS)
 
 
+def _is_xml_marker(marker: str) -> bool:
+    return marker == _XML_TOOL_CALL_MARKER
+
+
+def _next_marker_index(text: str, start: int = 0) -> int:
+    indexes = [
+        index
+        for index in (text.find("[", start), text.find("<", start))
+        if index != -1
+    ]
+    return min(indexes) if indexes else -1
+
+
 def _find_tool_call_end(text: str) -> int | None:
     paren_start = text.find("(")
     if paren_start == -1:
@@ -150,6 +211,57 @@ def _find_tool_call_end(text: str) -> int | None:
     if result is None:
         return None
     return result[1]
+
+
+def _find_xml_tool_call_end(text: str) -> int | None:
+    end_marker = "</tool_call>"
+    end = text.find(end_marker)
+    if end == -1:
+        return None
+    return end + len(end_marker)
+
+
+def _contains_tool_protocol_start_or_prefix(text: str) -> bool:
+    if any(marker in text for marker in (*_TEXT_MARKERS, _XML_TOOL_CALL_START)):
+        return True
+    return any(_is_marker_prefix(text[index:]) for index in range(len(text)))
+
+
+def _strip_from_first_tool_protocol_start(text: str) -> str:
+    indexes = [
+        index
+        for marker in (*_TEXT_MARKERS, _XML_TOOL_CALL_START)
+        if (index := text.find(marker)) != -1
+    ]
+    indexes.extend(
+        index
+        for index in range(len(text))
+        if any(marker.startswith(text[index:]) for marker in _MARKERS)
+    )
+    if not indexes:
+        return text
+    return text[: min(indexes)]
+
+
+def _extract_xml_tool_call(block: str) -> dict[str, Any] | None:
+    function_match = _RE_XML_FUNCTION.search(block)
+    if function_match is None:
+        return None
+
+    args: dict[str, Any] = {}
+    for parameter_match in _RE_XML_PARAMETER.finditer(function_match.group(2)):
+        args[parameter_match.group(1)] = _parse_xml_parameter_value(
+            parameter_match.group(2)
+        )
+
+    name, args = _normalize_tool_call(function_match.group(1), args)
+    return {"name": name, "arguments": args}
+
+
+def _parse_xml_parameter_value(raw_value: str) -> Any:
+    value = unescape(raw_value.strip())
+    parsed = _parse_jsonish(value)
+    return value if parsed is None else parsed
 
 
 def _extract_balanced(

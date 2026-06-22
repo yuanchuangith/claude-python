@@ -74,6 +74,10 @@ class AgentChatRequest(_GatewayBaseModel):
     model: str = ""
     conversation_id: str = Field(default="", alias="conversationId")
     run_id: str = Field(default="", alias="runId")
+    agent_mode: Literal["normal", "plan", "chat", ""] = Field(
+        default="",
+        alias="agentMode",
+    )
     prompt: str
     stream: bool = False
     tool_names: list[str] = Field(default_factory=list, alias="toolNames")
