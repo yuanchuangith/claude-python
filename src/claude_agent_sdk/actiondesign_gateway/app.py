@@ -4,33 +4,48 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
 import secrets
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path as FilePath
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .claude_code_provider import call_claude_code, stream_claude_code
+from .identifiers import CONVERSATION_ID_PATTERN
 from .langsmith_forwarder import forward_trace_batch
 from .mimo_provider import call_mimo, stream_mimo
 from .models import (
+    AccessKeyRotateRequest,
+    AccessKeyRotateResponse,
+    AccessKeyStatusResponse,
+    AdminLoginRequest,
+    AdminLoginResponse,
     AgentChatRequest,
     AgentChatResponse,
     AgentModelsResponse,
     ApiProfileResponse,
     ApiProfileWriteRequest,
+    AuditLogListResponse,
+    ConversationEventsResponse,
+    ConversationListResponse,
+    ConversationSealRequest,
+    ConversationSealResponse,
     DeleteProfileResponse,
     GatewayEventEnvelope,
     HealthResponse,
     ReadonlyMcpToolCallRequest,
     ReadonlyMcpToolCallResponse,
     ReadonlyMcpToolListResponse,
+    RequestLogDetailResponse,
     RequestLogEntry,
     RequestLogListResponse,
     ToolResultRequest,
@@ -38,7 +53,14 @@ from .models import (
     TraceBatchRequest,
     TraceBatchResponse,
 )
-from .profile_store import ApiProfileStore, ProfileSecretStore, ProviderProfile
+from .admin_security import AdminSessionStore, BrowserApiKeyStore
+from .audit_log import AuditLogStore
+from .profile_store import (
+    ApiProfileStore,
+    ProfileSecretStore,
+    ProviderProfile,
+    RouteCandidate,
+)
 from .provider_http import call_provider, stream_provider
 from .request_log import RequestLogStore
 from .redaction import redact_value
@@ -47,8 +69,10 @@ from .session_log import (
     append_conversation_event,
     append_log,
     model_to_dict,
-    require_run_id_for_full_log,
-    resolve_conversation_id,
+    list_conversations,
+    read_conversation,
+    resolve_request_identity,
+    seal_conversation,
 )
 from .settings import Settings
 from .readonly_mcp import ReadonlyMcpError, ReadonlyMcpGateway
@@ -56,6 +80,7 @@ from .readonly_mcp import ReadonlyMcpError, ReadonlyMcpGateway
 PROTOCOL_VERSION = "1.0"
 API_PREFIX = "/api/actiondesign-agent"
 SERVICE_AUTH_HEADER = "X-ActionDesign-Service-Token"
+BROWSER_API_KEY_HEADER = "X-ActionDesign-Api-Key"
 ProfileIdPath = Annotated[
     str,
     Path(
@@ -67,6 +92,14 @@ ProfileIdPath = Annotated[
 RequestIdPath = Annotated[
     str,
     Path(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9._:-]+$"),
+]
+ConversationIdPath = Annotated[
+    str,
+    Path(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+]
+RuntimeConversationIdPath = Annotated[
+    str,
+    Path(min_length=36, max_length=36, pattern=CONVERSATION_ID_PATTERN),
 ]
 
 
@@ -84,12 +117,51 @@ def create_app(
         max_bytes=gateway_settings.request_log_max_bytes,
         backup_count=gateway_settings.request_log_backup_count,
     )
-    app = FastAPI(title="ActionDesign Thin Agent Gateway", version="2.1.0")
+    admin_sessions = AdminSessionStore(
+        gateway_settings.admin_password,
+        ttl_seconds=gateway_settings.admin_session_ttl_seconds,
+    )
+    browser_api_keys = BrowserApiKeyStore(
+        gateway_settings.browser_api_key_store_path
+    )
+    audit_root = FilePath(
+        gateway_settings.log_root or gateway_settings.profile_store_path.parent
+    )
+    audit_logs = AuditLogStore(audit_root / "system" / "admin-audit.jsonl")
+    app = FastAPI(title="ActionDesign Thin Agent Gateway", version="2.2.0")
     app.state.settings = gateway_settings
     app.state.profile_store = profile_store
     app.state.tool_results = tool_results
     app.state.readonly_mcp_gateway = readonly_mcp_gateway
     app.state.request_logs = request_logs
+    app.state.admin_sessions = admin_sessions
+    app.state.browser_api_keys = browser_api_keys
+    app.state.audit_logs = audit_logs
+
+    @app.middleware("http")
+    async def admin_ui_security_headers(
+        request: Request,
+        call_next: Any,
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path == "/admin" or request.url.path.startswith("/admin/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+                "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+            )
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+        return response
+
+    admin_static_root = FilePath(__file__).with_name("static") / "admin"
+    app.mount(
+        "/admin",
+        StaticFiles(directory=str(admin_static_root), html=True),
+        name="actiondesign-admin",
+    )
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_request_validation_error(
@@ -125,6 +197,7 @@ def create_app(
                 and gateway_settings.langsmith_api_key
             ),
             "readonlyMcpEnabled": readonly_mcp_gateway.enabled,
+            "fullConversationLogEnabled": gateway_settings.full_conversation_log_enabled,
         }
 
     @app.get(f"{API_PREFIX}/models", response_model=AgentModelsResponse)
@@ -140,12 +213,34 @@ def create_app(
             )
             for provider, profiles in grouped.items()
         }
-        default_capability = providers.get(gateway_settings.default_provider)
+        routing_order = profile_store.routing_order()
+        default_route = routing_order[0] if routing_order else None
         return {
-            "defaultProvider": gateway_settings.default_provider,
-            "defaultModel": default_capability.get("defaultModel", "") if default_capability else "",
+            "defaultProvider": (
+                default_route.profile.provider
+                if default_route is not None
+                else gateway_settings.default_provider
+            ),
+            "defaultModel": default_route.model.id if default_route is not None else "",
             "supportedProtocolVersions": [PROTOCOL_VERSION],
             "providers": providers,
+            "routingOrder": [
+                {
+                    "position": index,
+                    "provider": candidate.profile.provider,
+                    "profileId": candidate.profile.id,
+                    "protocol": candidate.profile.protocol,
+                    "model": candidate.model.id,
+                    "profilePriority": candidate.profile.priority,
+                    "modelPriority": candidate.model.priority,
+                    "isDefaultProfile": (
+                        candidate.profile.id
+                        == profile_store.default_profile_id(candidate.profile.provider)
+                    ),
+                    "isDefaultModel": candidate.model.id == candidate.profile.default_model,
+                }
+                for index, candidate in enumerate(routing_order, start=1)
+            ],
         }
 
     @app.post(
@@ -212,15 +307,54 @@ def create_app(
         response_model=ToolResultResponse,
         dependencies=[Depends(_require_service_auth)],
     )
-    async def tool_result(req: ToolResultRequest, request: Request) -> dict[str, Any]:
-        conversation_id = resolve_conversation_id(request, req)
-        duplicate = tool_results.store(gateway_settings, conversation_id, req)
+    async def tool_result(
+        req: ToolResultRequest,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        conversation_id, _ = resolve_request_identity(request, req)
+        request_id = f"req_{secrets.token_hex(12)}"
+        response.headers["X-Request-Id"] = request_id
+        duplicate = tool_results.store(
+            gateway_settings,
+            conversation_id,
+            req,
+            request_id=request_id,
+        )
         append_conversation_event(
             gateway_settings,
             conversation_id,
-            {"type": "tool_result", **model_to_dict(req), "duplicate": duplicate},
+            {
+                "type": "tool_result",
+                **model_to_dict(req),
+                "requestId": request_id,
+                "duplicate": duplicate,
+            },
         )
         return {"success": True, "message": "recorded", "duplicate": duplicate}
+
+    @app.post(
+        f"{API_PREFIX}/conversations/{{conversation_id}}/seal",
+        response_model=ConversationSealResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def service_seal_conversation(
+        conversation_id: RuntimeConversationIdPath,
+        req: ConversationSealRequest,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        request_id = f"req_{secrets.token_hex(12)}"
+        response.headers["X-Request-Id"] = request_id
+        result = seal_conversation(gateway_settings, conversation_id, req.status)
+        audit_logs.record(
+            action="conversation_seal",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=request_id,
+            details={"conversationId": conversation_id, "status": req.status},
+        )
+        return result
 
     @app.get(
         f"{API_PREFIX}/mcp/gxp-lowcode-readonly/tools",
@@ -299,6 +433,150 @@ def create_app(
         )
         return response
 
+    @app.post(
+        f"{API_PREFIX}/admin/login",
+        response_model=AdminLoginResponse,
+    )
+    async def admin_login(
+        req: AdminLoginRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_admin_origin(request, gateway_settings)
+        if not gateway_settings.admin_password:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "ADMIN_LOGIN_DISABLED"},
+            )
+        actor = _audit_actor(request)
+        request_id = f"admin_{secrets.token_hex(8)}"
+        result, status = admin_sessions.login(req.password, actor=actor)
+        audit_logs.record(
+            action="admin_login",
+            success=result is not None,
+            actor=actor,
+            request_id=request_id,
+            details={"result": status},
+        )
+        if result is None:
+            if status == "blocked":
+                raise HTTPException(
+                    status_code=429,
+                    detail={"code": "ADMIN_LOGIN_RATE_LIMITED"},
+                )
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "ADMIN_LOGIN_FAILED"},
+            )
+        return result
+
+    @app.get(
+        f"{API_PREFIX}/admin/access-key",
+        response_model=AccessKeyStatusResponse,
+    )
+    async def get_access_key(request: Request) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        return browser_api_keys.public()
+
+    @app.post(
+        f"{API_PREFIX}/admin/access-key/rotate",
+        response_model=AccessKeyRotateResponse,
+    )
+    async def rotate_access_key(
+        req: AccessKeyRotateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        try:
+            result = browser_api_keys.rotate(req.api_key)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_BROWSER_API_KEY"},
+            ) from exc
+        audit_logs.record(
+            action="browser_api_key_rotate",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={"masked": result["masked"]},
+        )
+        return result
+
+    @app.get(
+        f"{API_PREFIX}/admin/audit-logs",
+        response_model=AuditLogListResponse,
+    )
+    async def list_audit_logs(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        items, total = audit_logs.list(limit=limit, offset=offset)
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.get(
+        f"{API_PREFIX}/admin/conversations",
+        response_model=ConversationListResponse,
+    )
+    async def admin_list_conversations(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        items, total = list_conversations(
+            gateway_settings,
+            limit=limit,
+            offset=offset,
+        )
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    @app.get(
+        f"{API_PREFIX}/admin/conversations/{{conversation_id}}",
+        response_model=ConversationEventsResponse,
+    )
+    async def admin_get_conversation(
+        conversation_id: ConversationIdPath,
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        items, total = read_conversation(
+            gateway_settings,
+            conversation_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "conversationId": conversation_id,
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.post(
+        f"{API_PREFIX}/admin/conversations/{{conversation_id}}/seal",
+        response_model=ConversationSealResponse,
+    )
+    async def admin_seal_conversation(
+        conversation_id: ConversationIdPath,
+        req: ConversationSealRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        result = seal_conversation(gateway_settings, conversation_id, req.status)
+        audit_logs.record(
+            action="conversation_seal",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={"conversationId": conversation_id, "status": req.status},
+        )
+        return result
+
     @app.get(
         f"{API_PREFIX}/admin/profiles",
         response_model=list[ApiProfileResponse],
@@ -333,17 +611,21 @@ def create_app(
 
     @app.get(
         f"{API_PREFIX}/admin/request-logs/{{request_id}}",
-        response_model=RequestLogEntry,
+        response_model=RequestLogDetailResponse,
     )
     async def get_request_log(
         request_id: RequestIdPath,
         request: Request,
     ) -> dict[str, Any]:
         _require_profile_admin(request, gateway_settings)
-        entry = request_logs.get(request_id)
-        if entry is None:
+        attempts = request_logs.get_attempts(request_id)
+        if not attempts:
             raise HTTPException(status_code=404, detail={"code": "REQUEST_LOG_NOT_FOUND"})
-        return entry
+        return {
+            **attempts[-1],
+            "attemptCount": len(attempts),
+            "attempts": attempts,
+        }
 
     @app.put(
         f"{API_PREFIX}/admin/profiles/{{profile_id}}",
@@ -358,21 +640,20 @@ def create_app(
         if profile_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "PROFILE_ID_MISMATCH"})
         response = profile_store.upsert(req)
-        append_log(
-            gateway_settings,
-            "profile-admin",
-            "profile-admin-audit.jsonl",
-            {
-                "type": "profile_upsert",
+        audit_logs.record(
+            action="profile_upsert",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
                 "profileId": response["id"],
                 "provider": response["provider"],
-                "displayName": response["displayName"],
                 "protocol": response["protocol"],
-                "baseUrl": response["baseUrl"],
+                "priority": response["priority"],
                 "defaultModel": response["defaultModel"],
-                "modelCount": len(response["models"]),
-                "authMode": response["authMode"],
-                "enabled": response["enabled"],
+                "modelPriorities": {
+                    item["id"]: item["priority"] for item in response["models"]
+                },
                 "keyUpdated": bool(req.api_key),
             },
         )
@@ -385,11 +666,12 @@ def create_app(
     ) -> dict[str, Any]:
         _require_profile_admin(request, gateway_settings)
         success = profile_store.delete(profile_id)
-        append_log(
-            gateway_settings,
-            "profile-admin",
-            "profile-admin-audit.jsonl",
-            {"type": "profile_delete", "profileId": profile_id, "success": success},
+        audit_logs.record(
+            action="profile_delete",
+            success=success,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={"profileId": profile_id},
         )
         return {"success": success}
 
@@ -404,62 +686,83 @@ async def _chat(
     profiles: ApiProfileStore,
     response: Response,
 ) -> dict[str, Any]:
-    conversation_id = resolve_conversation_id(request, req)
-    require_run_id_for_full_log(settings, req)
-    concrete_provider = provider or (
-        settings.default_provider if req.provider == "auto" else req.provider
-    )
-    req = AgentChatRequest.model_validate({
-        **req.model_dump(mode="python"),
-        "provider": concrete_provider,
-        "conversation_id": conversation_id,
-    })
-    profile = profiles.resolve(concrete_provider, req.profile_id)
-    _validate_profile_request(req, profile)
+    conversation_id, _ = resolve_request_identity(request, req)
+    routes = _routes_for_request(req, provider, profiles)
     request_id = f"req_{secrets.token_hex(12)}"
     response.headers["X-Request-Id"] = request_id
-    started = time.monotonic()
     request_logs: RequestLogStore = request.app.state.request_logs
-    _log_request(settings, conversation_id, req, profile)
-    try:
-        response = (
-            await call_mimo(req, profile)
-            if concrete_provider == "mimo"
-            else (
-                await call_claude_code(req, profile)
-                if concrete_provider == "claude-code"
-                else await call_provider(req, profile)
-            )
+    index = 0
+    attempt = 0
+    while index < len(routes):
+        route = routes[index]
+        attempt += 1
+        routed_request = _request_for_route(req, route)
+        started = time.monotonic()
+        _log_request(
+            settings,
+            conversation_id,
+            routed_request,
+            route.profile,
+            request_id=request_id,
+            attempt=attempt,
         )
-    except HTTPException as exc:
-        detail = _error_detail(exc)
-        _log_error(settings, conversation_id, req, detail)
+        try:
+            result = await _call_route(routed_request, route.profile)
+        except HTTPException as exc:
+            detail = _error_detail(exc)
+            next_index = _next_route_index(routes, index, route, exc)
+            _log_error(
+                settings,
+                conversation_id,
+                routed_request,
+                detail,
+                request_id=request_id,
+                attempt=attempt,
+                terminal=next_index is None,
+            )
+            request_logs.record(
+                request_id=request_id,
+                request=routed_request,
+                profile=route.profile,
+                started=started,
+                status="error",
+                error=detail,
+                http_status=exc.status_code,
+                stream=False,
+                attempt=attempt,
+            )
+            if next_index is None:
+                response.headers["X-Route-Attempts"] = str(attempt)
+                raise
+            index = next_index
+            continue
+        _log_response(
+            settings,
+            conversation_id,
+            routed_request,
+            result,
+            request_id=request_id,
+            attempt=attempt,
+        )
         request_logs.record(
             request_id=request_id,
-            request=req,
-            profile=profile,
+            request=routed_request,
+            profile=route.profile,
             started=started,
-            status="error",
-            error=detail,
-            http_status=exc.status_code,
+            status="success" if result.get("success", True) else "error",
+            response=result,
+            error={
+                "code": result.get("code") or "",
+                "message": result.get("error") or "",
+            },
             stream=False,
+            attempt=attempt,
         )
-        raise
-    _log_response(settings, conversation_id, req, response)
-    request_logs.record(
-        request_id=request_id,
-        request=req,
-        profile=profile,
-        started=started,
-        status="success" if response.get("success", True) else "error",
-        response=response,
-        error={
-            "code": response.get("code") or "",
-            "message": response.get("error") or "",
-        },
-        stream=False,
-    )
-    return response
+        response.headers["X-Route-Attempts"] = str(attempt)
+        response.headers["X-Actual-Profile"] = route.profile.id
+        response.headers["X-Actual-Model"] = route.model.id
+        return result
+    raise HTTPException(status_code=503, detail={"code": "PROVIDER_ROUTE_EXHAUSTED"})
 
 
 def _chat_stream(
@@ -469,18 +772,8 @@ def _chat_stream(
     settings: Settings,
     profiles: ApiProfileStore,
 ) -> StreamingResponse:
-    conversation_id = resolve_conversation_id(request, req)
-    require_run_id_for_full_log(settings, req)
-    concrete_provider = provider or (
-        settings.default_provider if req.provider == "auto" else req.provider
-    )
-    req = AgentChatRequest.model_validate({
-        **req.model_dump(mode="python"),
-        "provider": concrete_provider,
-        "conversation_id": conversation_id,
-    })
-    profile = profiles.resolve(concrete_provider, req.profile_id)
-    _validate_profile_request(req, profile)
+    conversation_id, _ = resolve_request_identity(request, req)
+    routes = _routes_for_request(req, provider, profiles)
     header_trace_id = request.headers.get("X-Agent-Trace-Id", "").strip()
     if header_trace_id and not req.trace_id:
         try:
@@ -495,75 +788,158 @@ def _chat_stream(
             ) from exc
     trace_id = req.trace_id or f"trace_{secrets.token_hex(8)}"
     request_id = f"req_{secrets.token_hex(12)}"
-    started = time.monotonic()
     request_logs: RequestLogStore = request.app.state.request_logs
-    _log_request(settings, conversation_id, req, profile)
 
     async def generate() -> AsyncIterator[str]:
         sequence = 0
         finalized = False
-        iterator: AsyncIterator[dict[str, Any]] = (
-            stream_mimo(req, profile)
-            if concrete_provider == "mimo"
-            else (
-                stream_claude_code(req, profile)
-                if concrete_provider == "claude-code"
-                else stream_provider(req, profile)
-            )
-        )
+        emitted_output = False
+        streamed_parts: list[str] = []
+        index = 0
+        attempt = 0
         try:
-            async for event in iterator:
-                sequence += 1
-                if event.get("kind") == "delta":
-                    yield _sse_envelope(req, trace_id, sequence, "model.delta", {"content": event.get("content", "")})
-                    continue
-                payload = event.get("payload") or {}
-                _log_response(settings, conversation_id, req, payload)
-                request_logs.record(
+            while index < len(routes):
+                route = routes[index]
+                attempt += 1
+                routed_request = _request_for_route(req, route)
+                started = time.monotonic()
+                _log_request(
+                    settings,
+                    conversation_id,
+                    routed_request,
+                    route.profile,
                     request_id=request_id,
-                    request=req,
-                    profile=profile,
-                    started=started,
-                    status="success" if payload.get("success", True) else "error",
-                    response=payload,
-                    error={
-                        "code": payload.get("code") or "",
-                        "message": payload.get("error") or "",
-                    },
-                    stream=True,
+                    attempt=attempt,
                 )
-                finalized = True
-                yield _sse_envelope(req, trace_id, sequence, "model.completed", payload)
-        except Exception as exc:  # stream already started; emit an error envelope
-            sequence += 1
-            detail = _error_detail(exc)
-            _log_error(settings, conversation_id, req, detail)
-            request_logs.record(
-                request_id=request_id,
-                request=req,
-                profile=profile,
-                started=started,
-                status="error",
-                error=detail,
-                http_status=exc.status_code if isinstance(exc, HTTPException) else 500,
-                stream=True,
-            )
-            finalized = True
-            yield _sse_envelope(req, trace_id, sequence, "gateway.error", detail)
+                iterator = _stream_route(routed_request, route.profile)
+                try:
+                    async for event in iterator:
+                        sequence += 1
+                        if event.get("kind") == "delta":
+                            content = str(event.get("content") or "")
+                            if content:
+                                emitted_output = True
+                                streamed_parts.append(content)
+                                yield _sse_envelope(
+                                    routed_request,
+                                    trace_id,
+                                    sequence,
+                                    "model.delta",
+                                    {"content": content},
+                                )
+                            continue
+                        payload = event.get("payload") or {}
+                        _log_response(
+                            settings,
+                            conversation_id,
+                            routed_request,
+                            payload,
+                            request_id=request_id,
+                            attempt=attempt,
+                        )
+                        request_logs.record(
+                            request_id=request_id,
+                            request=routed_request,
+                            profile=route.profile,
+                            started=started,
+                            status="success" if payload.get("success", True) else "error",
+                            response=payload,
+                            error={
+                                "code": payload.get("code") or "",
+                                "message": payload.get("error") or "",
+                            },
+                            stream=True,
+                            attempt=attempt,
+                        )
+                        finalized = True
+                        yield _sse_envelope(
+                            routed_request,
+                            trace_id,
+                            sequence,
+                            "model.completed",
+                            payload,
+                        )
+                        return
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "code": "PROVIDER_STREAM_INVALID",
+                            "message": "Provider stream ended without completion",
+                            "retryable": True,
+                            "failoverScope": "model",
+                        },
+                    )
+                except Exception as exc:
+                    detail = _error_detail(exc)
+                    next_index = None if emitted_output else _next_route_index(
+                        routes,
+                        index,
+                        route,
+                        exc,
+                    )
+                    _log_error(
+                        settings,
+                        conversation_id,
+                        routed_request,
+                        detail,
+                        request_id=request_id,
+                        attempt=attempt,
+                        terminal=next_index is None,
+                        partial_content="".join(streamed_parts),
+                    )
+                    request_logs.record(
+                        request_id=request_id,
+                        request=routed_request,
+                        profile=route.profile,
+                        started=started,
+                        status="error",
+                        error=detail,
+                        http_status=exc.status_code if isinstance(exc, HTTPException) else 500,
+                        stream=True,
+                        attempt=attempt,
+                    )
+                    if next_index is not None:
+                        index = next_index
+                        continue
+                    sequence += 1
+                    finalized = True
+                    yield _sse_envelope(
+                        routed_request,
+                        trace_id,
+                        sequence,
+                        "gateway.error",
+                        detail,
+                    )
+                    return
         finally:
             if not finalized:
+                route = routes[min(index, len(routes) - 1)]
+                routed_request = _request_for_route(req, route)
+                cancelled_error = {
+                    "code": "CLIENT_STREAM_CANCELLED",
+                    "message": "Client disconnected before the provider stream completed",
+                }
+                _log_error(
+                    settings,
+                    conversation_id,
+                    routed_request,
+                    cancelled_error,
+                    request_id=request_id,
+                    attempt=max(1, attempt),
+                    terminal=True,
+                    status="cancelled",
+                    partial_content="".join(streamed_parts),
+                )
                 request_logs.record(
                     request_id=request_id,
-                    request=req,
-                    profile=profile,
-                    started=started,
+                    request=routed_request,
+                    profile=route.profile,
+                    started=time.monotonic(),
                     status="cancelled",
-                    error={
-                        "code": "CLIENT_STREAM_CANCELLED",
-                        "message": "Client disconnected before the provider stream completed",
-                    },
+                    error=cancelled_error,
                     http_status=499,
                     stream=True,
+                    attempt=max(1, attempt),
                 )
 
     return StreamingResponse(
@@ -573,6 +949,91 @@ def _chat_stream(
     )
 
 
+def _routes_for_request(
+    req: AgentChatRequest,
+    forced_provider: str | None,
+    profiles: ApiProfileStore,
+) -> list[RouteCandidate]:
+    requested_provider = forced_provider or req.provider
+    routes = profiles.route_candidates(
+        provider=requested_provider,
+        profile_id=req.profile_id,
+        model=req.model,
+    )
+    first_request = _request_for_route(req, routes[0])
+    _validate_profile_request(first_request, routes[0].profile)
+    compatible = [routes[0]]
+    for route in routes[1:]:
+        routed_request = _request_for_route(req, route)
+        try:
+            _validate_profile_request(routed_request, route.profile)
+        except HTTPException:
+            continue
+        compatible.append(route)
+    return compatible
+
+
+def _request_for_route(
+    req: AgentChatRequest,
+    route: RouteCandidate,
+) -> AgentChatRequest:
+    return AgentChatRequest.model_validate(
+        {
+            **req.model_dump(mode="python"),
+            "provider": route.profile.provider,
+            "profile_id": route.profile.id,
+            "model": route.model.id,
+        }
+    )
+
+
+async def _call_route(
+    req: AgentChatRequest,
+    profile: ProviderProfile,
+) -> dict[str, Any]:
+    if profile.provider == "mimo":
+        return await call_mimo(req, profile)
+    if profile.provider == "claude-code":
+        return await call_claude_code(req, profile)
+    return await call_provider(req, profile)
+
+
+def _stream_route(
+    req: AgentChatRequest,
+    profile: ProviderProfile,
+) -> AsyncIterator[dict[str, Any]]:
+    if profile.provider == "mimo":
+        return stream_mimo(req, profile)
+    if profile.provider == "claude-code":
+        return stream_claude_code(req, profile)
+    return stream_provider(req, profile)
+
+
+def _next_route_index(
+    routes: list[RouteCandidate],
+    current_index: int,
+    current: RouteCandidate,
+    exc: Exception,
+) -> int | None:
+    scope = _failover_scope(exc)
+    if scope == "none":
+        return None
+    index = current_index + 1
+    if scope == "profile":
+        while index < len(routes) and routes[index].profile.id == current.profile.id:
+            index += 1
+    return index if index < len(routes) else None
+
+
+def _failover_scope(exc: Exception) -> str:
+    if not isinstance(exc, HTTPException) or not isinstance(exc.detail, dict):
+        return "none"
+    if exc.detail.get("retryable") is not True:
+        return "none"
+    scope = str(exc.detail.get("failoverScope") or "model")
+    return scope if scope in {"model", "profile"} else "none"
+
+
 def _provider_capability(
     provider: str,
     profiles: list[dict[str, Any]],
@@ -580,7 +1041,7 @@ def _provider_capability(
 ) -> dict[str, Any]:
     ordered = sorted(
         profiles,
-        key=lambda item: (not item["id"].startswith("default-"), item["id"]),
+        key=lambda item: (-int(item.get("priority", 100)), item["id"]),
     )
     ready_profiles = [
         profile
@@ -606,11 +1067,13 @@ def _provider_capability(
         "defaultProfileId": selected.get("id") or "",
         "status": "ready" if ready else "unavailable",
         "defaultModel": selected.get("defaultModel") or "",
+        "priority": int(selected.get("priority", 100)),
         "models": [
             {
                 "id": model_id,
                 "name": metadata.get("name") or model_id,
                 "provider": provider,
+                "priority": int(metadata.get("priority", 100)),
                 "supportsImages": bool(metadata.get("supportsImages", True)),
                 "contextWindowTokens": int(metadata.get("contextWindowTokens", 100_000)),
                 "maxOutputTokens": int(metadata.get("maxOutputTokens", 8_192)),
@@ -699,27 +1162,23 @@ def _log_request(
     conversation_id: str,
     req: AgentChatRequest,
     profile: ProviderProfile,
+    *,
+    request_id: str,
+    attempt: int,
 ) -> None:
     request_data = model_to_dict(req)
-    system_prompt = str(request_data.pop("systemPrompt", ""))
-    prompt = str(request_data.pop("prompt", ""))
     images = request_data.get("images") or []
     request_data["images"] = [
         {
             "media_type": image.get("media_type", ""),
             "source": "base64" if image.get("data") else "url",
             "encodedChars": len(str(image.get("data") or "")),
+            "sha256": hashlib.sha256(
+                str(image.get("data") or image.get("url") or "").encode("utf-8")
+            ).hexdigest(),
         }
         for image in images
     ]
-    request_data["promptMetadata"] = {
-        "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        "characters": len(prompt),
-    }
-    request_data["systemPromptMetadata"] = {
-        "sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
-        "characters": len(system_prompt),
-    }
     append_conversation_event(
         settings,
         conversation_id,
@@ -727,6 +1186,10 @@ def _log_request(
             "type": "gateway_request",
             "provider": profile.provider,
             "profileId": profile.id,
+            "requestId": request_id,
+            "runId": req.run_id,
+            "attempt": attempt,
+            "turnStatus": "running",
             "request": redact_value(request_data),
         },
     )
@@ -737,17 +1200,22 @@ def _log_response(
     conversation_id: str,
     req: AgentChatRequest,
     response: dict[str, Any],
+    *,
+    request_id: str,
+    attempt: int,
 ) -> None:
     response_data = model_to_dict(response)
-    content = str(response_data.pop("content", ""))
-    response_data["contentMetadata"] = {
-        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "characters": len(content),
-    }
     append_conversation_event(
         settings,
         conversation_id,
-        {"type": "gateway_response", "runId": req.run_id, "response": redact_value(response_data)},
+        {
+            "type": "gateway_response",
+            "requestId": request_id,
+            "runId": req.run_id,
+            "attempt": attempt,
+            "turnStatus": "completed",
+            "response": redact_value(response_data),
+        },
     )
 
 
@@ -756,11 +1224,30 @@ def _log_error(
     conversation_id: str,
     req: AgentChatRequest,
     error: Any,
+    *,
+    request_id: str,
+    attempt: int,
+    terminal: bool,
+    status: str = "error",
+    partial_content: str = "",
 ) -> None:
     append_conversation_event(
         settings,
         conversation_id,
-        {"type": "gateway_error", "runId": req.run_id, "error": redact_value(error)},
+        {
+            "type": "gateway_error",
+            "requestId": request_id,
+            "runId": req.run_id,
+            "attempt": attempt,
+            "turnStatus": status if terminal else "fallback",
+            "terminal": terminal,
+            "error": redact_value(error),
+            **(
+                {"partialContent": redact_value(partial_content)}
+                if partial_content
+                else {}
+            ),
+        },
     )
 
 
@@ -779,12 +1266,17 @@ def _error_detail(exc: Exception) -> dict[str, Any]:
 
 
 def _require_profile_admin(request: Request, settings: Settings) -> None:
-    if not settings.profile_admin_token:
-        raise HTTPException(status_code=503, detail={"code": "PROFILE_ADMIN_DISABLED"})
+    _require_admin_origin(request, settings)
     authorization = request.headers.get("Authorization", "")
-    expected = f"Bearer {settings.profile_admin_token}"
-    if not secrets.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail={"code": "PROFILE_ADMIN_AUTH_REQUIRED"})
+    token = authorization.removeprefix("Bearer ").strip()
+    sessions: AdminSessionStore = request.app.state.admin_sessions
+    if token and sessions.verify(token):
+        return
+    if settings.profile_admin_token:
+        expected = f"Bearer {settings.profile_admin_token}"
+        if secrets.compare_digest(authorization, expected):
+            return
+    raise HTTPException(status_code=401, detail={"code": "PROFILE_ADMIN_AUTH_REQUIRED"})
 
 
 def _require_service_auth(
@@ -793,17 +1285,63 @@ def _require_service_auth(
         str | None,
         Header(alias=SERVICE_AUTH_HEADER, max_length=8192),
     ] = None,
+    browser_api_key: Annotated[
+        str | None,
+        Header(alias=BROWSER_API_KEY_HEADER, max_length=8192),
+    ] = None,
 ) -> None:
     settings: Settings = request.app.state.settings
-    if settings.service_auth_mode == "disabled":
-        return
-    if not service_token or not secrets.compare_digest(
+    if service_token and settings.service_auth_mode == "required" and secrets.compare_digest(
         service_token,
         settings.service_auth_token,
     ):
+        return
+    if browser_api_key:
+        sessions: AdminSessionStore = request.app.state.admin_sessions
+        api_keys: BrowserApiKeyStore = request.app.state.browser_api_keys
+        if sessions.verify(browser_api_key) or api_keys.verify(browser_api_key):
+            return
+    api_keys = request.app.state.browser_api_keys
+    if settings.service_auth_mode == "disabled" and not api_keys.public()["configured"]:
+        return
+    raise HTTPException(
+        status_code=401,
+        detail={"code": "GATEWAY_SERVICE_AUTH_REQUIRED"},
+    )
+
+
+def _audit_actor(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+def _audit_request_id(request: Request) -> str:
+    return request.headers.get("X-Request-Id", "").strip() or f"admin_{secrets.token_hex(8)}"
+
+
+def _require_admin_origin(request: Request, settings: Settings) -> None:
+    client_host = request.client.host if request.client else ""
+    try:
+        is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_loopback = client_host == "localhost"
+    if not settings.admin_allow_remote and not is_loopback:
         raise HTTPException(
-            status_code=401,
-            detail={"code": "GATEWAY_SERVICE_AUTH_REQUIRED"},
+            status_code=403,
+            detail={"code": "ADMIN_REMOTE_DISABLED"},
+        )
+    origin = request.headers.get("Origin", "").rstrip("/")
+    if not origin:
+        return
+    if origin == str(request.base_url).rstrip("/"):
+        return
+    allowed = {item.rstrip("/") for item in settings.allow_origins if item != "*"}
+    if origin not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ADMIN_ORIGIN_NOT_ALLOWED"},
         )
 
 

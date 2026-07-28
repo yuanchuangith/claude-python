@@ -5,14 +5,34 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
+from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from claude_agent_sdk.actiondesign_gateway import app as gateway_app  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.app import create_app  # noqa: E402
+from claude_agent_sdk.actiondesign_gateway.models import (  # noqa: E402
+    GatewayEventEnvelope,
+)
 from claude_agent_sdk.actiondesign_gateway.profile_store import (  # noqa: E402
     MemoryProfileSecretStore,
 )
+from claude_agent_sdk.actiondesign_gateway.session_log import (  # noqa: E402
+    append_conversation_event,
+)
 from claude_agent_sdk.actiondesign_gateway.settings import Settings  # noqa: E402
+
+
+CONVERSATION_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_CONVERSATION_ID = "22222222-2222-4222-8222-222222222222"
+SERVICE_AUTH_CONVERSATION_ID = "33333333-3333-4333-8333-333333333333"
+SEAL_CONVERSATION_ID = "44444444-4444-4444-8444-444444444444"
+FORWARDED_CONVERSATION_ID = "55555555-5555-4555-8555-555555555555"
+RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OTHER_RUN_ID = "run_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+SERVICE_AUTH_RUN_ID = "run_cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+SEAL_RUN_ID = "run_dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+FORWARDED_RUN_ID = "run_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
 
 
 def make_settings(tmp_path, **overrides):
@@ -32,6 +52,7 @@ def make_settings(tmp_path, **overrides):
         "claude_code_models": ["claude-sonnet-4-5"],
         "profile_store_path": tmp_path / "profiles.json",
         "profile_admin_token": "admin-token",
+        "admin_allow_remote": True,
         "profile_allowed_hosts": [
             "token-plan-cn.xiaomimimo.com",
             "api.anthropic.com",
@@ -67,8 +88,8 @@ def audit_events(root, audit_id, filename):
 def chat_payload(**overrides):
     payload = {
         "provider": "mimo",
-        "conversationId": "conv_test",
-        "runId": "run_test",
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
         "agentMode": "normal",
         "systemPrompt": "You are the ActionDesign system agent.",
         "prompt": "Create a node",
@@ -95,6 +116,14 @@ def chat_payload(**overrides):
     return payload
 
 
+def identity_headers(payload, **extra):
+    return {
+        "X-Conversation-Id": payload["conversationId"],
+        "X-Agent-Run-Id": payload["runId"],
+        **extra,
+    }
+
+
 def test_models_expose_only_native_tool_capabilities(tmp_path):
     response = make_client(tmp_path).get("/api/actiondesign-agent/models")
 
@@ -114,6 +143,14 @@ def test_health_identifies_thin_gateway(tmp_path):
     assert response.status_code == 200
     assert response.json()["runtime"] == "thin-gateway"
     assert response.json()["protocolVersion"] == "1.0"
+    assert response.json()["fullConversationLogEnabled"] is True
+
+    disabled = make_client(
+        tmp_path / "disabled-log",
+        full_conversation_log_enabled=False,
+    ).get("/api/actiondesign-agent/health")
+    assert disabled.status_code == 200
+    assert disabled.json()["fullConversationLogEnabled"] is False
 
 
 def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_path):
@@ -124,8 +161,8 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
         service_auth_token=service_token,
     )
     payload = {
-        "conversationId": "conv_service_auth",
-        "runId": "run_service_auth",
+        "conversationId": SERVICE_AUTH_CONVERSATION_ID,
+        "runId": SERVICE_AUTH_RUN_ID,
         "toolCallId": "call_service_auth",
         "toolName": "create_node",
         "arguments": {"elementKey": "ExitAction"},
@@ -144,7 +181,10 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
     )
     accepted = client.post(
         "/api/actiondesign-agent/tool-result",
-        headers={"X-ActionDesign-Service-Token": service_token},
+        headers=identity_headers(
+            payload,
+            **{"X-ActionDesign-Service-Token": service_token},
+        ),
         json=payload,
     )
 
@@ -152,7 +192,10 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
     assert missing.json()["detail"]["code"] == "GATEWAY_SERVICE_AUTH_REQUIRED"
     assert wrong.status_code == 401
     assert accepted.status_code == 200
-    events = conversation_events(tmp_path / "conversations", "conv_service_auth")
+    events = conversation_events(
+        tmp_path / "conversations",
+        SERVICE_AUTH_CONVERSATION_ID,
+    )
     assert len(events) == 1
     assert service_token not in json.dumps(events, ensure_ascii=False)
 
@@ -175,6 +218,7 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
 
 def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
     schema = make_client(tmp_path).get("/openapi.json").json()
+    assert schema["info"]["version"] == "2.2.0"
     protected = {
         ("/api/actiondesign-agent/chat", "post"),
         ("/api/actiondesign-agent/chat/stream", "post"),
@@ -183,6 +227,7 @@ def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
         ("/api/actiondesign-agent/claude-code/chat", "post"),
         ("/api/actiondesign-agent/claude-code/chat/stream", "post"),
         ("/api/actiondesign-agent/tool-result", "post"),
+        ("/api/actiondesign-agent/conversations/{conversation_id}/seal", "post"),
         ("/api/actiondesign-agent/mcp/gxp-lowcode-readonly/tools", "get"),
         ("/api/actiondesign-agent/mcp/gxp-lowcode-readonly/call", "post"),
         ("/api/actiondesign-agent/telemetry/langsmith/runs/batch", "post"),
@@ -207,6 +252,289 @@ def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/actiondesign-agent/chat", chat_payload()),
+        ("/api/actiondesign-agent/chat/stream", chat_payload(stream=True)),
+        (
+            "/api/actiondesign-agent/tool-result",
+            {
+                "conversationId": CONVERSATION_ID,
+                "runId": RUN_ID,
+                "toolCallId": "call_identity",
+                "toolName": "create_node",
+                "arguments": {"elementKey": "ExitAction"},
+                "status": "success",
+                "result": {"nodeKey": "node_identity"},
+            },
+        ),
+    ],
+)
+def test_request_identity_headers_are_required_and_must_match_body(tmp_path, path, payload):
+    client = make_client(tmp_path)
+
+    missing = client.post(path, json=payload)
+    legacy_run_header = client.post(
+        path,
+        headers={
+            "X-Conversation-Id": payload["conversationId"],
+            "X-Run-Id": payload["runId"],
+        },
+        json=payload,
+    )
+    mismatched_conversation = client.post(
+        path,
+        headers=identity_headers(
+            payload,
+            **{"X-Conversation-Id": OTHER_CONVERSATION_ID},
+        ),
+        json=payload,
+    )
+    mismatched_run = client.post(
+        path,
+        headers=identity_headers(payload, **{"X-Agent-Run-Id": OTHER_RUN_ID}),
+        json=payload,
+    )
+
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["code"] == "REQUEST_IDENTITY_REQUIRED"
+    assert legacy_run_header.status_code == 422
+    assert legacy_run_header.json()["detail"] == {
+        "code": "REQUEST_IDENTITY_REQUIRED",
+        "fields": ["X-Agent-Run-Id"],
+    }
+    assert mismatched_conversation.status_code == 409
+    assert mismatched_conversation.json()["detail"] == {
+        "code": "REQUEST_IDENTITY_MISMATCH",
+        "fields": ["conversationId"],
+    }
+    assert mismatched_run.status_code == 409
+    assert mismatched_run.json()["detail"] == {
+        "code": "REQUEST_IDENTITY_MISMATCH",
+        "fields": ["runId"],
+    }
+
+
+def test_request_identity_body_fields_are_required_and_conversation_id_is_uuid4(tmp_path):
+    client = make_client(tmp_path)
+    missing_body = chat_payload()
+    del missing_body["conversationId"]
+    invalid_body = chat_payload(conversationId="conv:lossy")
+
+    missing = client.post(
+        "/api/actiondesign-agent/chat",
+        headers={
+            "X-Conversation-Id": CONVERSATION_ID,
+            "X-Agent-Run-Id": RUN_ID,
+        },
+        json=missing_body,
+    )
+    invalid = client.post(
+        "/api/actiondesign-agent/chat",
+        headers=identity_headers(invalid_body),
+        json=invalid_body,
+    )
+
+    assert missing.status_code == 422
+    assert "conversationId" in missing.text
+    assert invalid.status_code == 422
+    assert "conversationId" in invalid.text
+
+
+@pytest.mark.parametrize(
+    "invalid_conversation_id",
+    [
+        "conv_test",
+        "11111111-1111-1111-8111-111111111111",
+        "11111111111141118111111111111111",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    ],
+)
+def test_request_identity_rejects_noncanonical_or_non_v4_conversation_ids(
+    tmp_path,
+    invalid_conversation_id,
+):
+    client = make_client(tmp_path)
+    body_invalid = chat_payload(conversationId=invalid_conversation_id)
+    invalid_body = client.post(
+        "/api/actiondesign-agent/chat",
+        headers={
+            "X-Conversation-Id": invalid_conversation_id,
+            "X-Agent-Run-Id": body_invalid["runId"],
+        },
+        json=body_invalid,
+    )
+    valid_body = chat_payload()
+    invalid_header = client.post(
+        "/api/actiondesign-agent/chat",
+        headers={
+            "X-Conversation-Id": invalid_conversation_id,
+            "X-Agent-Run-Id": valid_body["runId"],
+        },
+        json=valid_body,
+    )
+
+    assert invalid_body.status_code == 422
+    assert invalid_header.status_code == 422
+    assert invalid_header.json()["detail"]["code"] == "REQUEST_IDENTITY_INVALID"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/actiondesign-agent/chat", chat_payload()),
+        ("/api/actiondesign-agent/chat/stream", chat_payload(stream=True)),
+        (
+            "/api/actiondesign-agent/tool-result",
+            {
+                "conversationId": CONVERSATION_ID,
+                "runId": RUN_ID,
+                "toolCallId": "call_run_identity",
+                "toolName": "create_node",
+            },
+        ),
+    ],
+)
+def test_runtime_routes_require_canonical_run_uuid4(tmp_path, path, payload):
+    client = make_client(tmp_path)
+    invalid_payload = {**payload, "runId": "run_test"}
+    invalid_body = client.post(
+        path,
+        headers=identity_headers(invalid_payload),
+        json=invalid_payload,
+    )
+    invalid_header = client.post(
+        path,
+        headers=identity_headers(payload, **{"X-Agent-Run-Id": "run_test"}),
+        json=payload,
+    )
+
+    assert invalid_body.status_code == 422
+    assert invalid_header.status_code == 422
+    assert invalid_header.json()["detail"]["code"] == "REQUEST_IDENTITY_INVALID"
+
+
+def test_sse_envelope_uses_runtime_identity_contract():
+    envelope = {
+        "protocolVersion": "1.0",
+        "sequence": 1,
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "traceId": "trace_test",
+        "timestamp": "2026-07-28T00:00:00Z",
+        "type": "model.delta",
+        "payload": {"content": "ok"},
+    }
+
+    assert GatewayEventEnvelope.model_validate(envelope).run_id == RUN_ID
+    with pytest.raises(ValidationError):
+        GatewayEventEnvelope.model_validate(
+            {**envelope, "conversationId": "legacy_conversation"}
+        )
+    with pytest.raises(ValidationError):
+        GatewayEventEnvelope.model_validate({**envelope, "runId": "run_test"})
+
+
+def test_service_auth_seal_is_explicit_and_turn_failure_does_not_seal(tmp_path, monkeypatch):
+    service_token = "service-token-" + ("s" * 32)
+
+    async def failing_call(_req, _profile):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "PROVIDER_TIMEOUT",
+                "message": "temporary upstream failure",
+                "retryable": True,
+                "failoverScope": "none",
+            },
+        )
+
+    monkeypatch.setattr(gateway_app, "call_mimo", failing_call)
+    client = make_client(
+        tmp_path,
+        service_auth_mode="required",
+        service_auth_token=service_token,
+    )
+    payload = chat_payload(
+        conversationId=SEAL_CONVERSATION_ID,
+        runId=SEAL_RUN_ID,
+    )
+    service_headers = identity_headers(
+        payload,
+        **{"X-ActionDesign-Service-Token": service_token},
+    )
+
+    failed_turn = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=service_headers,
+        json=payload,
+    )
+    before_seal = conversation_events(
+        tmp_path / "conversations",
+        SEAL_CONVERSATION_ID,
+    )
+    denied = client.post(
+        f"/api/actiondesign-agent/conversations/{SEAL_CONVERSATION_ID}/seal",
+        json={"status": "completed"},
+    )
+    sealed = client.post(
+        f"/api/actiondesign-agent/conversations/{SEAL_CONVERSATION_ID}/seal",
+        headers={"X-ActionDesign-Service-Token": service_token},
+        json={"status": "completed"},
+    )
+
+    assert failed_turn.status_code == 502
+    assert all(event["type"] != "conversation_sealed" for event in before_seal)
+    assert denied.status_code == 401
+    assert sealed.status_code == 200
+    assert sealed.headers["x-request-id"].startswith("req_")
+    assert sealed.json() == {"success": True, "status": "completed"}
+    assert conversation_events(
+        tmp_path / "conversations",
+        SEAL_CONVERSATION_ID,
+    )[-1]["type"] == "conversation_sealed"
+
+    invalid_version = client.post(
+        "/api/actiondesign-agent/conversations/"
+        "11111111-1111-1111-8111-111111111111/seal",
+        headers={"X-ActionDesign-Service-Token": service_token},
+        json={"status": "completed"},
+    )
+    assert invalid_version.status_code == 422
+
+
+def test_admin_conversation_routes_keep_legacy_safe_id_compatibility(tmp_path):
+    settings = make_settings(tmp_path)
+    append_conversation_event(
+        settings,
+        "legacy_conversation",
+        {"type": "gateway_request", "runId": "legacy_run"},
+    )
+    client = TestClient(
+        create_app(
+            settings,
+            profile_secret_store=MemoryProfileSecretStore(),
+        )
+    )
+    headers = {"Authorization": "Bearer admin-token"}
+
+    detail = client.get(
+        "/api/actiondesign-agent/admin/conversations/legacy_conversation",
+        headers=headers,
+    )
+    sealed = client.post(
+        "/api/actiondesign-agent/admin/conversations/legacy_conversation/seal",
+        headers=headers,
+        json={"status": "completed"},
+    )
+
+    assert detail.status_code == 200
+    assert detail.json()["conversationId"] == "legacy_conversation"
+    assert sealed.status_code == 200
+    assert sealed.json() == {"success": True, "status": "completed"}
+
+
 def test_service_auth_required_rejects_missing_or_ambiguous_configuration(tmp_path):
     with pytest.raises(ValueError, match="at least 32 characters"):
         make_settings(
@@ -220,6 +548,8 @@ def test_service_auth_required_rejects_missing_or_ambiguous_configuration(tmp_pa
             service_auth_mode="disabled",
             service_auth_token="configured-but-disabled-secret",
         )
+
+
 def test_chat_forwards_native_tool_schema_and_records_details(tmp_path, monkeypatch):
     captured = {}
 
@@ -241,23 +571,23 @@ def test_chat_forwards_native_tool_schema_and_records_details(tmp_path, monkeypa
         }
 
     monkeypatch.setattr(gateway_app, "call_mimo", fake_call)
+    payload = chat_payload()
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/mimo/chat",
-        json=chat_payload(),
+        headers=identity_headers(payload),
+        json=payload,
     )
 
     assert response.status_code == 200
     assert response.json()["tool_calls"][0]["name"] == "create_node"
     assert captured["request"].tools[0].input_schema["required"] == ["elementKey"]
     assert captured["profile"].id == "default-mimo"
-    events = conversation_events(tmp_path / "conversations", "conv_test")
+    events = conversation_events(tmp_path / "conversations", CONVERSATION_ID)
     assert [event["type"] for event in events] == ["gateway_request", "gateway_response"]
     assert events[0]["request"]["graphVersion"] == "1.1.0"
-    assert "prompt" not in events[0]["request"]
-    assert events[0]["request"]["promptMetadata"]["characters"] == len("Create a node")
-    assert "systemPrompt" not in events[0]["request"]
-    assert events[0]["request"]["systemPromptMetadata"]["characters"] == len("You are the ActionDesign system agent.")
-    assert "content" not in events[1]["response"]
+    assert events[0]["request"]["prompt"] == "Create a node"
+    assert events[0]["request"]["systemPrompt"] == "You are the ActionDesign system agent."
+    assert events[1]["response"]["content"] == ""
     assert "apiKey" not in json.dumps(events, ensure_ascii=False)
 
 
@@ -313,10 +643,12 @@ def test_stream_uses_versioned_monotonic_sse_envelopes(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(gateway_app, "stream_mimo", fake_stream)
+    payload = chat_payload(stream=True, traceId="trace_test")
     with make_client(tmp_path).stream(
         "POST",
         "/api/actiondesign-agent/mimo/chat/stream",
-        json=chat_payload(stream=True, traceId="trace_test"),
+        headers=identity_headers(payload),
+        json=payload,
     ) as response:
         events = [
             json.loads(line.removeprefix("data: "))
@@ -334,7 +666,10 @@ def test_stream_uses_versioned_monotonic_sse_envelopes(tmp_path, monkeypatch):
 def test_stream_rejects_invalid_trace_header_before_opening_sse(tmp_path):
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/mimo/chat/stream",
-        headers={"X-Agent-Trace-Id": "invalid trace id"},
+        headers=identity_headers(
+            chat_payload(stream=True),
+            **{"X-Agent-Trace-Id": "invalid trace id"},
+        ),
         json=chat_payload(stream=True),
     )
 
@@ -349,10 +684,12 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
         raise RuntimeError("authorization=Bearer upstream-secret")
 
     monkeypatch.setattr(gateway_app, "stream_mimo", fake_stream)
+    payload = chat_payload(stream=True, traceId="trace_secret")
     with make_client(tmp_path).stream(
         "POST",
         "/api/actiondesign-agent/mimo/chat/stream",
-        json=chat_payload(stream=True, traceId="trace_secret"),
+        headers=identity_headers(payload),
+        json=payload,
     ) as response:
         events = [
             json.loads(line.removeprefix("data: "))
@@ -367,7 +704,7 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
     assert "upstream-secret" not in serialized
     assert "[REDACTED]" in serialized
     persisted = json.dumps(
-        conversation_events(tmp_path / "conversations", "conv_test"),
+        conversation_events(tmp_path / "conversations", CONVERSATION_ID),
         ensure_ascii=False,
     )
     assert "upstream-secret" not in persisted
@@ -376,8 +713,8 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
 def test_tool_result_logging_is_idempotent(tmp_path):
     client = make_client(tmp_path)
     payload = {
-        "conversationId": "conv_test",
-        "runId": "run_test",
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
         "toolCallId": "call_1",
         "toolName": "create_node",
         "arguments": {
@@ -391,14 +728,29 @@ def test_tool_result_logging_is_idempotent(tmp_path):
         },
     }
 
-    first = client.post("/api/actiondesign-agent/tool-result", json=payload)
-    second = client.post("/api/actiondesign-agent/tool-result", json=payload)
+    first = client.post(
+        "/api/actiondesign-agent/tool-result",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+    second = client.post(
+        "/api/actiondesign-agent/tool-result",
+        headers=identity_headers(payload),
+        json=payload,
+    )
 
     assert first.status_code == 200
+    assert first.headers["x-request-id"].startswith("req_")
+    assert second.headers["x-request-id"].startswith("req_")
+    assert first.headers["x-request-id"] != second.headers["x-request-id"]
     assert first.json()["duplicate"] is False
     assert second.json()["duplicate"] is True
-    events = conversation_events(tmp_path / "conversations", "conv_test")
+    events = conversation_events(tmp_path / "conversations", CONVERSATION_ID)
     assert [event["duplicate"] for event in events] == [False, True]
+    assert [event["requestId"] for event in events] == [
+        first.headers["x-request-id"],
+        second.headers["x-request-id"],
+    ]
     assert all(event["arguments"]["apiKey"] == "[REDACTED]" for event in events)
     assert all(
         event["result"]["authorization"] == "[REDACTED]" for event in events
@@ -406,6 +758,13 @@ def test_tool_result_logging_is_idempotent(tmp_path):
     persisted = json.dumps(events, ensure_ascii=False)
     assert "tool-argument-secret" not in persisted
     assert "tool-result-secret" not in persisted
+    canonical = audit_events(
+        tmp_path / "audit",
+        CONVERSATION_ID,
+        "tool-results.jsonl",
+    )
+    assert len(canonical) == 1
+    assert canonical[0]["requestId"] == first.headers["x-request-id"]
 
 
 def test_profile_admin_path_id_is_strictly_validated(tmp_path):
@@ -453,15 +812,15 @@ def test_profile_admin_requires_configured_bearer_token(tmp_path):
     assert missing.json()["detail"]["code"] == "PROFILE_ADMIN_AUTH_REQUIRED"
     assert wrong.status_code == 401
     assert wrong.json()["detail"]["code"] == "PROFILE_ADMIN_AUTH_REQUIRED"
-    assert disabled.status_code == 503
-    assert disabled.json()["detail"]["code"] == "PROFILE_ADMIN_DISABLED"
+    assert disabled.status_code == 401
+    assert disabled.json()["detail"]["code"] == "PROFILE_ADMIN_AUTH_REQUIRED"
 
 
 def test_tool_result_rejects_coerced_and_unbounded_json(tmp_path):
     client = make_client(tmp_path)
     base = {
-        "conversationId": "conv_test",
-        "runId": "run_test",
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
         "toolCallId": "call_1",
         "toolName": "create_node",
         "arguments": {"elementKey": "ExitAction"},
@@ -506,7 +865,7 @@ def test_profile_admin_never_echoes_secret(tmp_path):
     persisted_text = (tmp_path / "profiles.json").read_text(encoding="utf-8")
     assert "managed-secret" not in persisted_text
     assert "api_key" not in persisted_text
-    assert json.loads(persisted_text)["schemaVersion"] == "3"
+    assert json.loads(persisted_text)["schemaVersion"] == "4"
     listed = client.get("/api/actiondesign-agent/admin/profiles", headers=headers)
     assert listed.status_code == 200
     assert "managed-secret" not in listed.text
@@ -518,15 +877,17 @@ def test_profile_admin_never_echoes_secret(tmp_path):
     assert deleted.status_code == 200
     assert deleted.json() == {"success": True}
 
-    events = audit_events(tmp_path / "audit", "profile-admin", "profile-admin-audit.jsonl")
-    assert [event["type"] for event in events] == ["profile_upsert", "profile_delete"]
-    assert events[0]["profileId"] == "team-mimo"
-    assert events[0]["keyUpdated"] is True
-    assert events[1] == {
-        "type": "profile_delete",
-        "profileId": "team-mimo",
-        "success": True,
-    }
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "audit" / "system" / "admin-audit.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["action"] for event in events] == ["profile_upsert", "profile_delete"]
+    assert events[0]["details"]["profileId"] == "team-mimo"
+    assert events[0]["details"]["keyUpdated"] is True
+    assert events[1]["details"]["profileId"] == "team-mimo"
+    assert events[1]["success"] is True
     audit_text = json.dumps(events, ensure_ascii=False)
     assert "managed-secret" not in audit_text
 
@@ -587,13 +948,15 @@ def test_dynamic_openai_channel_routes_through_generic_endpoint_and_logs_metadat
         },
     )
 
+    payload = chat_payload(
+        provider="team-openai",
+        model="gpt-5.1",
+        prompt="sensitive business prompt",
+    )
     response = client.post(
         "/api/actiondesign-agent/chat",
-        json=chat_payload(
-            provider="team-openai",
-            model="gpt-5.1",
-            prompt="sensitive business prompt",
-        ),
+        headers=identity_headers(payload),
+        json=payload,
     )
     logs = client.get(
         "/api/actiondesign-agent/admin/request-logs?provider=team-openai",
@@ -669,14 +1032,16 @@ def test_dynamic_managed_claude_channel_routes_through_generic_chat(
             "enabled": True,
         },
     )
+    payload = chat_payload(
+        provider="team-claude",
+        profileId="team-claude",
+        model="claude-team-model",
+        thinking={"type": "enabled", "budget_tokens": 4096},
+    )
     response = client.post(
         "/api/actiondesign-agent/chat",
-        json=chat_payload(
-            provider="team-claude",
-            profileId="team-claude",
-            model="claude-team-model",
-            thinking={"type": "enabled", "budget_tokens": 4096},
-        ),
+        headers=identity_headers(payload),
+        json=payload,
     )
 
     assert created.status_code == 200
@@ -760,7 +1125,11 @@ def test_profile_model_capabilities_are_enforced(
     )
     payload.update(request_overrides)
 
-    response = client.post("/api/actiondesign-agent/chat", json=payload)
+    response = client.post(
+        "/api/actiondesign-agent/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
 
     assert created.status_code == 200
     assert response.status_code == 400
@@ -836,7 +1205,7 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
         "eventId": "event_1",
         "traceId": "trace_1",
         "traceRunId": "trace_run_1",
-        "agentRunId": "run_test",
+        "agentRunId": RUN_ID,
         "name": "actiondesign-agent",
         "runType": "graph",
         "event": "start",
@@ -844,7 +1213,7 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
         "tags": ["actiondesign"],
         "metadata": {
             "environment": "test",
-            "conversationId": "conv_test",
+            "conversationId": CONVERSATION_ID,
             "graphVersion": "1.1.0",
             "protocolVersion": "1.0",
             "promptManifestVersion": "2.0.0",
@@ -888,7 +1257,7 @@ def test_langsmith_trace_rejects_unbounded_inputs(tmp_path):
         "eventId": "event_1",
         "traceId": "trace_1",
         "traceRunId": "trace_run_1",
-        "agentRunId": "run_test",
+        "agentRunId": RUN_ID,
         "name": "actiondesign-agent",
         "runType": "graph",
         "event": "start",
@@ -896,7 +1265,7 @@ def test_langsmith_trace_rejects_unbounded_inputs(tmp_path):
         "inputs": {"content": "x" * 500_001},
         "metadata": {
             "environment": "test",
-            "conversationId": "conv_test",
+            "conversationId": CONVERSATION_ID,
             "graphVersion": "1.1.0",
             "protocolVersion": "1.0",
             "promptManifestVersion": "2.0.0",
@@ -961,7 +1330,7 @@ def test_langsmith_forward_result_is_written_to_audit_log(
                     "eventId": "event_forwarded",
                     "traceId": "trace_forwarded",
                     "traceRunId": "trace_forwarded",
-                    "agentRunId": "run_forwarded",
+                    "agentRunId": FORWARDED_RUN_ID,
                     "name": "actiondesign-agent",
                     "runType": "graph",
                     "event": "start",
@@ -969,7 +1338,7 @@ def test_langsmith_forward_result_is_written_to_audit_log(
                     "tags": ["actiondesign"],
                     "metadata": {
                         "environment": "test",
-                        "conversationId": "conv_forwarded",
+                        "conversationId": FORWARDED_CONVERSATION_ID,
                         "graphVersion": "1.9.0",
                         "protocolVersion": "1.0",
                         "promptManifestVersion": "2.2.0",

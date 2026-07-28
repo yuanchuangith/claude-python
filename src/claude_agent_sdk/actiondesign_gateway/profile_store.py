@@ -16,7 +16,7 @@ from .models import ApiProfileModel, ApiProfileWriteRequest, MIMO_MODELS
 
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SECRET_REF = re.compile(r"^profile:[0-9a-f]{32}$")
-_PROFILE_STORE_SCHEMA_VERSION = "3"
+_PROFILE_STORE_SCHEMA_VERSION = "4"
 _KEYRING_SERVICE_NAME = "gxp.actiondesign.gateway.provider-profile.v1"
 _SECURE_KEYRING_BACKEND_PREFIXES = (
     "keyring.backends.windows.",
@@ -209,6 +209,7 @@ class _PersistedProviderProfile(BaseModel):
     models: list[ApiProfileModel] = Field(min_length=1, max_length=256)
     auth_mode: Literal["api-key", "bearer"]
     timeout_seconds: float = Field(ge=1.0, le=600.0)
+    priority: int = Field(default=100, ge=1, le=10_000)
     enabled: bool
     source: Literal["managed"]
 
@@ -262,8 +263,13 @@ class _PersistedProviderProfile(BaseModel):
 class _PersistedProfileFile(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["3"] = Field(alias="schemaVersion")
+    schema_version: Literal["4"] = Field(alias="schemaVersion")
     profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
+    environment_overrides: list["_EnvironmentProfileOverride"] = Field(
+        default_factory=list,
+        alias="environmentOverrides",
+        max_length=16,
+    )
 
     @model_validator(mode="after")
     def _validate_unique_ids(self) -> "_PersistedProfileFile":
@@ -273,6 +279,31 @@ class _PersistedProfileFile(BaseModel):
         refs = [profile.secret_ref for profile in self.profiles if profile.secret_ref]
         if len(refs) != len(set(refs)):
             raise ValueError("persisted profile secret references must be unique")
+        return self
+
+
+class _PersistedProfileFileV3(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["3"] = Field(alias="schemaVersion")
+    profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
+
+
+class _EnvironmentProfileOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+    id: Literal["default-mimo", "default-claude-code"]
+    priority: int = Field(default=100, ge=1, le=10_000)
+    default_model: str = Field(min_length=1, max_length=256)
+    models: list[ApiProfileModel] = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _validate_models(self) -> "_EnvironmentProfileOverride":
+        ids = [model.id for model in self.models]
+        if len(ids) != len(set(ids)):
+            raise ValueError("environment override model ids must be unique")
+        if self.default_model not in ids:
+            raise ValueError("environment override default model must be present in models")
         return self
 
 
@@ -308,6 +339,7 @@ class ProviderProfile:
     timeout_seconds: float
     enabled: bool
     source: str
+    priority: int = 100
     secret_ref: str | None = None
     display_name: str = ""
     protocol: str = "claude"
@@ -330,10 +362,17 @@ class ProviderProfile:
             ],
             "authMode": self.auth_mode,
             "timeoutSeconds": self.timeout_seconds,
+            "priority": self.priority,
             "enabled": self.enabled,
             "keyConfigured": bool(self.api_key),
             "source": self.source,
         }
+
+
+@dataclass(frozen=True)
+class RouteCandidate:
+    profile: ProviderProfile
+    model: ApiProfileModel
 
 
 class ApiProfileStore:
@@ -347,6 +386,7 @@ class ApiProfileStore:
         self._secret_store = secret_store or self._default_secret_store(settings)
         self._lock = threading.RLock()
         self._needs_migration = False
+        self._environment_overrides: dict[str, _EnvironmentProfileOverride] = {}
         self._profiles = self._load()
         self._seed_environment_profiles()
         if self._needs_migration:
@@ -362,7 +402,10 @@ class ApiProfileStore:
         with self._lock:
             return [
                 profile.public()
-                for profile in sorted(self._profiles.values(), key=lambda item: item.id)
+                for profile in sorted(
+                    self._profiles.values(),
+                    key=lambda item: (-item.priority, item.id),
+                )
             ]
 
     def resolve(self, provider: str, profile_id: str = "") -> ProviderProfile:
@@ -398,21 +441,201 @@ class ApiProfileStore:
                 for profile in self._profiles.values()
                 if profile.provider == provider
             ),
-            key=lambda item: (not item.id.startswith("default-"), item.id),
+            key=lambda item: (-item.priority, not item.id.startswith("default-"), item.id),
         )
         ready = [profile for profile in ordered if profile.enabled and profile.api_key]
         selected = ready[0] if ready else (ordered[0] if ordered else None)
         return selected.id if selected else f"default-{provider}"
+
+    def route_candidates(
+        self,
+        *,
+        provider: str = "auto",
+        profile_id: str = "",
+        model: str = "",
+    ) -> list["RouteCandidate"]:
+        """Build a deterministic profile/model failover chain.
+
+        A selected model/profile is always first. Remaining models in that
+        profile are exhausted by descending model priority before another
+        profile is entered. Other profiles start with their configured default
+        model, then continue through their remaining model-priority order.
+        """
+        with self._lock:
+            all_profiles = sorted(
+                self._profiles.values(),
+                key=lambda item: (-item.priority, item.id),
+            )
+            ready_profiles = [
+                item for item in all_profiles if item.enabled and item.api_key
+            ]
+            requested_profile: ProviderProfile | None = None
+            if profile_id:
+                requested_profile = self._profiles.get(profile_id)
+                if not requested_profile:
+                    raise self._unavailable_profile(profile_id)
+                if provider != "auto" and requested_profile.provider != provider:
+                    raise self._unavailable_profile(profile_id)
+
+            if requested_profile is not None:
+                ordered_profiles = [requested_profile] + [
+                    item for item in ready_profiles if item.id != requested_profile.id
+                ]
+            elif provider != "auto":
+                matching = [item for item in all_profiles if item.provider == provider]
+                if not matching:
+                    raise self._unavailable_profile(f"default-{provider}")
+                ready_matching = [
+                    item for item in ready_profiles if item.provider == provider
+                ]
+                ordered_profiles = ready_matching + [
+                    item for item in ready_profiles if item.provider != provider
+                ]
+                if not ready_matching:
+                    ordered_profiles = [matching[0]] + ordered_profiles
+            else:
+                ordered_profiles = ready_profiles or all_profiles
+
+            if model and requested_profile is None:
+                matching_model_profiles = [
+                    item
+                    for item in ordered_profiles
+                    if any(candidate.id == model for candidate in item.models)
+                    and (provider == "auto" or item.provider == provider)
+                ]
+                if not matching_model_profiles:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "PROFILE_MODEL_UNAVAILABLE", "model": model},
+                    )
+                first = matching_model_profiles[0]
+                ordered_profiles = [first] + [
+                    item for item in ordered_profiles if item.id != first.id
+                ]
+
+            if not ordered_profiles:
+                raise self._unavailable_profile("auto")
+
+            first_profile = ordered_profiles[0]
+            if not first_profile.enabled:
+                raise self._unavailable_profile(first_profile.id)
+            if not first_profile.api_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "API_PROFILE_KEY_MISSING",
+                        "message": f"API key is not configured for profile: {first_profile.id}",
+                    },
+                )
+
+            chain: list[RouteCandidate] = []
+            for index, profile_item in enumerate(ordered_profiles):
+                if not profile_item.enabled or not profile_item.api_key:
+                    continue
+                ordered_models = sorted(
+                    profile_item.models,
+                    key=lambda item: (-item.priority, item.id),
+                )
+                preferred_model = ""
+                if index == 0 and model:
+                    preferred_model = model
+                else:
+                    preferred_model = profile_item.default_model
+                if preferred_model:
+                    selected = next(
+                        (item for item in ordered_models if item.id == preferred_model),
+                        None,
+                    )
+                    if selected is None and index == 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "PROFILE_MODEL_UNAVAILABLE",
+                                "model": preferred_model,
+                                "profileId": profile_item.id,
+                            },
+                        )
+                    if selected is not None:
+                        ordered_models = [selected] + [
+                            item for item in ordered_models if item.id != selected.id
+                        ]
+                chain.extend(
+                    RouteCandidate(profile=profile_item, model=model_item)
+                    for model_item in ordered_models
+                )
+            if not chain:
+                raise self._unavailable_profile(first_profile.id)
+            return chain
+
+    def routing_order(self) -> list["RouteCandidate"]:
+        try:
+            return self.route_candidates()
+        except HTTPException:
+            return []
+
+    @staticmethod
+    def _unavailable_profile(selected_id: str) -> HTTPException:
+        return HTTPException(
+            status_code=400,
+            detail={
+                "code": "API_PROFILE_UNAVAILABLE",
+                "message": f"API profile is unavailable: {selected_id}",
+            },
+        )
 
     def upsert(self, request: ApiProfileWriteRequest) -> dict[str, Any]:
         with self._lock:
             self._validate(request.id, request.base_url)
             current = self._profiles.get(request.id)
             if current and current.source == "environment":
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "ENVIRONMENT_PROFILE_READ_ONLY"},
+                immutable_changed = any(
+                    (
+                        request.provider != current.provider,
+                        request.protocol != current.protocol,
+                        request.base_url.rstrip("/") != current.base_url,
+                        request.auth_mode != current.auth_mode,
+                        request.timeout_seconds != current.timeout_seconds,
+                        request.enabled != current.enabled,
+                    )
                 )
+                if request.api_key or immutable_changed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "ENVIRONMENT_PROFILE_ROUTE_READ_ONLY"},
+                    )
+                profile = ProviderProfile(
+                    id=current.id,
+                    provider=current.provider,
+                    display_name=request.display_name,
+                    protocol=current.protocol,
+                    base_url=current.base_url,
+                    api_key=current.api_key,
+                    default_model=request.default_model,
+                    models=list(request.models),
+                    auth_mode=current.auth_mode,
+                    timeout_seconds=current.timeout_seconds,
+                    priority=request.priority,
+                    enabled=current.enabled,
+                    source="environment",
+                )
+                previous_override = self._environment_overrides.get(profile.id)
+                self._profiles[profile.id] = profile
+                self._environment_overrides[profile.id] = _EnvironmentProfileOverride(
+                    id=profile.id,
+                    priority=profile.priority,
+                    default_model=profile.default_model,
+                    models=profile.models,
+                )
+                try:
+                    self._save()
+                except Exception:
+                    self._profiles[current.id] = current
+                    if previous_override is None:
+                        self._environment_overrides.pop(current.id, None)
+                    else:
+                        self._environment_overrides[current.id] = previous_override
+                    raise
+                return profile.public()
             if (
                 current
                 and not request.api_key
@@ -447,6 +670,7 @@ class ApiProfileStore:
                 models=list(request.models),
                 auth_mode=request.auth_mode,
                 timeout_seconds=max(1.0, min(request.timeout_seconds, 600.0)),
+                priority=request.priority,
                 enabled=request.enabled,
                 source="managed",
                 secret_ref=secret_ref if api_key else None,
@@ -519,6 +743,7 @@ class ApiProfileStore:
                 models=mimo_models,
                 auth_mode=str(self.settings.mimo_auth_mode),
                 timeout_seconds=float(self.settings.mimo_timeout_seconds),
+                priority=100 if self.settings.default_provider == "mimo" else 90,
                 enabled=True,
                 source="environment",
             ),
@@ -536,11 +761,17 @@ class ApiProfileStore:
                 ],
                 auth_mode=str(self.settings.claude_code_auth_mode),
                 timeout_seconds=float(self.settings.claude_code_timeout_seconds),
+                priority=100 if self.settings.default_provider == "claude-code" else 90,
                 enabled=True,
                 source="environment",
             ),
         ]
         for profile in defaults:
+            override = self._environment_overrides.get(profile.id)
+            if override is not None:
+                profile.priority = override.priority
+                profile.default_model = override.default_model
+                profile.models = list(override.models)
             try:
                 self._validate(profile.id, profile.base_url)
             except HTTPException as exc:
@@ -576,9 +807,16 @@ class ApiProfileStore:
                 legacy = _PersistedProfileFileV2.model_validate(raw)
                 payload_items = [self._migrate_v2_profile(item) for item in legacy.profiles]
                 self._needs_migration = True
+            elif schema_version == "3":
+                legacy = _PersistedProfileFileV3.model_validate(raw)
+                payload_items = list(legacy.profiles)
+                self._needs_migration = True
             else:
                 payload = _PersistedProfileFile.model_validate(raw)
                 payload_items = list(payload.profiles)
+                self._environment_overrides = {
+                    item.id: item for item in payload.environment_overrides
+                }
             profiles: dict[str, ProviderProfile] = {}
             for item in payload_items:
                 self._validate(item.id, item.base_url)
@@ -600,6 +838,7 @@ class ApiProfileStore:
                     models=list(item.models),
                     auth_mode=item.auth_mode,
                     timeout_seconds=item.timeout_seconds,
+                    priority=item.priority,
                     enabled=item.enabled,
                     source=item.source,
                     secret_ref=item.secret_ref,
@@ -650,6 +889,7 @@ class ApiProfileStore:
                 ],
                 "auth_mode": item.auth_mode,
                 "timeout_seconds": item.timeout_seconds,
+                "priority": 100,
                 "enabled": item.enabled,
                 "source": "managed",
             }
@@ -671,6 +911,7 @@ class ApiProfileStore:
                 ],
                 "auth_mode": profile.auth_mode,
                 "timeout_seconds": profile.timeout_seconds,
+                "priority": profile.priority,
                 "enabled": profile.enabled,
                 "source": "managed",
             }
@@ -681,6 +922,13 @@ class ApiProfileStore:
             {
                 "schemaVersion": _PROFILE_STORE_SCHEMA_VERSION,
                 "profiles": managed,
+                "environmentOverrides": [
+                    override.model_dump(mode="json")
+                    for override in sorted(
+                        self._environment_overrides.values(),
+                        key=lambda item: item.id,
+                    )
+                ],
             }
         ).model_dump(mode="json", by_alias=True)
         self.path.parent.mkdir(parents=True, exist_ok=True)

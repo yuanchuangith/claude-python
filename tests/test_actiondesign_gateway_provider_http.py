@@ -7,6 +7,10 @@ from claude_agent_sdk.actiondesign_gateway.profile_store import ProviderProfile
 from claude_agent_sdk.actiondesign_gateway import provider_http
 
 
+CONVERSATION_ID = "88888888-8888-4888-8888-888888888888"
+RUN_ID = "run_88888888-8888-4888-8888-888888888888"
+
+
 def profile():
     return ProviderProfile(
         id="default-mimo",
@@ -39,8 +43,8 @@ def openai_profile():
 
 def test_request_body_uses_provider_native_tools():
     req = AgentChatRequest(
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system rules",
         prompt="hello",
         tools=[
@@ -68,8 +72,8 @@ def test_request_body_uses_provider_native_tools():
 
 def test_request_body_forwards_native_tool_choice():
     req = AgentChatRequest(
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system rules",
         prompt="review",
         tools=[
@@ -89,8 +93,8 @@ def test_request_body_forwards_native_tool_choice():
 
 def test_claude_request_forwards_enabled_thinking_budget():
     req = AgentChatRequest(
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system rules",
         prompt="reason carefully",
         maxTokens=8192,
@@ -106,8 +110,8 @@ def test_openai_request_converts_messages_images_tools_and_tool_choice():
     req = AgentChatRequest(
         provider="team-openai",
         profileId="team-openai",
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system rules",
         prompt="inspect image",
         images=[{"media_type": "image/png", "data": "aGVsbG8="}],
@@ -205,8 +209,8 @@ def test_openai_stream_accumulates_text_and_function_arguments(monkeypatch):
     req = AgentChatRequest(
         provider="team-openai",
         profileId="team-openai",
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system",
         prompt="inspect",
         tools=[{
@@ -275,8 +279,8 @@ def test_parse_response_marks_max_tokens_as_structured_failure():
 
 def test_response_tool_arguments_are_validated_against_request_schema():
     req = AgentChatRequest(
-        conversationId="conv",
-        runId="run",
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
         systemPrompt="system rules",
         prompt="inspect",
         tools=[{

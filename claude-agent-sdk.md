@@ -35,6 +35,10 @@ uvicorn claude_agent_sdk.actiondesign_gateway.app:app --host 0.0.0.0 --port 8888
 GET /api/actiondesign-agent/health
 ```
 
+OpenAPI document version: `2.2.0` (strict runtime identity and full request-attempt detail contract).
+
+Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and `runId` is `run_<uuid-v4>`. Chat/stream/tool-result require exact Body/Header identity agreement; the service seal path also requires UUID v4. Admin conversation lookup/seal retains legacy safe-ID compatibility for historical logs.
+
 ## API
 
 ### 模型与转发
@@ -52,8 +56,8 @@ GET /api/actiondesign-agent/health
 ```json
 {
   "provider": "mimo",
-  "conversationId": "conv_1",
-  "runId": "run_1",
+  "conversationId": "11111111-1111-4111-8111-111111111111",
+  "runId": "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   "systemPrompt": "完整且独立的 ActionDesign 系统规则",
   "prompt": "...",
   "stream": true,
@@ -110,9 +114,9 @@ GET /api/actiondesign-agent/health
 每个 frame 都是统一 envelope：
 
 ```text
-data: {"protocolVersion":"1.0","sequence":1,"conversationId":"conv_1","runId":"run_1","traceId":"trace_1","timestamp":"...","type":"model.delta","payload":{"content":"..."}}
+data: {"protocolVersion":"1.0","sequence":1,"conversationId":"11111111-1111-4111-8111-111111111111","runId":"run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","traceId":"trace_1","timestamp":"...","type":"model.delta","payload":{"content":"..."}}
 
-data: {"protocolVersion":"1.0","sequence":2,"conversationId":"conv_1","runId":"run_1","traceId":"trace_1","timestamp":"...","type":"model.completed","payload":{"content":"...","tool_calls":[],"success":true}}
+data: {"protocolVersion":"1.0","sequence":2,"conversationId":"11111111-1111-4111-8111-111111111111","runId":"run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","traceId":"trace_1","timestamp":"...","type":"model.completed","payload":{"content":"...","tool_calls":[],"success":true}}
 ```
 
 允许的 type：
@@ -143,28 +147,42 @@ data: {"protocolVersion":"1.0","sequence":2,"conversationId":"conv_1","runId":"r
 
 ### API Profile / Key
 
+- `GET /admin/`：本项目内置的独立管理页面，不依赖其他前端工程
+- `POST /api/actiondesign-agent/admin/login`
+- `GET /api/actiondesign-agent/admin/access-key`
+- `POST /api/actiondesign-agent/admin/access-key/rotate`
 - `GET /api/actiondesign-agent/admin/profiles`
 - `PUT /api/actiondesign-agent/admin/profiles/{profileId}`
 - `DELETE /api/actiondesign-agent/admin/profiles/{profileId}`
 - `GET /api/actiondesign-agent/admin/request-logs`
 - `GET /api/actiondesign-agent/admin/request-logs/{requestId}`
+- `GET /api/actiondesign-agent/admin/audit-logs`
+- `GET /api/actiondesign-agent/admin/conversations`
+- `GET /api/actiondesign-agent/admin/conversations/{conversationId}`
+- `POST /api/actiondesign-agent/admin/conversations/{conversationId}/seal`
 
 管理接口要求：
 
 ```text
-Authorization: Bearer <ACTIONDESIGN_PROFILE_ADMIN_TOKEN>
+POST /api/actiondesign-agent/admin/login {"password":"..."}
+Authorization: Bearer <short-lived-session-token>
 ```
 
 规则：
 
-- API 响应只有 `keyConfigured`，绝不返回 Key。
+- 管理密码不硬编码在源码中；本项目部署时通过隔离 `.env` 设置 `ACTIONDESIGN_ADMIN_PASSWORD=ailxhmm12`，未配置时登录端点返回 `ADMIN_LOGIN_DISABLED`。登录连续失败 5 次后，同一来源会被限制 30 分钟。密码只在登录请求中发送，不写日志。`ACTIONDESIGN_ADMIN_ALLOW_REMOTE` 默认 `false`，因此公网 8888 的 admin 路由不可访问；生产前端必须由 loopback 上的 HTTPS 同源代理转发，或在完成网络边界保护后显式开启远程管理。
+- `/admin/` 直接调用同源管理 API，覆盖渠道、模型、路由优先级、Browser API Key、系统审计、完整 Conversation 和 metadata 请求日志。管理密码、session、Provider Key 与新生成的 Browser API Key 都只保存在当前页面内存；页面刷新后需要重新登录。
+- 浏览器可直接把短期管理 session 放入 `X-ActionDesign-Api-Key` 调用模型；长期浏览器/CLI Key 通过 access-key rotate 创建或轮换，明文只在该次响应出现，后端仅持久化盐化摘要和末尾掩码。
+- 内部服务继续独立使用 `X-ActionDesign-Service-Token`，不得把 Provider Key 或 Service Token 下发给浏览器。
+- Profile API 响应只有 `keyConfigured`，绝不返回 Provider Key。
 - 更新时 `apiKey` 为空会保留已有 Key。
-- 每个 Profile 包含动态 `provider` 渠道 ID、`displayName`、`protocol=openai|claude`、`models[]`、`defaultModel`、Base URL、认证方式、超时和启用状态。
-- 未显式提交 `profileId` 时，网关使用 `/models` 暴露的真实 `defaultProfileId`；请求模型必须属于选中 Profile，图片、native tools、Thinking 和 `maxTokens` 必须符合该模型能力。
+- 每个 Profile 包含动态 `provider` 渠道 ID、`displayName`、`protocol=openai|claude`、`priority`、`models[].priority`、`defaultModel`、Base URL、认证方式、超时和启用状态。priority 为 1..10000，数值越大越优先。
+- `/models.routingOrder` 返回真实全局顺序。无显式选择时先使用最高优先级渠道的 `defaultModel`；显式 profile/model 始终作为首选。可重试故障先切同 Profile 其余模型（按 priority），再切其他 Profile 的默认模型及模型链。
+- 401/403 会跳过当前 Profile 的其余模型再尝试其他凭据；408/429/5xx、timeout/network、context/model unavailable 可降级；参数、能力校验及普通 4xx 不盲重试。流式只允许首个可见 delta 前切换，已输出后返回 `gateway.error` 而不换路由。
 - Claude Thinking 透传为 Anthropic `thinking`；OpenAI Chat Completions 按预算映射为 `reasoning_effort`。
-- 环境变量生成的 default profile 不允许通过 API 删除。
+- `default-mimo` 和 `default-claude-code` 只是普通环境渠道，不允许删除，也不能改 provider/protocol/Base URL/auth/key；但允许页面修改 priority、defaultModel 和 models 路由 metadata，并通过 environment overlay 持久化。
 - 环境变量和受管 profile 的 URL 都会在注册前校验 HTTPS/loopback 与 `ACTIONDESIGN_PROFILE_ALLOWED_HOSTS`，并拒绝 userinfo、query 和 fragment；非法环境 Profile 会使网关启动失败，而不是带着未校验目标运行。
-- profile 文件使用 strict schema v3，只保存非敏感 metadata、协议、模型能力和随机 `secret_ref`；旧 schema v2 会严格校验后一次性迁移到 v3，旧明文 Profile 文件仍拒绝加载。
+- profile 文件使用 strict schema v4，只保存非敏感 metadata、优先级、环境 overlay 和随机 `secret_ref`；旧 schema v2/v3 会严格校验后一次性迁移到 v4，旧明文 Profile 文件仍拒绝加载。
 - 默认使用系统安全 Keyring backend。无桌面会话的 systemd 环境可以显式选择 `file` secret backend；该文件与父目录分别按 `0600`/`0700` 保护，且仍与 Profile metadata 分离，不会回显到 API、审计或请求日志。
 - 修改已有 Profile 的 provider、`protocol`、`baseUrl` 或 `authMode` 时必须同时提交新 Key；Secret 与 metadata 更新、删除失败时执行回滚。
 - profile 文件默认 `config/actiondesign-api-profiles.json`，写入后尝试设置 `0600`；生产环境应把目录挂载到受保护存储。
@@ -186,8 +204,9 @@ ACTIONDESIGN_AGENT_ALLOW_ORIGINS=https://your-frontend.example
 ACTIONDESIGN_SERVICE_AUTH_MODE=required
 ACTIONDESIGN_SERVICE_AUTH_TOKEN=<random-secret-at-least-32-characters>
 ACTIONDESIGN_AGENT_LOG_ROOT=debug_logs/actiondesign-agent
-ACTIONDESIGN_FULL_CONVERSATION_LOG=false
+ACTIONDESIGN_FULL_CONVERSATION_LOG=true
 ACTIONDESIGN_FULL_CONVERSATION_LOG_ROOT=logs/actiondesign-agent
+ACTIONDESIGN_FULL_CONVERSATION_LOG_MAX_BYTES=104857600
 ACTIONDESIGN_REQUEST_LOG_PATH=logs/actiondesign-agent/request-logs.jsonl
 ACTIONDESIGN_REQUEST_LOG_MAX_BYTES=10485760
 ACTIONDESIGN_REQUEST_LOG_BACKUP_COUNT=5
@@ -195,7 +214,7 @@ ACTIONDESIGN_REQUEST_LOG_BACKUP_COUNT=5
 
 请求日志只保留严格白名单内的 usage/error、hash、长度、耗时和路由元数据；读取历史行时再次清洗。默认单文件 10 MiB、保留 5 个备份，列表与详情使用有界分块反向读取，不会把整个日志文件载入内存。
 
-生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要先删除客户端提交的 `X-ActionDesign-Service-Token`，再从服务端安全配置注入真实 Token；浏览器不得读取、保存或主动发送该 Token，代理访问日志也不得记录它。`chat`、流式路由、兼容 Provider 路由、`tool-result`、固定 MCP 和 LangSmith batch 均验证该 Header；`health/models` 保持公开只读，Profile/请求日志管理继续使用独立管理员 Bearer Token。`required` 模式缺少或少于 32 字符的 Token 时网关启动失败；本地开发只有在明确使用 `disabled` 且 Token 为空时才允许关闭。
+生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要删除客户端伪造的 Service Token Header；浏览器使用短期 session 或独立 Browser API Key，不读取 Provider Key/Service Token。`chat`、流式路由、兼容 Provider 路由、`tool-result`、固定 MCP 和 LangSmith batch 接受有效 `X-ActionDesign-Api-Key`，内部调用也可使用 `X-ActionDesign-Service-Token`；`health/models` 保持公开只读。短期 session 只应放内存或 sessionStorage，不应放 localStorage。
 
 ### MiMo
 
@@ -235,6 +254,10 @@ ACTIONDESIGN_PROFILE_STORE_PATH=config/actiondesign-api-profiles.json
 ACTIONDESIGN_PROFILE_SECRET_STORE_BACKEND=keyring
 ACTIONDESIGN_PROFILE_SECRET_STORE_PATH=config/actiondesign-api-profile-secrets.json
 ACTIONDESIGN_PROFILE_ADMIN_TOKEN=...
+ACTIONDESIGN_ADMIN_PASSWORD=ailxhmm12
+ACTIONDESIGN_ADMIN_SESSION_TTL_SECONDS=3600
+ACTIONDESIGN_ADMIN_ALLOW_REMOTE=false
+ACTIONDESIGN_BROWSER_API_KEY_STORE_PATH=config/actiondesign-browser-api-key.json
 ACTIONDESIGN_PROFILE_ALLOWED_HOSTS=token-plan-cn.xiaomimimo.com,api.anthropic.com
 ```
 
@@ -262,9 +285,11 @@ ACTIONDESIGN_GXP_READONLY_MCP_TIMEOUT_SECONDS=30
 
 ## 日志与脱敏
 
-- 审计日志默认写入 `debug_logs/actiondesign-agent/{conversationId}/`。
-- 完整会话日志默认关闭；仅显式 opt-in 后写入 `logs/actiondesign-agent/yyyyMMdd_HHmmss_{conversationId}.jsonl`。
-- 记录 gateway request/response/error、版本信息、usage、耗时和 tool result；Prompt、systemPrompt、模型正文和图片 base64 只记录 hash、长度或摘要元数据，不保存原文。
+- 系统修改审计日志独立写入 `debug_logs/actiondesign-agent/system/admin-audit.jsonl`，记录登录、Profile/Key/priority、Browser API Key 和 seal 操作的 actor/IP、requestId、结果与脱敏详情。
+- metadata 请求日志独立写入 `request-logs.jsonl` 并轮转；每个实际 fallback attempt 都记录 attempt、实际 Profile/协议/模型，不保存正文。
+- 完整会话日志默认开启，按 `conversationId` 同步追加到 `logs/actiondesign-agent/yyyyMMdd_HHmmss_{conversationId}.jsonl`，使用 per-conversation lock，目录/文件权限尝试设为 `0700`/`0600`。
+- 完整会话日志保存每轮 systemPrompt、prompt、请求参数、每次 fallback、最终响应/工具调用/错误；图片只保存类型、来源、长度和 SHA-256，不保存原始 base64。
+- conversation 默认 `open`，仅显式 seal 后为 `completed|aborted`；断线/timeout 只把 turn 标成 cancelled/error，不伪称会话完成。超过大小上限会写 `incompleteReason`。
 - Authorization、API Key、cookie、长 base64 和图片 data 会脱敏。
 - 所有会话日志在最终持久化写入层再次统一脱敏，调用方不能绕过该边界；SSE 错误文本也会在返回和记录前脱敏。
 - Profile secret 不进入普通 API 响应或请求日志。

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -16,6 +15,27 @@ _SECRET_KEYS = {
     "cookie",
     "gxp_mimo_api_key",
     "model_mimo_key",
+}
+_NON_SECRET_TOKEN_KEYS = {
+    "budget_tokens",
+    "cached_tokens",
+    "completion_tokens",
+    "contextwindowtokens",
+    "context_window_tokens",
+    "input_tokens",
+    "maxoutputtokens",
+    "max_output_tokens",
+    "maxtokens",
+    "max_tokens",
+    "output_tokens",
+    "prompt_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+}
+_NON_SECRET_STATUS_KEYS = {
+    "keyconfigured",
+    "keyupdated",
+    "masked",
 }
 _CONNECTION_KEYS = {
     "connection_string",
@@ -54,12 +74,9 @@ _REDACTED = "[REDACTED]"
 
 
 def safe_conversation_id(value: str) -> str:
-    if value == "":
-        return f"unknown_{int(time.time() * 1000)}"
-    value = value.replace(":", "_")
     if not _CONVERSATION_ID_RE.fullmatch(value):
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail={"code": "INVALID_CONVERSATION_ID"},
         )
     return value
@@ -86,6 +103,8 @@ def _is_secret_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False
     normalized = key.strip().lower()
+    if normalized in _NON_SECRET_TOKEN_KEYS or normalized in _NON_SECRET_STATUS_KEYS:
+        return False
     return (
         normalized in _SECRET_KEYS
         or normalized in _CONNECTION_KEYS

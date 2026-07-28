@@ -46,7 +46,7 @@ def test_managed_profile_persists_only_secret_reference_and_never_plaintext(tmp_
 
     assert public["keyConfigured"] is True
     assert "api_key" not in public
-    assert payload["schemaVersion"] == "3"
+    assert payload["schemaVersion"] == "4"
     assert payload["profiles"][0]["secret_ref"].startswith("profile:")
     assert "api_key" not in payload["profiles"][0]
     assert "managed-secret" not in persisted_text
@@ -243,7 +243,7 @@ def test_environment_profiles_cannot_be_overwritten(tmp_path):
         store.upsert(overwrite)
 
     assert error.value.status_code == 409
-    assert error.value.detail["code"] == "ENVIRONMENT_PROFILE_READ_ONLY"
+    assert error.value.detail["code"] == "ENVIRONMENT_PROFILE_ROUTE_READ_ONLY"
 
 
 def test_corrupt_profile_store_fails_closed_instead_of_silently_erasing_profiles(tmp_path):
@@ -357,10 +357,90 @@ def test_settings_accept_dynamic_default_provider(monkeypatch):
     assert Settings().default_provider == "team-openai"
 
 
-def test_full_conversation_log_is_opt_in(monkeypatch):
+def test_full_conversation_log_is_enabled_by_default(monkeypatch):
     monkeypatch.delenv("ACTIONDESIGN_FULL_CONVERSATION_LOG", raising=False)
 
-    assert Settings().full_conversation_log_enabled is False
+    assert Settings().full_conversation_log_enabled is True
+
+
+def test_environment_profile_routing_metadata_override_persists(tmp_path):
+    gateway_settings = settings(tmp_path)
+    store = ApiProfileStore(gateway_settings, MemoryProfileSecretStore())
+    current = store.resolve("mimo", "default-mimo")
+    models = [
+        {
+            **item.model_dump(mode="json", by_alias=True),
+            "priority": 800 if item.id == "mimo-v2.5-pro" else 700,
+        }
+        for item in current.models
+    ]
+
+    updated = store.upsert(
+        ApiProfileWriteRequest(
+            id=current.id,
+            provider=current.provider,
+            displayName=current.display_name,
+            protocol=current.protocol,
+            baseUrl=current.base_url,
+            apiKey="",
+            defaultModel="mimo-v2.5-pro",
+            models=models,
+            authMode=current.auth_mode,
+            timeoutSeconds=current.timeout_seconds,
+            priority=900,
+            enabled=current.enabled,
+        )
+    )
+    reloaded = ApiProfileStore(gateway_settings, MemoryProfileSecretStore())
+    resolved = reloaded.resolve("mimo", "default-mimo")
+    payload = json.loads((tmp_path / "profiles.json").read_text(encoding="utf-8"))
+
+    assert updated["source"] == "environment"
+    assert updated["priority"] == 900
+    assert resolved.default_model == "mimo-v2.5-pro"
+    assert resolved.priority == 900
+    assert resolved.models[0].priority in {700, 800}
+    assert payload["environmentOverrides"][0]["id"] == "default-mimo"
+
+
+def test_schema_v3_profiles_are_migrated_with_default_priorities(tmp_path):
+    secret_store = MemoryProfileSecretStore()
+    secret_ref = "profile:" + ("b" * 32)
+    secret_store.set(secret_ref, "managed-secret")
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "3",
+                "profiles": [
+                    {
+                        "id": "legacy-v3",
+                        "provider": "team-openai",
+                        "display_name": "Legacy V3",
+                        "protocol": "openai",
+                        "base_url": "https://api.example.test/v1",
+                        "secret_ref": secret_ref,
+                        "default_model": "legacy-model",
+                        "models": [{"id": "legacy-model", "name": "Legacy"}],
+                        "auth_mode": "bearer",
+                        "timeout_seconds": 60.0,
+                        "enabled": True,
+                        "source": "managed",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = ApiProfileStore(settings(tmp_path), secret_store)
+    migrated = store.resolve("team-openai", "legacy-v3")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert migrated.priority == 100
+    assert migrated.models[0].priority == 100
+    assert payload["schemaVersion"] == "4"
+    assert payload["profiles"][0]["priority"] == 100
 
 
 def test_schema_v2_profiles_are_migrated_to_protocol_and_model_schema(tmp_path):
@@ -396,7 +476,7 @@ def test_schema_v2_profiles_are_migrated_to_protocol_and_model_schema(tmp_path):
 
     assert migrated.protocol == "claude"
     assert migrated.models[0].id == "mimo-v2.5"
-    assert payload["schemaVersion"] == "3"
+    assert payload["schemaVersion"] == "4"
     assert payload["profiles"][0]["protocol"] == "claude"
     assert payload["profiles"][0]["models"]
 
@@ -457,7 +537,8 @@ def test_gateway_models_reject_type_coercion():
 
     with pytest.raises(ValidationError):
         ToolResultRequest.model_validate({
-            "runId": "run_test",
+            "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "runId": "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "toolCallId": "call_1",
             "toolName": "create_node",
             "turn": "1",

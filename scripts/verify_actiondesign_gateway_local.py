@@ -105,8 +105,12 @@ def _payload(*, stream: bool, profile_id: str = "") -> dict[str, Any]:
     return {
         "provider": "mimo",
         "profileId": profile_id,
-        "conversationId": "conv_local_smoke",
-        "runId": "run_local_smoke_stream" if stream else "run_local_smoke",
+        "conversationId": "99999999-9999-4999-8999-999999999999",
+        "runId": (
+            "run_99999999-9999-4999-8999-999999999998"
+            if stream
+            else "run_99999999-9999-4999-8999-999999999999"
+        ),
         "agentMode": "normal",
         "systemPrompt": "You are the ActionDesign system agent.",
         "prompt": "Create one ExitAction node",
@@ -154,6 +158,7 @@ def main() -> int:
                 claude_code_models=["claude-sonnet-4-5"],
                 profile_store_path=root / "profiles.json",
                 profile_admin_token="local-admin-token",
+                admin_allow_remote=True,
                 profile_allowed_hosts=["127.0.0.1", "api.anthropic.com"],
                 langsmith_enabled=False,
                 langsmith_api_key="",
@@ -162,6 +167,7 @@ def main() -> int:
                 create_app(settings, profile_secret_store=MemoryProfileSecretStore())
             )
             health = client.get("/api/actiondesign-agent/health")
+            openapi = client.get("/openapi.json")
             models = client.get("/api/actiondesign-agent/models")
             admin_headers = {"Authorization": "Bearer local-admin-token"}
             managed = client.put(
@@ -181,13 +187,23 @@ def main() -> int:
             managed_list = client.get(
                 "/api/actiondesign-agent/admin/profiles", headers=admin_headers
             )
+            chat_payload = _payload(stream=False, profile_id="local-managed")
+            stream_payload = _payload(stream=True, profile_id="local-managed")
             chat = client.post(
                 "/api/actiondesign-agent/mimo/chat",
-                json=_payload(stream=False, profile_id="local-managed"),
+                headers={
+                    "X-Conversation-Id": chat_payload["conversationId"],
+                    "X-Agent-Run-Id": chat_payload["runId"],
+                },
+                json=chat_payload,
             )
             stream = client.post(
                 "/api/actiondesign-agent/mimo/chat/stream",
-                json=_payload(stream=True, profile_id="local-managed"),
+                headers={
+                    "X-Conversation-Id": stream_payload["conversationId"],
+                    "X-Agent-Run-Id": stream_payload["runId"],
+                },
+                json=stream_payload,
             )
             deleted = client.delete(
                 "/api/actiondesign-agent/admin/profiles/local-managed",
@@ -195,6 +211,7 @@ def main() -> int:
             )
             for response in (
                 health,
+                openapi,
                 models,
                 managed,
                 managed_list,
@@ -218,6 +235,7 @@ def main() -> int:
             result = {
                 "status": "passed",
                 "runtime": health.json()["runtime"],
+                "openapiVersion": openapi.json()["info"]["version"],
                 "providerStatus": models.json()["providers"]["mimo"]["status"],
                 "nonStreamSuccess": chat_body["success"],
                 "nativeTool": chat_body["tool_calls"][0]["name"],
@@ -234,6 +252,7 @@ def main() -> int:
             if result != {
                 "status": "passed",
                 "runtime": "thin-gateway",
+                "openapiVersion": "2.2.0",
                 "providerStatus": "ready",
                 "nonStreamSuccess": True,
                 "nativeTool": "create_node",

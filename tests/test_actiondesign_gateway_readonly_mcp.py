@@ -38,6 +38,8 @@ SERVICE_HEADERS = {
     "Origin": ORIGIN,
     "X-ActionDesign-Service-Token": SERVICE_TOKEN,
 }
+CONVERSATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+RUN_ID = "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def make_settings(tmp_path, **overrides):
@@ -413,8 +415,8 @@ def call_payload(**overrides):
     payload = {
         "toolName": "resolve_action",
         "arguments": {"identifier": "TRAINING_CREATE"},
-        "conversationId": "conversation_mcp",
-        "runId": "run_mcp",
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
         "traceId": "trace_mcp",
         "skillId": "gxp-lowcode-debug",
         "skillVersion": GXP_LOWCODE_DEBUG_SKILL_VERSION,
@@ -491,6 +493,19 @@ def test_request_model_rejects_non_allowlisted_tools_and_wrong_skill_version(tmp
         json=call_payload(skillVersion="0.9.0"),
     )
     assert wrong_version.status_code == 422
+
+    legacy_conversation = client.post(
+        "/api/actiondesign-agent/mcp/gxp-lowcode-readonly/call",
+        headers=headers,
+        json=call_payload(conversationId="conversation_mcp"),
+    )
+    legacy_run = client.post(
+        "/api/actiondesign-agent/mcp/gxp-lowcode-readonly/call",
+        headers=headers,
+        json=call_payload(runId="run_mcp"),
+    )
+    assert legacy_conversation.status_code == 422
+    assert legacy_run.status_code == 422
 
 
 def test_current_frontend_skill_version_is_accepted(tmp_path):

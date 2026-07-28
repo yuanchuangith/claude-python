@@ -58,8 +58,8 @@ def _call_payload(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return {
         "toolName": tool_name,
         "arguments": arguments,
-        "conversationId": "verify_readonly_mcp",
-        "runId": "verify_readonly_mcp_run",
+        "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "runId": "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "topicId": "verify_readonly_mcp_topic",
         "checkpointId": "verify_readonly_mcp_checkpoint",
         "traceId": "verify_readonly_mcp_trace",

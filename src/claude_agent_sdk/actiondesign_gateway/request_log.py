@@ -27,6 +27,7 @@ _KNOWN_ERROR_CODES = frozenset(
         "PROVIDER_AUTH_FAILED",
         "PROVIDER_CONTEXT_TOO_LARGE",
         "PROVIDER_HTTP_ERROR",
+        "PROVIDER_MODEL_UNAVAILABLE",
         "PROVIDER_NETWORK_ERROR",
         "PROVIDER_OUTPUT_TRUNCATED",
         "PROVIDER_RATE_LIMITED",
@@ -37,6 +38,7 @@ _KNOWN_ERROR_CODES = frozenset(
         "PROVIDER_STREAM_INVALID",
         "PROVIDER_TIMEOUT",
         "PROVIDER_TOOL_CALL_INVALID",
+        "CLIENT_STREAM_CANCELLED",
     }
 )
 _TOKEN_USAGE_FIELDS = frozenset(
@@ -106,6 +108,7 @@ class RequestLogStore:
         error: Any = None,
         http_status: int = 200,
         stream: bool,
+        attempt: int = 1,
     ) -> dict[str, Any]:
         response_data = model_to_dict(response or {})
         usage = _sanitize_usage(response_data.get("usage"))
@@ -129,6 +132,7 @@ class RequestLogStore:
                 "profileId": profile.id,
                 "protocol": profile.protocol,
                 "model": str(response_data.get("model") or request.model or profile.default_model),
+                "attempt": attempt,
                 "stream": stream,
                 "status": status,
                 "durationMs": max(0, int((time.monotonic() - started) * 1_000)),
@@ -203,6 +207,20 @@ class RequestLogStore:
             if entry.get("requestId") == request_id:
                 return entry
         return None
+
+    def get_attempts(self, request_id: str) -> list[dict[str, Any]]:
+        attempts = [
+            entry
+            for entry in self._iter_entries_newest()
+            if entry.get("requestId") == request_id
+        ]
+        attempts.sort(
+            key=lambda entry: (
+                int(entry.get("attempt") or 0),
+                str(entry.get("timestamp") or ""),
+            )
+        )
+        return attempts
 
     def _iter_entries_newest(self) -> Iterator[dict[str, Any]]:
         with self._lock:

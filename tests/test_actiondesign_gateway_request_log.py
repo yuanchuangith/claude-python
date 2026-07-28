@@ -20,6 +20,10 @@ from claude_agent_sdk.actiondesign_gateway.request_log import RequestLogStore  #
 from claude_agent_sdk.actiondesign_gateway.settings import Settings  # noqa: E402
 
 
+CONVERSATION_ID = "77777777-7777-4777-8777-777777777777"
+RUN_ID = "run_77777777-7777-4777-8777-777777777777"
+
+
 def make_settings(tmp_path, **overrides):
     values = {
         "default_provider": "mimo",
@@ -39,6 +43,7 @@ def make_settings(tmp_path, **overrides):
         "claude_code_models": ["claude-sonnet-4-5"],
         "profile_store_path": tmp_path / "profiles.json",
         "profile_admin_token": "admin-token",
+        "admin_allow_remote": True,
         "profile_allowed_hosts": [
             "token-plan-cn.xiaomimimo.com",
             "api.anthropic.com",
@@ -62,8 +67,8 @@ def make_client(tmp_path, **overrides):
 def chat_payload(**overrides):
     payload = {
         "provider": "mimo",
-        "conversationId": "conv_request_log",
-        "runId": "run_request_log",
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
         "agentMode": "normal",
         "systemPrompt": "System instructions",
         "prompt": "Private business prompt",
@@ -74,11 +79,18 @@ def chat_payload(**overrides):
     return payload
 
 
+def identity_headers(payload):
+    return {
+        "X-Conversation-Id": payload["conversationId"],
+        "X-Agent-Run-Id": payload["runId"],
+    }
+
+
 def request_model(index: int) -> AgentChatRequest:
     return AgentChatRequest.model_validate(
         chat_payload(
-            conversationId=f"conv_{index}",
-            runId=f"run_{index}",
+            conversationId=f"77777777-7777-4777-8777-{index:012x}",
+            runId=f"run_77777777-7777-4777-8777-{index:012x}",
             prompt=f"Private prompt {index}",
         )
     )
@@ -220,8 +232,8 @@ def test_request_log_admin_is_unavailable_when_token_is_disabled(tmp_path):
         headers={"Authorization": "Bearer ignored"},
     )
 
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "PROFILE_ADMIN_DISABLED"
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "PROFILE_ADMIN_AUTH_REQUIRED"
 
 
 def test_request_log_admin_returns_sanitized_detail_and_not_found(tmp_path, monkeypatch):
@@ -245,9 +257,11 @@ def test_request_log_admin_returns_sanitized_detail_and_not_found(tmp_path, monk
 
     monkeypatch.setattr(gateway_app, "call_mimo", fake_call)
     client = make_client(tmp_path)
+    payload = chat_payload()
     chat = client.post(
         "/api/actiondesign-agent/mimo/chat",
-        json=chat_payload(),
+        headers=identity_headers(payload),
+        json=payload,
     )
     request_id = chat.headers["x-request-id"]
     headers = {"Authorization": "Bearer admin-token"}
@@ -264,6 +278,8 @@ def test_request_log_admin_returns_sanitized_detail_and_not_found(tmp_path, monk
     assert chat.status_code == 200
     assert detail.status_code == 200
     assert detail.json()["requestId"] == request_id
+    assert detail.json()["attemptCount"] == 1
+    assert [item["attempt"] for item in detail.json()["attempts"]] == [1]
     assert detail.json()["usage"] == {
         "input_tokens": 10,
         "output_tokens": 4,

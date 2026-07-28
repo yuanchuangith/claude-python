@@ -104,10 +104,18 @@ class Settings(BaseModel):
         default_factory=lambda: Path(_env("ACTIONDESIGN_AGENT_LOG_ROOT", default="debug_logs/actiondesign-agent"))
     )
     full_conversation_log_enabled: bool = Field(
-        default_factory=lambda: _bool("ACTIONDESIGN_FULL_CONVERSATION_LOG", False)
+        default_factory=lambda: _bool("ACTIONDESIGN_FULL_CONVERSATION_LOG", True)
     )
     full_conversation_log_root: Path = Field(
         default_factory=lambda: Path(_env("ACTIONDESIGN_FULL_CONVERSATION_LOG_ROOT", default="logs/actiondesign-agent"))
+    )
+    full_conversation_log_max_bytes: int = Field(
+        default_factory=lambda: _int(
+            "ACTIONDESIGN_FULL_CONVERSATION_LOG_MAX_BYTES",
+            100 * 1024 * 1024,
+        ),
+        ge=1024 * 1024,
+        le=1024 * 1024 * 1024,
     )
     request_log_path: Path = Field(
         default_factory=lambda: Path(
@@ -180,6 +188,25 @@ class Settings(BaseModel):
         )
     )
     profile_admin_token: str = Field(default_factory=lambda: _env("ACTIONDESIGN_PROFILE_ADMIN_TOKEN"))
+    admin_password: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_ADMIN_PASSWORD")
+    )
+    admin_session_ttl_seconds: int = Field(
+        default_factory=lambda: _int("ACTIONDESIGN_ADMIN_SESSION_TTL_SECONDS", 3600),
+        ge=300,
+        le=86_400,
+    )
+    admin_allow_remote: bool = Field(
+        default_factory=lambda: _bool("ACTIONDESIGN_ADMIN_ALLOW_REMOTE", False)
+    )
+    browser_api_key_store_path: Path = Field(
+        default_factory=lambda: Path(
+            _env(
+                "ACTIONDESIGN_BROWSER_API_KEY_STORE_PATH",
+                default="config/actiondesign-browser-api-key.json",
+            )
+        )
+    )
     profile_allowed_hosts: list[str] = Field(
         default_factory=lambda: _csv(
             "ACTIONDESIGN_PROFILE_ALLOWED_HOSTS",
@@ -264,6 +291,7 @@ class Settings(BaseModel):
         "mimo_api_key",
         "claude_code_api_key",
         "profile_admin_token",
+        "admin_password",
         "langsmith_api_key",
         "service_auth_token",
     )

@@ -219,11 +219,31 @@ async def call_messages(req: Any, profile: ProviderProfile) -> dict[str, Any]:
             response.raise_for_status()
             payload = response.json()
     except httpx.TimeoutException as exc:
-        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider request timed out") from exc
+        raise _upstream_error(
+            504,
+            "PROVIDER_TIMEOUT",
+            "Provider request timed out",
+            retryable=True,
+            failover_scope="model",
+        ) from exc
     except httpx.HTTPStatusError as exc:
         raise _provider_http_error(exc) from exc
-    except (httpx.RequestError, ValueError) as exc:
-        raise _upstream_error(502, "PROVIDER_RESPONSE_ERROR", str(exc)) from exc
+    except httpx.RequestError as exc:
+        raise _upstream_error(
+            502,
+            "PROVIDER_NETWORK_ERROR",
+            str(exc),
+            retryable=True,
+            failover_scope="model",
+        ) from exc
+    except ValueError as exc:
+        raise _upstream_error(
+            502,
+            "PROVIDER_RESPONSE_ERROR",
+            str(exc),
+            retryable=True,
+            failover_scope="model",
+        ) from exc
     if not isinstance(payload, dict):
         raise _upstream_error(502, "PROVIDER_RESPONSE_INVALID", "Provider response is not an object")
     parsed = AgentChatResponse.model_validate(
@@ -290,11 +310,11 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
                         if delta_text:
                             yield {"kind": "delta", "content": delta_text}
     except httpx.TimeoutException as exc:
-        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider stream timed out") from exc
+        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider stream timed out", retryable=True, failover_scope="model") from exc
     except httpx.HTTPStatusError as exc:
         raise _provider_http_error(exc) from exc
     except httpx.RequestError as exc:
-        raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc)) from exc
+        raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc), retryable=True, failover_scope="model") from exc
 
     calls = []
     for block in tool_blocks.values():
@@ -390,11 +410,13 @@ async def call_openai(req: Any, profile: ProviderProfile) -> dict[str, Any]:
             response.raise_for_status()
             payload = response.json()
     except httpx.TimeoutException as exc:
-        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider request timed out") from exc
+        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider request timed out", retryable=True, failover_scope="model") from exc
     except httpx.HTTPStatusError as exc:
         raise _provider_http_error(exc) from exc
-    except (httpx.RequestError, ValueError) as exc:
-        raise _upstream_error(502, "PROVIDER_RESPONSE_ERROR", str(exc)) from exc
+    except httpx.RequestError as exc:
+        raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc), retryable=True, failover_scope="model") from exc
+    except ValueError as exc:
+        raise _upstream_error(502, "PROVIDER_RESPONSE_ERROR", str(exc), retryable=True, failover_scope="model") from exc
     if not isinstance(payload, dict):
         raise _upstream_error(502, "PROVIDER_RESPONSE_INVALID", "Provider response is not an object")
     parsed = AgentChatResponse.model_validate(
@@ -470,11 +492,11 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
                             yield {"kind": "delta", "content": delta_text}
                         _consume_openai_tool_call_deltas(delta.get("tool_calls") or [], tool_calls)
     except httpx.TimeoutException as exc:
-        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider stream timed out") from exc
+        raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider stream timed out", retryable=True, failover_scope="model") from exc
     except httpx.HTTPStatusError as exc:
         raise _provider_http_error(exc) from exc
     except httpx.RequestError as exc:
-        raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc)) from exc
+        raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc), retryable=True, failover_scope="model") from exc
 
     calls = _finalize_openai_tool_calls(tool_calls)
     truncated = finish_reason in {"length", "max_tokens", "output_truncated"}
@@ -679,17 +701,89 @@ def _parse_event(event_name: str, data_lines: list[str]) -> dict[str, Any] | Non
     return event
 
 
-def _upstream_error(status: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code=status, detail={"code": code, "message": message})
+def _upstream_error(
+    status: int,
+    code: str,
+    message: str,
+    *,
+    retryable: bool | None = None,
+    failover_scope: str = "none",
+) -> HTTPException:
+    if retryable is None:
+        retryable = code in {
+            "PROVIDER_RESPONSE_EMPTY",
+            "PROVIDER_RESPONSE_ERROR",
+            "PROVIDER_RESPONSE_INVALID",
+            "PROVIDER_STREAM_ERROR",
+            "PROVIDER_STREAM_INVALID",
+        }
+        if retryable and failover_scope == "none":
+            failover_scope = "model"
+    return HTTPException(
+        status_code=status,
+        detail={
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "failoverScope": failover_scope,
+        },
+    )
 
 
 def _provider_http_error(exc: httpx.HTTPStatusError) -> HTTPException:
     status = exc.response.status_code
     body = exc.response.text[:2000]
+    normalized_body = body.lower()
     if status in {401, 403}:
-        return _upstream_error(502, "PROVIDER_AUTH_FAILED", f"Provider authentication failed ({status})")
+        return _upstream_error(
+            502,
+            "PROVIDER_AUTH_FAILED",
+            f"Provider authentication failed ({status})",
+            retryable=True,
+            failover_scope="profile",
+        )
     if status == 429:
-        return _upstream_error(503, "PROVIDER_RATE_LIMITED", "Provider rate limit exceeded")
-    if status == 400 and any(marker in body.lower() for marker in ("context", "token", "too long", "maximum")):
-        return _upstream_error(413, "PROVIDER_CONTEXT_TOO_LARGE", "Provider rejected the request because the context is too large")
+        return _upstream_error(
+            503,
+            "PROVIDER_RATE_LIMITED",
+            "Provider rate limit exceeded",
+            retryable=True,
+            failover_scope="model",
+        )
+    if status in {400, 413} and any(
+        marker in normalized_body
+        for marker in ("context", "too long", "maximum context", "context_length")
+    ):
+        return _upstream_error(
+            413,
+            "PROVIDER_CONTEXT_TOO_LARGE",
+            "Provider rejected the request because the context is too large",
+            retryable=True,
+            failover_scope="model",
+        )
+    if status in {400, 404, 422} and any(
+        marker in normalized_body
+        for marker in (
+            "model not found",
+            "model_not_found",
+            "unknown model",
+            "unsupported model",
+            "model is not supported",
+        )
+    ):
+        return _upstream_error(
+            502,
+            "PROVIDER_MODEL_UNAVAILABLE",
+            "Provider does not support the requested model",
+            retryable=True,
+            failover_scope="model",
+        )
+    if status == 408 or status >= 500:
+        return _upstream_error(
+            502,
+            "PROVIDER_HTTP_ERROR",
+            f"Provider HTTP {status}",
+            retryable=True,
+            failover_scope="model",
+        )
     return _upstream_error(502, "PROVIDER_HTTP_ERROR", f"Provider HTTP {status}")
