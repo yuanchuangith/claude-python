@@ -1,25 +1,31 @@
-"""ActionDesign gateway support models and configuration."""
+"""Thin ActionDesign gateway: logging, controlled API forwarding and telemetry."""
 
 from .models import (
-    DESIGN_TOOLS,
-    MIMO_IMAGE_MODELS,
     MIMO_MODELS,
     AgentChatRequest,
     AgentChatResponse,
+    ApiProfileResponse,
+    ApiProfileWriteRequest,
     ImageInput,
+    NativeToolDefinition,
     ToolResultRequest,
     ToolResultResponse,
+    TraceBatchRequest,
+    TraceBatchResponse,
 )
 from .settings import Settings
 
 __all__ = [
-    "DESIGN_TOOLS",
-    "MIMO_IMAGE_MODELS",
     "MIMO_MODELS",
     "AgentChatRequest",
     "AgentChatResponse",
+    "ApiProfileResponse",
+    "ApiProfileWriteRequest",
     "ImageInput",
+    "NativeToolDefinition",
     "Settings",
     "ToolResultRequest",
     "ToolResultResponse",
+    "TraceBatchRequest",
+    "TraceBatchResponse",
 ]

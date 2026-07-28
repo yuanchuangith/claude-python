@@ -57,3 +57,4 @@ dmypy.json
 
 # Logs
 debug_log/
+logs/

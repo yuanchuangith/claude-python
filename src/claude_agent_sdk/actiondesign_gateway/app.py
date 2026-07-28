@@ -1,962 +1,872 @@
+"""FastAPI application for the thin ActionDesign model gateway."""
+
 from __future__ import annotations
 
 import json
+import hashlib
+import secrets
 import time
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
+from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
-from .actiondesign_backend_executor import warm_knowledge_index
-from .backend_tools import BackendToolCall, BackendToolResult, execute_backend_tool_calls
-from .claude_code_provider import (
-    call_claude_code,
-    call_claude_code_review,
-    stream_claude_code,
-)
-from .mimo_provider import call_mimo, call_mimo_review, stream_mimo
+from .claude_code_provider import call_claude_code, stream_claude_code
+from .langsmith_forwarder import forward_trace_batch
+from .mimo_provider import call_mimo, stream_mimo
 from .models import (
-    MIMO_MODELS,
     AgentChatRequest,
     AgentChatResponse,
-    CodeReviewRequest,
-    CodeReviewResponse,
+    AgentModelsResponse,
+    ApiProfileResponse,
+    ApiProfileWriteRequest,
+    DeleteProfileResponse,
+    GatewayEventEnvelope,
+    HealthResponse,
+    ReadonlyMcpToolCallRequest,
+    ReadonlyMcpToolCallResponse,
+    ReadonlyMcpToolListResponse,
+    RequestLogEntry,
+    RequestLogListResponse,
     ToolResultRequest,
+    ToolResultResponse,
+    TraceBatchRequest,
+    TraceBatchResponse,
 )
-from .qdrant_knowledge_store import qdrant_knowledge_store_from_settings
-from .redaction import safe_conversation_id
+from .profile_store import ApiProfileStore, ProfileSecretStore, ProviderProfile
+from .provider_http import call_provider, stream_provider
+from .request_log import RequestLogStore
+from .redaction import redact_value
 from .session_log import (
     ToolResultStore,
     append_conversation_event,
+    append_log,
     model_to_dict,
     require_run_id_for_full_log,
     resolve_conversation_id,
 )
 from .settings import Settings
+from .readonly_mcp import ReadonlyMcpError, ReadonlyMcpGateway
+
+PROTOCOL_VERSION = "1.0"
+API_PREFIX = "/api/actiondesign-agent"
+SERVICE_AUTH_HEADER = "X-ActionDesign-Service-Token"
+ProfileIdPath = Annotated[
+    str,
+    Path(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    ),
+]
+RequestIdPath = Annotated[
+    str,
+    Path(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9._:-]+$"),
+]
 
 
-def _allow_origins(value: str | Sequence[str]) -> list[str]:
-    if not isinstance(value, str):
-        return list(value)
-    if value == "*":
-        return ["*"]
-    return [origin.strip() for origin in value.split(",") if origin.strip()]
-
-
-def _claude_code_models(settings: Settings) -> list[dict]:
-    configured_model_ids = [
-        str(model).strip()
-        for model in (getattr(settings, "claude_code_models", None) or [])
-        if str(model).strip()
-    ]
-    if configured_model_ids:
-        model_ids = configured_model_ids
-    else:
-        model_ids = list(MIMO_MODELS)
-    default_model = str(
-        getattr(settings, "claude_code_default_model", "") or ""
-    ).strip()
-    if default_model and default_model not in model_ids:
-        model_ids = [default_model, *model_ids]
-    models: list[dict] = []
-    seen: set[str] = set()
-    for model_id in model_ids:
-        model_id = str(model_id).strip()
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        metadata = MIMO_MODELS.get(
-            model_id,
-            {
-                "name": model_id,
-                "supportsImages": False,
-            },
-        )
-        models.append(
-            {
-                "id": model_id,
-                "name": metadata["name"],
-                "provider": "claude-code",
-                "supportsImages": bool(metadata.get("supportsImages", False)),
-                "supportsTextToolProtocol": True,
-                "supportsNativeTools": True,
-                "supportsThinking": False,
-            }
-        )
-    return models
-
-
-def _first_model_id(models: list[dict]) -> str:
-    if not models:
-        return ""
-    return str(models[0].get("id") or "")
-
-
-def _resolved_request_model(
-    req: AgentChatRequest,
-    settings: Settings,
-    provider: Literal["mimo", "claude-code"],
-) -> str:
-    if req.model:
-        return req.model
-    if provider == "mimo":
-        return settings.mimo_default_model or "mimo-v2.5"
-    return (
-        settings.claude_code_default_model
-        or _first_model_id(_claude_code_models(settings))
-        or settings.mimo_default_model
-        or "mimo-v2.5"
-    )
-
-
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    profile_secret_store: ProfileSecretStore | None = None,
+) -> FastAPI:
     gateway_settings = settings or Settings()
+    profile_store = ApiProfileStore(gateway_settings, profile_secret_store)
     tool_results = ToolResultStore()
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        try:
-            warm_knowledge_index(gateway_settings)
-        except Exception as exc:
-            app.state.knowledge_index_error = str(exc)
-        yield
-
-    app = FastAPI(
-        title="ActionDesign Agent Gateway",
-        version="1.0.0",
-        lifespan=lifespan,
+    readonly_mcp_gateway = ReadonlyMcpGateway(gateway_settings)
+    request_logs = RequestLogStore(
+        gateway_settings.request_log_path,
+        max_bytes=gateway_settings.request_log_max_bytes,
+        backup_count=gateway_settings.request_log_backup_count,
     )
-    app.state.actiondesign_settings = gateway_settings
+    app = FastAPI(title="ActionDesign Thin Agent Gateway", version="2.1.0")
+    app.state.settings = gateway_settings
+    app.state.profile_store = profile_store
     app.state.tool_results = tool_results
-    app.state.knowledge_index_error = None
+    app.state.readonly_mcp_gateway = readonly_mcp_gateway
+    app.state.request_logs = request_logs
+
+    @app.exception_handler(RequestValidationError)
+    async def sanitized_request_validation_error(
+        _request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        errors = [
+            {
+                key: value
+                for key, value in error.items()
+                if key not in {"input", "ctx"}
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_allow_origins(gateway_settings.allow_origins),
-        allow_credentials=True,
-        allow_methods=["*"],
+        allow_origins=gateway_settings.allow_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
-    @app.get("/api/actiondesign-agent/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/api/actiondesign-agent/models")
-    async def get_models() -> dict:
-        mimo_models = [
-            {
-                "id": model_id,
-                "name": config["name"],
-                "provider": "mimo",
-                "supportsImages": config["supportsImages"],
-                "supportsTextToolProtocol": True,
-                "supportsNativeTools": False,
-                "supportsThinking": True,
-            }
-            for model_id, config in MIMO_MODELS.items()
-        ]
-        mimo = {
-            "status": "ready" if gateway_settings.mimo_api_key else "unavailable",
-            "defaultModel": gateway_settings.mimo_default_model,
-            "chatPath": "/api/actiondesign-agent/mimo/chat",
-            "streamPath": "/api/actiondesign-agent/mimo/chat/stream",
-            "supportsGenericChat": False,
-            "models": mimo_models,
+    @app.get(f"{API_PREFIX}/health", response_model=HealthResponse)
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "runtime": "thin-gateway",
+            "protocolVersion": PROTOCOL_VERSION,
+            "langsmithEnabled": bool(
+                gateway_settings.langsmith_enabled
+                and gateway_settings.langsmith_api_key
+            ),
+            "readonlyMcpEnabled": readonly_mcp_gateway.enabled,
         }
-        if not gateway_settings.mimo_api_key:
-            mimo["error"] = "Missing GXP_MIMO_API_KEY or MODEL_MIMO_KEY"
 
-        claude_code_models = _claude_code_models(gateway_settings)
-        claude_code_default_model = (
-            gateway_settings.claude_code_default_model
-            or _first_model_id(claude_code_models)
-        )
-        claude_code = {
-            "status": "ready"
-            if gateway_settings.claude_code_enabled
-            else "unavailable",
-            "defaultModel": claude_code_default_model,
-            "chatPath": "/api/actiondesign-agent/claude-code/chat",
-            "streamPath": "/api/actiondesign-agent/claude-code/chat/stream",
-            "supportsGenericChat": False,
-            "models": claude_code_models,
+    @app.get(f"{API_PREFIX}/models", response_model=AgentModelsResponse)
+    async def models() -> dict[str, Any]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for profile in profile_store.list_public():
+            grouped.setdefault(profile["provider"], []).append(profile)
+        providers = {
+            provider: _provider_capability(
+                provider,
+                profiles,
+                profile_store.default_profile_id(provider),
+            )
+            for provider, profiles in grouped.items()
         }
-        if not gateway_settings.claude_code_enabled:
-            claude_code["error"] = "CLAUDE_CODE_PROVIDER_ENABLED=false"
-
+        default_capability = providers.get(gateway_settings.default_provider)
         return {
             "defaultProvider": gateway_settings.default_provider,
-            "defaultModel": gateway_settings.mimo_default_model,
-            "supportsGenericChat": False,
-            "providers": {
-                "mimo": mimo,
-                "claude-code": claude_code,
-            },
+            "defaultModel": default_capability.get("defaultModel", "") if default_capability else "",
+            "supportedProtocolVersions": [PROTOCOL_VERSION],
+            "providers": providers,
         }
 
-    @app.post("/api/actiondesign-agent/knowledge/upload")
-    async def upload_knowledge(
+    @app.post(
+        f"{API_PREFIX}/chat",
+        response_model=AgentChatResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def generic_chat(
+        req: AgentChatRequest,
         request: Request,
-        files: Annotated[list[UploadFile], File(...)],
-        paths: Annotated[list[str] | None, Form()] = None,
-    ) -> dict:
-        _require_knowledge_admin(request, gateway_settings)
-        store = _knowledge_store_or_503(gateway_settings)
-        documents = []
-        seen_paths: set[str] = set()
-        if paths is not None and len(paths) != len(files):
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "KNOWLEDGE_PATH_COUNT_MISMATCH",
-                    "message": "paths count must match files count",
-                },
-            )
-        for index, uploaded in enumerate(files):
-            path = _upload_path(uploaded, paths[index] if paths else None)
-            if path in seen_paths:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "KNOWLEDGE_DUPLICATE_PATH",
-                        "message": f"Duplicate knowledge path: {path}",
-                    },
-                )
-            seen_paths.add(path)
-            content = _decode_knowledge_content(await uploaded.read())
-            if not content.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "KNOWLEDGE_EMPTY_FILE",
-                        "message": f"Knowledge file is empty: {path}",
-                    },
-                )
-            documents.append({"path": path, "content": content})
-        result = store.replace_documents(documents)
-        return {"success": True, **result}
-
-    @app.post("/api/actiondesign-agent/knowledge/search")
-    async def search_knowledge(payload: dict) -> dict:
-        query = str(payload.get("query") or "").strip()
-        if not query:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "KNOWLEDGE_QUERY_REQUIRED",
-                    "message": "knowledge search requires query",
-                },
-            )
-        result = await _execute_public_knowledge_tool(
+        response: Response,
+    ) -> dict[str, Any]:
+        return await _chat(
+            req,
+            request,
+            None,
             gateway_settings,
-            BackendToolCall(
-                name="knowledge.search",
-                arguments={
-                    "query": query,
-                    "limit": payload.get("limit")
-                    or gateway_settings.knowledge_max_results,
-                    "maxCharsPerItem": payload.get("maxCharsPerItem")
-                    or payload.get("max_chars_per_item")
-                    or gateway_settings.knowledge_max_chars_per_item,
-                    "maxContextChars": payload.get("maxContextChars")
-                    or payload.get("max_context_chars")
-                    or gateway_settings.knowledge_max_context_chars,
-                },
-            ),
+            profile_store,
+            response,
         )
-        return _public_knowledge_result_or_raise(result)
-
-    @app.post("/api/actiondesign-agent/knowledge/read")
-    async def read_knowledge(payload: dict) -> dict:
-        path = str(payload.get("path") or "").strip()
-        if not path:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "KNOWLEDGE_PATH_REQUIRED",
-                    "message": "knowledge read requires path",
-                },
-            )
-        result = await _execute_public_knowledge_tool(
-            gateway_settings,
-            BackendToolCall(
-                name="knowledge.read",
-                arguments={
-                    "path": path,
-                    "heading": str(payload.get("heading") or "").strip(),
-                    "maxChars": payload.get("maxChars")
-                    or payload.get("max_chars")
-                    or gateway_settings.knowledge_max_chars_per_item,
-                },
-            ),
-        )
-        return _public_knowledge_result_or_raise(result)
 
     @app.post(
-        "/api/actiondesign-agent/mimo/chat",
-        response_model=AgentChatResponse,
+        f"{API_PREFIX}/chat/stream",
+        dependencies=[Depends(_require_service_auth)],
     )
-    async def mimo_chat(req: AgentChatRequest, request: Request) -> JSONResponse:
-        return await _chat(req, request, "mimo")
-
-    @app.post(
-        "/api/actiondesign-agent/claude-code/chat",
-        response_model=AgentChatResponse,
-    )
-    async def claude_code_chat(
-        req: AgentChatRequest, request: Request
-    ) -> JSONResponse:
-        return await _chat(req, request, "claude-code")
-
-    @app.post(
-        "/api/actiondesign-agent/mimo/review",
-        response_model=CodeReviewResponse,
-    )
-    async def mimo_review(
-        req: CodeReviewRequest, request: Request
-    ) -> JSONResponse:
-        return await _review(req, request, "mimo")
-
-    @app.post(
-        "/api/actiondesign-agent/claude-code/review",
-        response_model=CodeReviewResponse,
-    )
-    async def claude_code_review(
-        req: CodeReviewRequest, request: Request
-    ) -> JSONResponse:
-        return await _review(req, request, "claude-code")
-
-    @app.post("/api/actiondesign-agent/mimo/chat/stream")
-    async def mimo_chat_stream(
-        req: AgentChatRequest, request: Request
+    async def generic_chat_stream(
+        req: AgentChatRequest,
+        request: Request,
     ) -> StreamingResponse:
-        return _chat_stream(req, request, "mimo")
+        return _chat_stream(req, request, None, gateway_settings, profile_store)
 
-    @app.post("/api/actiondesign-agent/claude-code/chat/stream")
-    async def claude_code_chat_stream(
-        req: AgentChatRequest, request: Request
-    ) -> StreamingResponse:
-        return _chat_stream(req, request, "claude-code")
+    @app.post(
+        f"{API_PREFIX}/mimo/chat",
+        response_model=AgentChatResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def mimo_chat(req: AgentChatRequest, request: Request, response: Response) -> dict[str, Any]:
+        return await _chat(req, request, "mimo", gateway_settings, profile_store, response)
 
-    @app.post("/api/actiondesign-agent/tool-result")
-    async def receive_tool_result(req: ToolResultRequest, request: Request) -> dict:
+    @app.post(
+        f"{API_PREFIX}/claude-code/chat",
+        response_model=AgentChatResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def claude_chat(req: AgentChatRequest, request: Request, response: Response) -> dict[str, Any]:
+        return await _chat(req, request, "claude-code", gateway_settings, profile_store, response)
+
+    @app.post(
+        f"{API_PREFIX}/mimo/chat/stream",
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def mimo_chat_stream(req: AgentChatRequest, request: Request) -> StreamingResponse:
+        return _chat_stream(req, request, "mimo", gateway_settings, profile_store)
+
+    @app.post(
+        f"{API_PREFIX}/claude-code/chat/stream",
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def claude_chat_stream(req: AgentChatRequest, request: Request) -> StreamingResponse:
+        return _chat_stream(req, request, "claude-code", gateway_settings, profile_store)
+
+    @app.post(
+        f"{API_PREFIX}/tool-result",
+        response_model=ToolResultResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def tool_result(req: ToolResultRequest, request: Request) -> dict[str, Any]:
         conversation_id = resolve_conversation_id(request, req)
-        req.conversation_id = conversation_id
         duplicate = tool_results.store(gateway_settings, conversation_id, req)
         append_conversation_event(
             gateway_settings,
             conversation_id,
-            {
-                "type": "tool_result",
-                "conversationId": conversation_id,
-                "runId": req.run_id,
-                "toolCallId": req.tool_call_id,
-                "toolName": req.tool_name,
-                "arguments": req.arguments,
-                "status": req.status,
-                "result": req.result,
-                "error": req.error,
-                "duplicate": duplicate,
-            },
+            {"type": "tool_result", **model_to_dict(req), "duplicate": duplicate},
         )
-        return {"success": True, "message": "received", "duplicate": duplicate}
+        return {"success": True, "message": "recorded", "duplicate": duplicate}
 
-    @app.get("/api/actiondesign-agent/tool-results/{conversation_id}/{run_id}")
-    async def get_tool_results(conversation_id: str, run_id: str) -> dict:
-        safe_conversation_id(conversation_id)
-        return {
-            "conversationId": conversation_id,
-            "runId": run_id,
-            "results": tool_results.get(conversation_id, run_id),
+    @app.get(
+        f"{API_PREFIX}/mcp/gxp-lowcode-readonly/tools",
+        response_model=ReadonlyMcpToolListResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def readonly_mcp_tools(request: Request) -> dict[str, Any]:
+        _require_readonly_mcp_origin(request, gateway_settings)
+        gateway: ReadonlyMcpGateway = request.app.state.readonly_mcp_gateway
+        try:
+            return await gateway.list_tools()
+        except ReadonlyMcpError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+
+    @app.post(
+        f"{API_PREFIX}/mcp/gxp-lowcode-readonly/call",
+        response_model=ReadonlyMcpToolCallResponse,
+        response_model_exclude_none=True,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def readonly_mcp_call(
+        req: ReadonlyMcpToolCallRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_readonly_mcp_origin(request, gateway_settings)
+        gateway: ReadonlyMcpGateway = request.app.state.readonly_mcp_gateway
+        try:
+            response = await gateway.call_tool(req.tool_name, req.arguments)
+        except ReadonlyMcpError as exc:
+            _log_readonly_mcp_call(gateway_settings, req, None, exc)
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        _log_readonly_mcp_call(gateway_settings, req, response, None)
+        return response
+
+    @app.post(
+        f"{API_PREFIX}/telemetry/langsmith/runs/batch",
+        response_model=TraceBatchResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def langsmith_batch(req: TraceBatchRequest) -> dict[str, Any]:
+        batch_id = f"trace_batch_{secrets.token_hex(8)}"
+        append_log(gateway_settings, batch_id, "langsmith-trace-batches.jsonl", req)
+        trace_events = [model_to_dict(event) for event in req.events]
+        if not gateway_settings.langsmith_enabled or not gateway_settings.langsmith_api_key:
+            response = {
+                "exportBatchId": batch_id,
+                "accepted": 0,
+                "rejected": len(trace_events),
+                "status": "disabled",
+            }
+            append_log(
+                gateway_settings,
+                batch_id,
+                "langsmith-trace-batches.jsonl",
+                {"type": "langsmith_trace_batch_result", **response},
+            )
+            return response
+        accepted, rejected = await forward_trace_batch(gateway_settings, trace_events)
+        response = {
+            "exportBatchId": batch_id,
+            "accepted": accepted,
+            "rejected": rejected,
+            "status": "accepted" if rejected == 0 else "partial",
         }
+        append_log(
+            gateway_settings,
+            batch_id,
+            "langsmith-trace-batches.jsonl",
+            {"type": "langsmith_trace_batch_result", **response},
+        )
+        return response
 
-    async def _chat(
-        req: AgentChatRequest,
+    @app.get(
+        f"{API_PREFIX}/admin/profiles",
+        response_model=list[ApiProfileResponse],
+    )
+    async def list_profiles(request: Request) -> list[dict[str, Any]]:
+        _require_profile_admin(request, gateway_settings)
+        return profile_store.list_public()
+
+    @app.get(
+        f"{API_PREFIX}/admin/request-logs",
+        response_model=RequestLogListResponse,
+    )
+    async def list_request_logs(
         request: Request,
-        provider: Literal["mimo", "claude-code"],
-    ) -> JSONResponse:
-        started = time.time()
-        conversation_id = resolve_conversation_id(request, req)
-        req.conversation_id = conversation_id
-        req.provider = provider
-        req.model = _resolved_request_model(req, gateway_settings, provider)
-        run_id = require_run_id_for_full_log(gateway_settings, req)
-        append_conversation_event(
-            gateway_settings,
-            conversation_id,
-            _request_event(req, provider, run_id),
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        provider: Annotated[str, Query(max_length=64)] = "",
+        profile_id: Annotated[str, Query(alias="profileId", max_length=64)] = "",
+        protocol: Annotated[str, Query(pattern=r"^(openai|claude)?$")] = "",
+        status: Annotated[str, Query(pattern=r"^(success|error|cancelled)?$")] = "",
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        items, total = request_logs.list(
+            limit=limit,
+            offset=offset,
+            provider=provider,
+            profile_id=profile_id,
+            protocol=protocol,
+            status=status,
         )
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
 
-        if _is_review_chat_request(req):
-            append_conversation_event(
-                gateway_settings,
-                conversation_id,
-                _review_request_event(req, provider, run_id),
-            )
-            try:
-                raw_response = (
-                    await call_mimo_review(req, gateway_settings)
-                    if provider == "mimo"
-                    else await call_claude_code_review(req, gateway_settings)
-                )
-            except Exception as exc:
-                append_conversation_event(
-                    gateway_settings,
-                    conversation_id,
-                    _review_response_event(
-                        _review_exception_response_payload(exc, provider, req.model),
-                        conversation_id,
-                        run_id,
-                        started,
-                    ),
-                )
-                raise
-
-            review_event = _code_review_response_payload(raw_response)
-            append_conversation_event(
-                gateway_settings,
-                conversation_id,
-                _review_response_event(review_event, conversation_id, run_id, started),
-            )
-            content = _review_chat_response_payload(raw_response)
-            append_conversation_event(
-                gateway_settings,
-                conversation_id,
-                _response_event(content, conversation_id, run_id, started),
-            )
-            return JSONResponse(
-                content=content,
-                headers=_conversation_headers(conversation_id, run_id),
-            )
-
-        try:
-            raw_response = (
-                await call_mimo(req, gateway_settings)
-                if provider == "mimo"
-                else await call_claude_code(req, gateway_settings)
-            )
-        except Exception as exc:
-            append_conversation_event(
-                gateway_settings,
-                conversation_id,
-                _response_event(
-                    _exception_response_payload(exc, provider, req.model),
-                    conversation_id,
-                    run_id,
-                    started,
-                ),
-            )
-            raise
-        content = _agent_response_payload(raw_response)
-        append_conversation_event(
-            gateway_settings,
-            conversation_id,
-            _response_event(content, conversation_id, run_id, started),
-        )
-        return JSONResponse(
-            content=content,
-            headers=_conversation_headers(conversation_id, run_id),
-        )
-
-    async def _review(
-        req: CodeReviewRequest,
+    @app.get(
+        f"{API_PREFIX}/admin/request-logs/{{request_id}}",
+        response_model=RequestLogEntry,
+    )
+    async def get_request_log(
+        request_id: RequestIdPath,
         request: Request,
-        provider: Literal["mimo", "claude-code"],
-    ) -> JSONResponse:
-        started = time.time()
-        conversation_id = resolve_conversation_id(request, req)
-        req.conversation_id = conversation_id
-        req.provider = provider
-        req.model = _resolved_request_model(req, gateway_settings, provider)
-        run_id = require_run_id_for_full_log(gateway_settings, req)
-        append_conversation_event(
-            gateway_settings,
-            conversation_id,
-            _review_request_event(req, provider, run_id),
-        )
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        entry = request_logs.get(request_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail={"code": "REQUEST_LOG_NOT_FOUND"})
+        return entry
 
-        try:
-            raw_response = (
-                await call_mimo_review(req, gateway_settings)
-                if provider == "mimo"
-                else await call_claude_code_review(req, gateway_settings)
-            )
-        except Exception as exc:
-            append_conversation_event(
-                gateway_settings,
-                conversation_id,
-                _review_response_event(
-                    _review_exception_response_payload(exc, provider, req.model),
-                    conversation_id,
-                    run_id,
-                    started,
-                ),
-            )
-            raise
-        content = _code_review_response_payload(raw_response)
-        append_conversation_event(
-            gateway_settings,
-            conversation_id,
-            _review_response_event(content, conversation_id, run_id, started),
-        )
-        return JSONResponse(
-            content=content,
-            headers=_conversation_headers(conversation_id, run_id),
-        )
-
-    def _chat_stream(
-        req: AgentChatRequest,
+    @app.put(
+        f"{API_PREFIX}/admin/profiles/{{profile_id}}",
+        response_model=ApiProfileResponse,
+    )
+    async def put_profile(
+        profile_id: ProfileIdPath,
+        req: ApiProfileWriteRequest,
         request: Request,
-        provider: Literal["mimo", "claude-code"],
-    ) -> StreamingResponse:
-        started = time.time()
-        conversation_id = resolve_conversation_id(request, req)
-        req.conversation_id = conversation_id
-        req.provider = provider
-        req.model = _resolved_request_model(req, gateway_settings, provider)
-        run_id = require_run_id_for_full_log(gateway_settings, req)
-        append_conversation_event(
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        if profile_id != req.id:
+            raise HTTPException(status_code=400, detail={"code": "PROFILE_ID_MISMATCH"})
+        response = profile_store.upsert(req)
+        append_log(
             gateway_settings,
-            conversation_id,
-            _request_event(req, provider, run_id),
-        )
-        generator = (
-            stream_mimo(req, gateway_settings)
-            if provider == "mimo"
-            else stream_claude_code(req, gateway_settings)
-        )
-        return StreamingResponse(
-            _log_stream_response(
-                generator,
-                gateway_settings,
-                conversation_id,
-                run_id,
-                started,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-                **_conversation_headers(conversation_id, run_id),
+            "profile-admin",
+            "profile-admin-audit.jsonl",
+            {
+                "type": "profile_upsert",
+                "profileId": response["id"],
+                "provider": response["provider"],
+                "displayName": response["displayName"],
+                "protocol": response["protocol"],
+                "baseUrl": response["baseUrl"],
+                "defaultModel": response["defaultModel"],
+                "modelCount": len(response["models"]),
+                "authMode": response["authMode"],
+                "enabled": response["enabled"],
+                "keyUpdated": bool(req.api_key),
             },
         )
+        return response
+
+    @app.delete(f"{API_PREFIX}/admin/profiles/{{profile_id}}", response_model=DeleteProfileResponse)
+    async def delete_profile(
+        profile_id: ProfileIdPath,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        success = profile_store.delete(profile_id)
+        append_log(
+            gateway_settings,
+            "profile-admin",
+            "profile-admin-audit.jsonl",
+            {"type": "profile_delete", "profileId": profile_id, "success": success},
+        )
+        return {"success": success}
 
     return app
 
 
-def _request_event(
+async def _chat(
     req: AgentChatRequest,
-    provider: Literal["mimo", "claude-code"],
-    run_id: str,
-) -> dict:
-    request_body = model_to_dict(req)
-    if isinstance(request_body, dict):
-        request_body["provider"] = provider
-        request_body["conversationId"] = req.conversation_id
-        request_body["runId"] = run_id
-        request_body["agentMode"] = req.agent_mode
-    return {
-        "type": "request",
-        "conversationId": req.conversation_id,
-        "runId": run_id,
-        "agentMode": req.agent_mode,
-        "provider": provider,
-        "model": req.model,
-        "userPrompt": req.prompt,
-        "requestBody": request_body,
-    }
-
-
-def _agent_response_payload(raw_response: dict) -> dict:
-    response = AgentChatResponse(**raw_response)
-    dump = getattr(response, "model_dump", None)
-    if callable(dump):
-        return dump(mode="json")
-    return response.dict()
-
-
-def _is_review_chat_request(req: AgentChatRequest) -> bool:
-    run_id = str(getattr(req, "run_id", "") or "")
-    prompt = str(getattr(req, "prompt", "") or "")
-    return ":review" in run_id or "ActionDesign Reviewer Agent" in prompt
-
-
-def _review_chat_response_payload(raw_response: dict) -> dict:
-    review = _code_review_response_payload(raw_response)
-    issues = [
-        _review_tow_issue_payload(issue, index)
-        for index, issue in enumerate(review.get("issues", []))
-    ]
-    repair_instructions = [
-        issue["repairHint"]
-        for issue in issues
-        if issue.get("repairHint")
-    ]
-    content = {
-        "passed": bool(review.get("pass", False)),
-        "summary": str(review.get("summary") or ""),
-        "issues": issues,
-        "repairInstructions": repair_instructions,
-        "needAskUser": False,
-        "userQuestions": [],
-    }
-    return {
-        "provider": review.get("provider"),
-        "model": review.get("model"),
-        "content": json.dumps(content, ensure_ascii=False),
-        "tool_calls": [],
-        "success": True,
-        "error": None,
-        "code": None,
-        "duration_ms": review.get("duration_ms", 0),
-        "usage": review.get("usage", {}),
-    }
-
-
-def _review_tow_issue_payload(issue: dict, index: int) -> dict:
-    code = str(issue.get("code") or "")
-    fix = str(issue.get("fix") or "")
-    message = str(issue.get("message") or code or f"Review issue {index + 1}")
-    return {
-        "id": code or f"review-{index}",
-        "severity": str(issue.get("severity") or "error"),
-        "category": _review_tow_issue_category(code),
-        "message": message,
-        "targetAction": str(issue.get("actionKey") or ""),
-        "nodeKey": str(issue.get("nodeKey") or ""),
-        "elementKey": "",
-        "requirementId": "",
-        "expected": "",
-        "actual": message,
-        "evidence": str(issue.get("evidence") or ""),
-        "repairHint": fix,
-    }
-
-
-def _review_tow_issue_category(code: str) -> str:
-    if code == "REVIEW_TOOL_CALL_NOT_ALLOWED":
-        return "tool_execution"
-    if code == "REVIEW_RESPONSE_INVALID_JSON":
-        return "conversation_error"
-    return "semantic_error"
-
-
-def _code_review_response_payload(raw_response: dict) -> dict:
-    response = CodeReviewResponse(**raw_response)
-    dump = getattr(response, "model_dump", None)
-    if callable(dump):
-        return dump(mode="json", by_alias=True)
-    return response.dict(by_alias=True)
-
-
-def _response_event(
-    response: dict,
-    conversation_id: str,
-    run_id: str,
-    started: float,
-) -> dict:
-    duration = response.get("duration_ms")
-    if duration is None:
-        duration = int((time.time() - started) * 1000)
-    return {
-        "type": "response",
-        "conversationId": conversation_id,
-        "runId": run_id,
-        "provider": response.get("provider"),
-        "model": response.get("model"),
-        "content": response.get("content", ""),
-        "toolCalls": response.get("tool_calls", []),
-        "success": bool(response.get("success", False)),
-        "error": response.get("error"),
-        "code": response.get("code"),
-        "usage": response.get("usage", {}),
-        "duration": duration,
-    }
-
-
-def _review_request_event(
-    req: CodeReviewRequest,
-    provider: Literal["mimo", "claude-code"],
-    run_id: str,
-) -> dict:
-    request_body = model_to_dict(req)
-    if isinstance(request_body, dict):
-        request_body["provider"] = provider
-        request_body["conversationId"] = req.conversation_id
-        request_body["runId"] = run_id
-    return {
-        "type": "review_request",
-        "conversationId": req.conversation_id,
-        "runId": run_id,
-        "provider": provider,
-        "model": req.model,
-        "userPrompt": req.prompt,
-        "requestBody": request_body,
-    }
-
-
-def _review_response_event(
-    response: dict,
-    conversation_id: str,
-    run_id: str,
-    started: float,
-) -> dict:
-    duration = response.get("duration_ms")
-    if duration is None:
-        duration = int((time.time() - started) * 1000)
-    return {
-        "type": "review_response",
-        "conversationId": conversation_id,
-        "runId": run_id,
-        "provider": response.get("provider"),
-        "model": response.get("model"),
-        "pass": bool(response.get("pass", False)),
-        "summary": response.get("summary", ""),
-        "issues": response.get("issues", []),
-        "success": bool(response.get("success", False)),
-        "error": response.get("error"),
-        "code": response.get("code"),
-        "usage": response.get("usage", {}),
-        "duration": duration,
-    }
-
-
-def _exception_response_payload(
-    exc: Exception,
-    provider: Literal["mimo", "claude-code"],
-    model: str,
-) -> dict:
-    code = "PROVIDER_ERROR"
-    error = str(exc)
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-        if isinstance(detail, dict):
-            code = str(detail.get("code") or code)
-            error = str(
-                detail.get("message")
-                or detail.get("error")
-                or detail.get("code")
-                or error
-            )
-        else:
-            error = str(detail or error)
-    return {
-        "provider": provider,
-        "model": model,
-        "content": "",
-        "tool_calls": [],
-        "success": False,
-        "error": error,
-        "code": code,
-        "usage": {},
-    }
-
-
-def _review_exception_response_payload(
-    exc: Exception,
-    provider: Literal["mimo", "claude-code"],
-    model: str,
-) -> dict:
-    code = "PROVIDER_ERROR"
-    error = str(exc)
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-        if isinstance(detail, dict):
-            code = str(detail.get("code") or code)
-            error = str(
-                detail.get("message")
-                or detail.get("error")
-                or detail.get("code")
-                or error
-            )
-        else:
-            error = str(detail or error)
-    return {
-        "provider": provider,
-        "model": model,
-        "pass": False,
-        "summary": "Review provider failed.",
-        "issues": [
-            {
-                "severity": "error",
-                "code": code,
-                "message": error,
-            }
-        ],
-        "success": False,
-        "error": error,
-        "code": code,
-        "usage": {},
-        "raw": "",
-    }
-
-
-def _conversation_headers(conversation_id: str, run_id: str) -> dict[str, str]:
-    return {
-        "X-Conversation-Id": conversation_id,
-        "X-Run-Id": run_id,
-    }
-
-
-async def _log_stream_response(
-    generator: AsyncIterator[str],
+    request: Request,
+    provider: str | None,
     settings: Settings,
-    conversation_id: str,
-    run_id: str,
-    started: float,
-) -> AsyncIterator[str]:
-    final_payload: dict | None = None
-    async for chunk in generator:
-        for payload in _sse_payloads(chunk):
-            if payload.get("type") == "message_complete":
-                final_payload = payload
-        yield chunk
+    profiles: ApiProfileStore,
+    response: Response,
+) -> dict[str, Any]:
+    conversation_id = resolve_conversation_id(request, req)
+    require_run_id_for_full_log(settings, req)
+    concrete_provider = provider or (
+        settings.default_provider if req.provider == "auto" else req.provider
+    )
+    req = AgentChatRequest.model_validate({
+        **req.model_dump(mode="python"),
+        "provider": concrete_provider,
+        "conversation_id": conversation_id,
+    })
+    profile = profiles.resolve(concrete_provider, req.profile_id)
+    _validate_profile_request(req, profile)
+    request_id = f"req_{secrets.token_hex(12)}"
+    response.headers["X-Request-Id"] = request_id
+    started = time.monotonic()
+    request_logs: RequestLogStore = request.app.state.request_logs
+    _log_request(settings, conversation_id, req, profile)
+    try:
+        response = (
+            await call_mimo(req, profile)
+            if concrete_provider == "mimo"
+            else (
+                await call_claude_code(req, profile)
+                if concrete_provider == "claude-code"
+                else await call_provider(req, profile)
+            )
+        )
+    except HTTPException as exc:
+        detail = _error_detail(exc)
+        _log_error(settings, conversation_id, req, detail)
+        request_logs.record(
+            request_id=request_id,
+            request=req,
+            profile=profile,
+            started=started,
+            status="error",
+            error=detail,
+            http_status=exc.status_code,
+            stream=False,
+        )
+        raise
+    _log_response(settings, conversation_id, req, response)
+    request_logs.record(
+        request_id=request_id,
+        request=req,
+        profile=profile,
+        started=started,
+        status="success" if response.get("success", True) else "error",
+        response=response,
+        error={
+            "code": response.get("code") or "",
+            "message": response.get("error") or "",
+        },
+        stream=False,
+    )
+    return response
 
-    if final_payload is None:
-        final_payload = {
-            "provider": None,
-            "model": None,
-            "content": "",
-            "tool_calls": [],
-            "success": False,
-            "error": "Stream ended without message_complete",
-            "code": "STREAM_RESPONSE_INCOMPLETE",
-            "usage": {},
-        }
-    append_conversation_event(
-        settings,
-        conversation_id,
-        _response_event(final_payload, conversation_id, run_id, started),
+
+def _chat_stream(
+    req: AgentChatRequest,
+    request: Request,
+    provider: str | None,
+    settings: Settings,
+    profiles: ApiProfileStore,
+) -> StreamingResponse:
+    conversation_id = resolve_conversation_id(request, req)
+    require_run_id_for_full_log(settings, req)
+    concrete_provider = provider or (
+        settings.default_provider if req.provider == "auto" else req.provider
+    )
+    req = AgentChatRequest.model_validate({
+        **req.model_dump(mode="python"),
+        "provider": concrete_provider,
+        "conversation_id": conversation_id,
+    })
+    profile = profiles.resolve(concrete_provider, req.profile_id)
+    _validate_profile_request(req, profile)
+    header_trace_id = request.headers.get("X-Agent-Trace-Id", "").strip()
+    if header_trace_id and not req.trace_id:
+        try:
+            req = AgentChatRequest.model_validate({
+                **req.model_dump(mode="python"),
+                "trace_id": header_trace_id,
+            })
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "INVALID_TRACE_ID", "field": "trace_id"},
+            ) from exc
+    trace_id = req.trace_id or f"trace_{secrets.token_hex(8)}"
+    request_id = f"req_{secrets.token_hex(12)}"
+    started = time.monotonic()
+    request_logs: RequestLogStore = request.app.state.request_logs
+    _log_request(settings, conversation_id, req, profile)
+
+    async def generate() -> AsyncIterator[str]:
+        sequence = 0
+        finalized = False
+        iterator: AsyncIterator[dict[str, Any]] = (
+            stream_mimo(req, profile)
+            if concrete_provider == "mimo"
+            else (
+                stream_claude_code(req, profile)
+                if concrete_provider == "claude-code"
+                else stream_provider(req, profile)
+            )
+        )
+        try:
+            async for event in iterator:
+                sequence += 1
+                if event.get("kind") == "delta":
+                    yield _sse_envelope(req, trace_id, sequence, "model.delta", {"content": event.get("content", "")})
+                    continue
+                payload = event.get("payload") or {}
+                _log_response(settings, conversation_id, req, payload)
+                request_logs.record(
+                    request_id=request_id,
+                    request=req,
+                    profile=profile,
+                    started=started,
+                    status="success" if payload.get("success", True) else "error",
+                    response=payload,
+                    error={
+                        "code": payload.get("code") or "",
+                        "message": payload.get("error") or "",
+                    },
+                    stream=True,
+                )
+                finalized = True
+                yield _sse_envelope(req, trace_id, sequence, "model.completed", payload)
+        except Exception as exc:  # stream already started; emit an error envelope
+            sequence += 1
+            detail = _error_detail(exc)
+            _log_error(settings, conversation_id, req, detail)
+            request_logs.record(
+                request_id=request_id,
+                request=req,
+                profile=profile,
+                started=started,
+                status="error",
+                error=detail,
+                http_status=exc.status_code if isinstance(exc, HTTPException) else 500,
+                stream=True,
+            )
+            finalized = True
+            yield _sse_envelope(req, trace_id, sequence, "gateway.error", detail)
+        finally:
+            if not finalized:
+                request_logs.record(
+                    request_id=request_id,
+                    request=req,
+                    profile=profile,
+                    started=started,
+                    status="cancelled",
+                    error={
+                        "code": "CLIENT_STREAM_CANCELLED",
+                        "message": "Client disconnected before the provider stream completed",
+                    },
+                    http_status=499,
+                    stream=True,
+                )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"X-Request-Id": request_id},
     )
 
 
-def _sse_payloads(chunk: str) -> list[dict]:
-    payloads: list[dict] = []
-    for line in str(chunk).splitlines():
-        if not line.startswith("data:"):
-            continue
-        raw = line.removeprefix("data:").strip()
-        if not raw or raw == "[DONE]":
-            continue
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(payload, dict):
-            payloads.append(payload)
-    return payloads
+def _provider_capability(
+    provider: str,
+    profiles: list[dict[str, Any]],
+    default_profile_id: str,
+) -> dict[str, Any]:
+    ordered = sorted(
+        profiles,
+        key=lambda item: (not item["id"].startswith("default-"), item["id"]),
+    )
+    ready_profiles = [
+        profile
+        for profile in ordered
+        if profile.get("enabled") and profile.get("keyConfigured")
+    ]
+    selected = next(
+        (
+            profile
+            for profile in ordered
+            if profile.get("id") == default_profile_id
+        ),
+        ready_profiles[0] if ready_profiles else ordered[0],
+    )
+    models: dict[str, dict[str, Any]] = {}
+    for profile in ready_profiles:
+        for model in profile.get("models") or []:
+            models.setdefault(str(model.get("id") or ""), model)
+    ready = bool(ready_profiles)
+    return {
+        "displayName": selected.get("displayName") or provider,
+        "protocol": selected.get("protocol") or "claude",
+        "defaultProfileId": selected.get("id") or "",
+        "status": "ready" if ready else "unavailable",
+        "defaultModel": selected.get("defaultModel") or "",
+        "models": [
+            {
+                "id": model_id,
+                "name": metadata.get("name") or model_id,
+                "provider": provider,
+                "supportsImages": bool(metadata.get("supportsImages", True)),
+                "contextWindowTokens": int(metadata.get("contextWindowTokens", 100_000)),
+                "maxOutputTokens": int(metadata.get("maxOutputTokens", 8_192)),
+                "supportsNativeTools": bool(metadata.get("supportsNativeTools", True)),
+                "supportsThinking": bool(metadata.get("supportsThinking", False)),
+            }
+            for model_id, metadata in models.items()
+            if model_id
+        ] if ready else [],
+        **({"error": "API profile/key is not configured"} if not ready else {}),
+    }
 
 
-def _require_knowledge_admin(request: Request, settings: Settings) -> None:
-    token = settings.knowledge_admin_token
-    authorization = request.headers.get("Authorization", "")
-    if not token:
+def _validate_profile_request(
+    req: AgentChatRequest,
+    profile: ProviderProfile,
+) -> None:
+    model_id = req.model or profile.default_model
+    model = next((item for item in profile.models if item.id == model_id), None)
+    if model is None:
         raise HTTPException(
-            status_code=503,
+            status_code=400,
             detail={
-                "code": "KNOWLEDGE_ADMIN_TOKEN_NOT_CONFIGURED",
-                "message": "Set ACTIONDESIGN_KNOWLEDGE_ADMIN_TOKEN",
+                "code": "PROFILE_MODEL_UNAVAILABLE",
+                "model": model_id,
+                "profileId": profile.id,
             },
         )
-    if not authorization.startswith("Bearer "):
+    if req.images and not model.supports_images:
         raise HTTPException(
-            status_code=401,
+            status_code=400,
             detail={
-                "code": "KNOWLEDGE_ADMIN_AUTH_REQUIRED",
-                "message": "Knowledge upload requires bearer admin token",
+                "code": "MODEL_DOES_NOT_SUPPORT_IMAGES",
+                "model": model_id,
             },
         )
-    if authorization.removeprefix("Bearer ").strip() != token:
+    if req.tools and not model.supports_native_tools:
         raise HTTPException(
-            status_code=403,
+            status_code=400,
             detail={
-                "code": "KNOWLEDGE_ADMIN_AUTH_INVALID",
-                "message": "Knowledge admin token is invalid",
+                "code": "MODEL_DOES_NOT_SUPPORT_NATIVE_TOOLS",
+                "model": model_id,
+            },
+        )
+    if req.max_tokens > model.max_output_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "MODEL_MAX_OUTPUT_TOKENS_EXCEEDED",
+                "model": model_id,
+                "maxOutputTokens": model.max_output_tokens,
+            },
+        )
+    if req.thinking.type == "enabled" and not model.supports_thinking:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "MODEL_DOES_NOT_SUPPORT_THINKING",
+                "model": model_id,
             },
         )
 
 
-def _knowledge_store_or_503(settings: Settings):
-    store = qdrant_knowledge_store_from_settings(settings)
-    if store is None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "KNOWLEDGE_STORE_NOT_CONFIGURED",
-                "message": "Set ACTIONDESIGN_QDRANT_URL and embedding settings",
-            },
-        )
-    return store
+def _sse_envelope(
+    req: AgentChatRequest,
+    trace_id: str,
+    sequence: int,
+    event_type: str,
+    payload: dict[str, Any],
+) -> str:
+    envelope = GatewayEventEnvelope.model_validate({
+        "protocolVersion": PROTOCOL_VERSION,
+        "sequence": sequence,
+        "conversationId": req.conversation_id,
+        "runId": req.run_id,
+        "traceId": trace_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": event_type,
+        "payload": payload,
+    }).model_dump(mode="json", by_alias=True)
+    return f"data: {json.dumps(envelope, ensure_ascii=False)}\n\n"
 
 
-async def _execute_public_knowledge_tool(
+def _log_request(
     settings: Settings,
-    call: BackendToolCall,
-) -> BackendToolResult:
-    results = await execute_backend_tool_calls([call], settings)
-    return results[0]
-
-
-def _public_knowledge_result_or_raise(result: BackendToolResult) -> dict:
-    if result.status == "success":
-        return result.result if isinstance(result.result, dict) else {"result": result.result}
-
-    code = result.code or "KNOWLEDGE_TOOL_FAILED"
-    if code in {
-        "KNOWLEDGE_QUERY_REQUIRED",
-        "KNOWLEDGE_PATH_REQUIRED",
-        "KNOWLEDGE_PATH_FORBIDDEN",
-        "BACKEND_TOOL_ARGUMENTS_INVALID",
-    }:
-        status_code = 400
-    elif code == "KNOWLEDGE_NOT_FOUND":
-        status_code = 404
-    elif code == "KNOWLEDGE_ROOT_NOT_CONFIGURED":
-        status_code = 503
-    else:
-        status_code = 502
-    raise HTTPException(
-        status_code=status_code,
-        detail={
-            "code": code,
-            "message": result.error or f"{result.name} failed",
+    conversation_id: str,
+    req: AgentChatRequest,
+    profile: ProviderProfile,
+) -> None:
+    request_data = model_to_dict(req)
+    system_prompt = str(request_data.pop("systemPrompt", ""))
+    prompt = str(request_data.pop("prompt", ""))
+    images = request_data.get("images") or []
+    request_data["images"] = [
+        {
+            "media_type": image.get("media_type", ""),
+            "source": "base64" if image.get("data") else "url",
+            "encodedChars": len(str(image.get("data") or "")),
+        }
+        for image in images
+    ]
+    request_data["promptMetadata"] = {
+        "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "characters": len(prompt),
+    }
+    request_data["systemPromptMetadata"] = {
+        "sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+        "characters": len(system_prompt),
+    }
+    append_conversation_event(
+        settings,
+        conversation_id,
+        {
+            "type": "gateway_request",
+            "provider": profile.provider,
+            "profileId": profile.id,
+            "request": redact_value(request_data),
         },
     )
 
 
-def _upload_path(uploaded: UploadFile, path_override: str | None = None) -> str:
-    filename = (path_override or uploaded.filename or "").replace("\\", "/").lstrip("/")
-    if not filename or filename.endswith("/") or not filename.lower().endswith(".md"):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "KNOWLEDGE_FILE_INVALID",
-                "message": "Knowledge upload only accepts Markdown files",
-            },
-        )
-    if any(part in {"", ".", ".."} for part in filename.split("/")):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "KNOWLEDGE_PATH_FORBIDDEN",
-                "message": "Knowledge upload path is not safe",
-            },
-        )
-    return filename
+def _log_response(
+    settings: Settings,
+    conversation_id: str,
+    req: AgentChatRequest,
+    response: dict[str, Any],
+) -> None:
+    response_data = model_to_dict(response)
+    content = str(response_data.pop("content", ""))
+    response_data["contentMetadata"] = {
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "characters": len(content),
+    }
+    append_conversation_event(
+        settings,
+        conversation_id,
+        {"type": "gateway_response", "runId": req.run_id, "response": redact_value(response_data)},
+    )
 
 
-def _decode_knowledge_content(raw: bytes) -> str:
-    for encoding in ("utf-8-sig", "gb18030"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+def _log_error(
+    settings: Settings,
+    conversation_id: str,
+    req: AgentChatRequest,
+    error: Any,
+) -> None:
+    append_conversation_event(
+        settings,
+        conversation_id,
+        {"type": "gateway_error", "runId": req.run_id, "error": redact_value(error)},
+    )
+
+
+def _error_detail(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        message = redact_value(str(detail.get("message", str(exc.detail))))
+        return {
+            "code": str(detail.get("code", "GATEWAY_ERROR")),
+            "message": str(message),
+        }
+    return {
+        "code": "GATEWAY_ERROR",
+        "message": str(redact_value(str(exc))),
+    }
+
+
+def _require_profile_admin(request: Request, settings: Settings) -> None:
+    if not settings.profile_admin_token:
+        raise HTTPException(status_code=503, detail={"code": "PROFILE_ADMIN_DISABLED"})
+    authorization = request.headers.get("Authorization", "")
+    expected = f"Bearer {settings.profile_admin_token}"
+    if not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail={"code": "PROFILE_ADMIN_AUTH_REQUIRED"})
+
+
+def _require_service_auth(
+    request: Request,
+    service_token: Annotated[
+        str | None,
+        Header(alias=SERVICE_AUTH_HEADER, max_length=8192),
+    ] = None,
+) -> None:
+    settings: Settings = request.app.state.settings
+    if settings.service_auth_mode == "disabled":
+        return
+    if not service_token or not secrets.compare_digest(
+        service_token,
+        settings.service_auth_token,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "GATEWAY_SERVICE_AUTH_REQUIRED"},
+        )
+
+
+def _require_readonly_mcp_origin(request: Request, settings: Settings) -> None:
+    origin = request.headers.get("Origin", "").rstrip("/")
+    allowed = {item.rstrip("/") for item in settings.allow_origins if item != "*"}
+    if not origin or origin not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "READONLY_MCP_ORIGIN_NOT_ALLOWED"},
+        )
+
+
+def _log_readonly_mcp_call(
+    settings: Settings,
+    req: ReadonlyMcpToolCallRequest,
+    response: dict[str, Any] | None,
+    error: ReadonlyMcpError | None,
+) -> None:
+    arguments_text = json.dumps(redact_value(req.arguments), ensure_ascii=False, default=str)
+    result_value = response.get("result") if response else None
+    result_text = json.dumps(redact_value(result_value), ensure_ascii=False, default=str)
+    append_conversation_event(
+        settings,
+        req.conversation_id,
+        {
+            "type": "readonly_mcp_call",
+            "runId": req.run_id,
+            "topicId": req.topic_id,
+            "checkpointId": req.checkpoint_id,
+            "traceId": req.trace_id,
+            "skillId": req.skill_id,
+            "skillVersion": req.skill_version,
+            "serverId": "gxp-lowcode-readonly",
+            "toolName": req.tool_name,
+            "argumentKeys": sorted(req.arguments),
+            "argumentsMetadata": {
+                "sha256": hashlib.sha256(arguments_text.encode("utf-8")).hexdigest(),
+                "characters": len(arguments_text),
+            },
+            "resultMetadata": {
+                "sha256": hashlib.sha256(result_text.encode("utf-8")).hexdigest(),
+                "characters": len(result_text),
+                "success": bool(response and response.get("success")),
+                "durationMs": int(response.get("durationMs", 0)) if response else 0,
+            },
+            **(
+                {"error": {"code": error.code, "message": str(error)}}
+                if error
+                else {}
+            ),
+        },
+    )
 
 
 app = create_app()
+
+
+def main() -> None:
+    import uvicorn
+
+    uvicorn.run("claude_agent_sdk.actiondesign_gateway.app:app", host="0.0.0.0", port=8318)
+
+
+if __name__ == "__main__":
+    main()

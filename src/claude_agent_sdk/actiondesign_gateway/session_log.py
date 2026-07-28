@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import secrets
 import time
@@ -88,7 +87,11 @@ def append_conversation_event(
     log_path = _conversation_log_path(root, safe_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = model_to_dict(event)
+    # Conversation events are a persistent boundary.  Callers may already
+    # sanitize selected fields, but the writer must remain the final,
+    # fail-safe redaction layer so new event types cannot accidentally persist
+    # provider keys, credentials, connection details, or encoded image data.
+    payload = redact_value(model_to_dict(event))
     if not isinstance(payload, dict):
         payload = {"value": payload}
     payload.setdefault("conversationId", safe_id)
@@ -171,7 +174,7 @@ class ToolResultStore:
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock = clock or time.time
-        self._results: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+        self._results: dict[tuple[str, str, str], float] = {}
 
     def store(
         self,
@@ -192,30 +195,16 @@ class ToolResultStore:
         if key in self._results:
             return True
 
-        stored = copy.deepcopy(result)
+        stored = dict(result)
         stored["conversationId"] = safe_id
-        self._results[key] = (now, stored)
+        self._results[key] = now
         append_log(settings, safe_id, "tool-results.jsonl", stored)
         return False
-
-    def get(self, conversation_id: str, run_id: str) -> list[dict[str, Any]]:
-        now = self._clock()
-        self._prune(now)
-        safe_id = safe_conversation_id(conversation_id)
-        return [
-            copy.deepcopy(result)
-            for (
-                stored_conversation_id,
-                stored_run_id,
-                _,
-            ), (_, result) in self._results.items()
-            if stored_conversation_id == safe_id and stored_run_id == run_id
-        ]
 
     def _prune(self, now: float) -> None:
         expired = [
             key
-            for key, (created_at, _) in self._results.items()
+            for key, created_at in self._results.items()
             if now - created_at >= self._ttl_seconds
         ]
         for key in expired:
