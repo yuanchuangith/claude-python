@@ -14,24 +14,69 @@ from .models import AgentChatResponse
 from .profile_store import ProviderProfile
 
 
+_CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
+_OPENAI_CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
+
+
 def normalize_messages_url(value: str) -> str:
-    parsed = urlsplit(value.strip().rstrip("/"))
-    path = parsed.path.rstrip("/")
-    if path.endswith("/messages"):
-        return urlunsplit(parsed._replace(path=path))
-    return urlunsplit(parsed._replace(path=f"{path}/v1/messages" if path else "/v1/messages"))
+    return _normalize_fixed_provider_url(
+        value,
+        fixed_suffix=_CLAUDE_MESSAGES_SUFFIX,
+        resource_suffix="/messages",
+        provider_label="Claude-compatible",
+    )
 
 
 def normalize_chat_completions_url(value: str) -> str:
+    return _normalize_fixed_provider_url(
+        value,
+        fixed_suffix=_OPENAI_CHAT_COMPLETIONS_SUFFIX,
+        resource_suffix="/chat/completions",
+        provider_label="OpenAI-compatible",
+    )
+
+
+def _normalize_fixed_provider_url(
+    value: str,
+    *,
+    fixed_suffix: str,
+    resource_suffix: str,
+    provider_label: str,
+) -> str:
     parsed = urlsplit(value.strip().rstrip("/"))
     path = parsed.path.rstrip("/")
-    if path.endswith("/chat/completions"):
+    if path.endswith(fixed_suffix):
         return urlunsplit(parsed._replace(path=path))
+    if path.endswith(resource_suffix):
+        raise _upstream_error(
+            502,
+            "PROVIDER_ENDPOINT_INVALID",
+            f"{provider_label} endpoint must use the fixed {fixed_suffix} suffix",
+            retryable=False,
+        )
     if path.endswith("/v1"):
-        path = f"{path}/chat/completions"
+        endpoint_path = f"{path}{resource_suffix}"
     else:
-        path = f"{path}/v1/chat/completions" if path else "/v1/chat/completions"
-    return urlunsplit(parsed._replace(path=path))
+        endpoint_path = f"{path}{fixed_suffix}" if path else fixed_suffix
+    return urlunsplit(parsed._replace(path=endpoint_path))
+
+
+def _provider_http_client(profile: ProviderProfile) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=profile.timeout_seconds,
+        follow_redirects=False,
+    )
+
+
+def _raise_provider_status(response: httpx.Response) -> None:
+    if bool(getattr(response, "is_redirect", False)):
+        raise _upstream_error(
+            502,
+            "PROVIDER_REDIRECT_FORBIDDEN",
+            "Provider redirects are not allowed",
+            retryable=False,
+        )
+    response.raise_for_status()
 
 
 def request_headers(profile: ProviderProfile) -> dict[str, str]:
@@ -210,13 +255,13 @@ def parse_response(payload: dict[str, Any], provider: str, model: str, started: 
 async def call_messages(req: Any, profile: ProviderProfile) -> dict[str, Any]:
     started = time.time()
     try:
-        async with httpx.AsyncClient(timeout=profile.timeout_seconds) as client:
+        async with _provider_http_client(profile) as client:
             response = await client.post(
                 normalize_messages_url(profile.base_url),
                 headers=request_headers(profile),
                 json=request_body(req, profile, False),
             )
-            response.raise_for_status()
+            _raise_provider_status(response)
             payload = response.json()
     except httpx.TimeoutException as exc:
         raise _upstream_error(
@@ -260,7 +305,7 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
     usage: dict[str, Any] = {}
     model = req.model or profile.default_model
     try:
-        async with httpx.AsyncClient(timeout=profile.timeout_seconds) as client:
+        async with _provider_http_client(profile) as client:
             async with client.stream(
                 "POST",
                 normalize_messages_url(profile.base_url),
@@ -272,7 +317,7 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
                     # the error body before mapping the status so the shared
                     # error classifier can inspect it without ResponseNotRead.
                     await response.aread()
-                response.raise_for_status()
+                _raise_provider_status(response)
                 event_name = ""
                 data_lines: list[str] = []
                 async for raw_line in response.aiter_lines():
@@ -401,13 +446,13 @@ def parse_openai_response(
 async def call_openai(req: Any, profile: ProviderProfile) -> dict[str, Any]:
     started = time.time()
     try:
-        async with httpx.AsyncClient(timeout=profile.timeout_seconds) as client:
+        async with _provider_http_client(profile) as client:
             response = await client.post(
                 normalize_chat_completions_url(profile.base_url),
                 headers=openai_request_headers(profile),
                 json=openai_request_body(req, profile, False),
             )
-            response.raise_for_status()
+            _raise_provider_status(response)
             payload = response.json()
     except httpx.TimeoutException as exc:
         raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider request timed out", retryable=True, failover_scope="model") from exc
@@ -439,7 +484,7 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
     finish_reason = ""
     model = req.model or profile.default_model
     try:
-        async with httpx.AsyncClient(timeout=profile.timeout_seconds) as client:
+        async with _provider_http_client(profile) as client:
             async with client.stream(
                 "POST",
                 normalize_chat_completions_url(profile.base_url),
@@ -448,7 +493,7 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
             ) as response:
                 if response.is_error:
                     await response.aread()
-                response.raise_for_status()
+                _raise_provider_status(response)
                 async for raw_line in response.aiter_lines():
                     line = raw_line.strip()
                     if not line or line.startswith("event:") or line.startswith(":"):
@@ -525,6 +570,56 @@ async def call_provider(req: Any, profile: ProviderProfile) -> dict[str, Any]:
     if profile.protocol == "openai":
         return await call_openai(req, profile)
     return await call_messages(req, profile)
+
+
+async def probe_provider(profile: ProviderProfile, model: str) -> None:
+    if model not in {item.id for item in profile.models}:
+        raise _upstream_error(
+            400,
+            "PROFILE_MODEL_UNAVAILABLE",
+            "The requested model is not configured for this Profile",
+            retryable=False,
+        )
+    if profile.protocol == "openai":
+        url = normalize_chat_completions_url(profile.base_url)
+        headers = openai_request_headers(profile)
+        body = {
+            "model": model,
+            "max_tokens": 1,
+            "stream": False,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+    else:
+        url = normalize_messages_url(profile.base_url)
+        headers = request_headers(profile)
+        body = {
+            "model": model,
+            "max_tokens": 1,
+            "stream": False,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+    try:
+        async with _provider_http_client(profile) as client:
+            response = await client.post(url, headers=headers, json=body)
+            _raise_provider_status(response)
+    except httpx.TimeoutException as exc:
+        raise _upstream_error(
+            504,
+            "PROVIDER_TIMEOUT",
+            "Provider connection test timed out",
+            retryable=True,
+            failover_scope="profile",
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        raise _provider_http_error(exc) from exc
+    except httpx.RequestError as exc:
+        raise _upstream_error(
+            502,
+            "PROVIDER_NETWORK_ERROR",
+            "Provider connection test failed",
+            retryable=True,
+            failover_scope="profile",
+        ) from exc
 
 
 def stream_provider(req: Any, profile: ProviderProfile) -> AsyncIterator[dict[str, Any]]:

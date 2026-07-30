@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import anyio
+import pytest
 
 from claude_agent_sdk.actiondesign_gateway.models import AgentChatRequest
 from claude_agent_sdk.actiondesign_gateway.profile_store import ProviderProfile
@@ -9,6 +10,8 @@ from claude_agent_sdk.actiondesign_gateway import provider_http
 
 CONVERSATION_ID = "88888888-8888-4888-8888-888888888888"
 RUN_ID = "run_88888888-8888-4888-8888-888888888888"
+REQUEST_ID = "99999999-9999-4999-8999-999999999999"
+CORRELATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def profile():
@@ -45,6 +48,8 @@ def test_request_body_uses_provider_native_tools():
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system rules",
         prompt="hello",
         tools=[
@@ -70,10 +75,112 @@ def test_request_body_uses_provider_native_tools():
     assert provider_http.normalize_messages_url(profile().base_url) == "https://example.test/anthropic/v1/messages"
 
 
+@pytest.mark.parametrize(
+    ("normalizer", "base_url", "expected"),
+    [
+        (
+            provider_http.normalize_messages_url,
+            "https://example.test",
+            "https://example.test/v1/messages",
+        ),
+        (
+            provider_http.normalize_messages_url,
+            "https://example.test/tenant",
+            "https://example.test/tenant/v1/messages",
+        ),
+        (
+            provider_http.normalize_messages_url,
+            "https://example.test/tenant/v1",
+            "https://example.test/tenant/v1/messages",
+        ),
+        (
+            provider_http.normalize_messages_url,
+            "https://example.test/tenant/v1/messages",
+            "https://example.test/tenant/v1/messages",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test",
+            "https://example.test/v1/chat/completions",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/tenant",
+            "https://example.test/tenant/v1/chat/completions",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/tenant/v1",
+            "https://example.test/tenant/v1/chat/completions",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/tenant/v1/chat/completions",
+            "https://example.test/tenant/v1/chat/completions",
+        ),
+    ],
+)
+def test_provider_endpoint_normalization_preserves_controlled_base_path_prefix(
+    normalizer,
+    base_url,
+    expected,
+):
+    assert normalizer(base_url) == expected
+
+
+@pytest.mark.parametrize(
+    ("normalizer", "base_url"),
+    [
+        (provider_http.normalize_messages_url, "https://example.test/messages"),
+        (provider_http.normalize_messages_url, "https://example.test/tenant/messages"),
+        (provider_http.normalize_messages_url, "https://example.test/tenant/v2/messages"),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/chat/completions",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/tenant/chat/completions",
+        ),
+        (
+            provider_http.normalize_chat_completions_url,
+            "https://example.test/tenant/v2/chat/completions",
+        ),
+    ],
+)
+def test_provider_endpoint_normalization_rejects_disguised_nonfixed_suffix(
+    normalizer,
+    base_url,
+):
+    with pytest.raises(provider_http.HTTPException) as raised:
+        normalizer(base_url)
+
+    assert raised.value.detail["code"] == "PROVIDER_ENDPOINT_INVALID"
+    assert raised.value.detail["retryable"] is False
+
+
+def test_provider_http_client_explicitly_disables_redirects(monkeypatch):
+    captured = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(provider_http.httpx, "AsyncClient", FakeClient)
+
+    provider_http._provider_http_client(profile())
+    provider_http._provider_http_client(openai_profile())
+
+    assert len(captured) == 2
+    assert all(item["follow_redirects"] is False for item in captured)
+
+
 def test_request_body_forwards_native_tool_choice():
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system rules",
         prompt="review",
         tools=[
@@ -95,6 +202,8 @@ def test_claude_request_forwards_enabled_thinking_budget():
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system rules",
         prompt="reason carefully",
         maxTokens=8192,
@@ -112,6 +221,8 @@ def test_openai_request_converts_messages_images_tools_and_tool_choice():
         profileId="team-openai",
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system rules",
         prompt="inspect image",
         images=[{"media_type": "image/png", "data": "aGVsbG8="}],
@@ -211,6 +322,8 @@ def test_openai_stream_accumulates_text_and_function_arguments(monkeypatch):
         profileId="team-openai",
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system",
         prompt="inspect",
         tools=[{
@@ -281,6 +394,8 @@ def test_response_tool_arguments_are_validated_against_request_schema():
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
         systemPrompt="system rules",
         prompt="inspect",
         tools=[{

@@ -99,6 +99,37 @@ def redact_value(value: Any) -> Any:
     return value
 
 
+def redact_secret_values(value: Any, secret_values: Sequence[str]) -> Any:
+    """Redact structured secret fields and exact configured Secret values."""
+
+    filtered = tuple(
+        sorted(
+            {secret for secret in secret_values if secret},
+            key=len,
+            reverse=True,
+        )
+    )
+    return _replace_secret_values(redact_value(value), filtered)
+
+
+def _replace_secret_values(value: Any, secret_values: tuple[str, ...]) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_secret_values(item, secret_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_replace_secret_values(item, secret_values) for item in value)
+    if _is_non_string_sequence(value):
+        return [_replace_secret_values(item, secret_values) for item in value]
+    if isinstance(value, str):
+        result = value
+        for secret in secret_values:
+            result = result.replace(secret, _REDACTED)
+        return result
+    return value
+
+
 def _is_secret_key(key: Any) -> bool:
     if not isinstance(key, str):
         return False

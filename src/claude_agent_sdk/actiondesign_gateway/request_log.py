@@ -109,6 +109,7 @@ class RequestLogStore:
         http_status: int = 200,
         stream: bool,
         attempt: int = 1,
+        endpoint: str = "",
     ) -> dict[str, Any]:
         response_data = model_to_dict(response or {})
         usage = _sanitize_usage(response_data.get("usage"))
@@ -122,12 +123,54 @@ class RequestLogStore:
         ]
         prompt = request.prompt
         system_prompt = request.system_prompt
+        stop_reason = str(
+            usage.get("stop_reason") or usage.get("finish_reason") or ""
+        )
+        request_metadata = redact_value(
+            {
+                "agentMode": request.agent_mode,
+                "topicId": request.topic_id,
+                "checkpointId": request.checkpoint_id,
+                "graphVersion": request.graph_version,
+                "protocolVersion": request.protocol_version,
+                "promptManifestVersion": request.prompt_manifest_version,
+                "promptManifestHash": request.prompt_manifest_hash,
+                "toolCatalogVersion": request.tool_catalog_version,
+                "toolCatalogHash": request.tool_catalog_hash,
+                "skillCatalogVersion": request.skill_catalog_version,
+                "skillCatalogHash": request.skill_catalog_hash,
+                "loadedSkillIds": sorted(request.loaded_skill_versions),
+                "mcpServerIds": request.mcp_server_ids,
+                "maxTokens": request.max_tokens,
+                "thinking": request.thinking.type,
+                "toolCount": len(request.tools),
+                "imageCount": len(request.images),
+            }
+        )
+        response_metadata = redact_value(
+            {
+                "success": response_data.get("success", status == "success"),
+                "contentSha256": _sha256(content),
+                "toolCallCount": len(tool_calls),
+                "toolCallIds": [
+                    str(call.get("id") or "")
+                    for call in tool_calls
+                    if isinstance(call, dict) and call.get("id")
+                ],
+                "toolNames": response_tool_names,
+            }
+        )
         entry = RequestLogEntry.model_validate(
             {
                 "requestId": request_id,
+                "correlationId": request.correlation_id,
+                "parentRequestId": request.parent_request_id,
+                "retryOf": request.retry_of,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "conversationId": request.conversation_id,
                 "runId": request.run_id,
+                "traceId": request.trace_id,
+                "endpoint": endpoint,
                 "provider": profile.provider,
                 "profileId": profile.id,
                 "protocol": profile.protocol,
@@ -151,7 +194,10 @@ class RequestLogStore:
                 "finishReason": str(
                     usage.get("finish_reason") or usage.get("stop_reason") or ""
                 ),
+                "stopReason": stop_reason,
                 "usage": usage,
+                "requestMetadata": request_metadata,
+                "responseMetadata": response_metadata,
             }
         ).model_dump(mode="json", by_alias=True)
         serialized = json.dumps(
@@ -186,6 +232,14 @@ class RequestLogStore:
         profile_id: str = "",
         protocol: str = "",
         status: str = "",
+        conversation_id: str = "",
+        request_id: str = "",
+        run_id: str = "",
+        model: str = "",
+        stream: bool | None = None,
+        error_code: str = "",
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         items: list[dict[str, Any]] = []
         total = 0
@@ -195,6 +249,17 @@ class RequestLogStore:
                 and (not profile_id or entry.get("profileId") == profile_id)
                 and (not protocol or entry.get("protocol") == protocol)
                 and (not status or entry.get("status") == status)
+                and (not conversation_id or entry.get("conversationId") == conversation_id)
+                and (not request_id or entry.get("requestId") == request_id)
+                and (not run_id or entry.get("runId") == run_id)
+                and (not model or entry.get("model") == model)
+                and (stream is None or entry.get("stream") is stream)
+                and (not error_code or entry.get("errorCode") == error_code)
+                and _timestamp_in_range(
+                    entry.get("timestamp"),
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
             ):
                 continue
             if total >= offset and len(items) < limit:
@@ -320,14 +385,33 @@ def _parse_entry(line: str) -> dict[str, Any] | None:
         usage = _sanitize_usage(payload.get("usage"))
         payload = {
             **payload,
+            "correlationId": payload.get("correlationId") or "",
+            "parentRequestId": payload.get("parentRequestId") or "",
+            "retryOf": payload.get("retryOf") or "",
+            "traceId": payload.get("traceId") or "",
+            "endpoint": payload.get("endpoint") or "",
             "errorCode": error_code,
             "errorMessage": error_message,
             "finishReason": (
                 _sanitize_finish_reason(payload.get("finishReason"))
                 or str(usage.get("finish_reason") or usage.get("stop_reason") or "")
             ),
+            "stopReason": (
+                _sanitize_finish_reason(payload.get("stopReason"))
+                or _sanitize_finish_reason(payload.get("finishReason"))
+                or str(usage.get("stop_reason") or usage.get("finish_reason") or "")
+            ),
             "usage": usage,
+            "requestMetadata": payload.get("requestMetadata")
+            if isinstance(payload.get("requestMetadata"), dict)
+            else {},
+            "responseMetadata": payload.get("responseMetadata")
+            if isinstance(payload.get("responseMetadata"), dict)
+            else {},
         }
+        payload = redact_value(payload)
+        if not isinstance(payload, dict):
+            return None
         return RequestLogEntry.model_validate(payload).model_dump(
             mode="json",
             by_alias=True,
@@ -376,3 +460,27 @@ def _iter_lines_reverse(path: Path) -> Iterator[str]:
 
 def _sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _timestamp_in_range(
+    value: Any,
+    *,
+    started_at: datetime | None,
+    ended_at: datetime | None,
+) -> bool:
+    if started_at is None and ended_at is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if timestamp.tzinfo is None:
+        return False
+    timestamp = timestamp.astimezone(timezone.utc)
+    if started_at is not None and timestamp < started_at.astimezone(timezone.utc):
+        return False
+    if ended_at is not None and timestamp > ended_at.astimezone(timezone.utc):
+        return False
+    return True

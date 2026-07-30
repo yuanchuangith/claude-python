@@ -14,17 +14,14 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .identifiers import validate_conversation_uuid4, validate_run_id
-from .readonly_mcp import (
-    GXP_READONLY_MCP_CONTRACT_HASH,
-    GXP_READONLY_MCP_CONTRACT_VERSION,
-    GXP_LOWCODE_DEBUG_SKILL_ID,
-    GXP_LOWCODE_DEBUG_SKILL_VERSION,
-    GXP_READONLY_MCP_SERVER_ID,
-    validate_readonly_mcp_result,
+from .identifiers import (
+    validate_conversation_uuid4,
+    validate_history_conversation_id,
+    validate_history_run_id,
+    validate_run_id,
+    validate_safe_request_id,
+    validate_uuid4_id,
 )
-
-
 MIMO_MODELS: dict[str, dict[str, Any]] = {
     "mimo-v2.5": {
         "name": "MiMo v2.5",
@@ -54,7 +51,9 @@ class _GatewayBaseModel(BaseModel):
 
 IDENTIFIER_RE = compile_regex(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 PROFILE_ID_RE = compile_regex(r"^[A-Za-z0-9_-]{1,64}$")
+MCP_SERVER_ID_RE = compile_regex(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TOOL_NAME_RE = compile_regex(r"^[A-Za-z][A-Za-z0-9_-]{0,127}$")
+MCP_TOOL_NAME_RE = compile_regex(r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")
 SHA256_RE = compile_regex(r"^sha256:[a-fA-F0-9]{64}$")
 MODEL_NAME_RE = compile_regex(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 MAX_PROMPT_CHARS = 2_000_000
@@ -232,13 +231,42 @@ class RequestIdentity(_GatewayBaseModel):
         return validate_run_id(value)
 
 
-class AgentChatRequest(_GatewayBaseModel):
+class RequestCorrelation(_GatewayBaseModel):
+    correlation_id: str = Field(alias="correlationId")
+    retry_of: str = Field(default="", alias="retryOf")
+    parent_request_id: str = Field(default="", alias="parentRequestId")
+
+    @field_validator("correlation_id")
+    def _validate_correlation_uuid(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="correlationId")
+
+    @field_validator("retry_of")
+    def _validate_retry_uuid(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="retryOf") if value else value
+
+    @field_validator("parent_request_id")
+    def _validate_parent_request_uuid(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="parentRequestId") if value else value
+
+
+class RequestCorrelationIdentity(RequestCorrelation):
+    """Caller-provided request identity validated at the transport boundary."""
+
+    request_id: str = Field(alias="requestId")
+
+    @field_validator("request_id")
+    def _validate_request_uuid(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="requestId")
+
+
+class AgentChatRequest(RequestCorrelationIdentity):
     provider: str = "auto"
     profile_id: str = Field(default="", alias="profileId")
     model: str = ""
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")
     topic_id: str = Field(default="", alias="topicId")
+    user_id: str = Field(default="", alias="userId", max_length=256)
     checkpoint_id: str = Field(default="", alias="checkpointId")
     agent_mode: Literal["normal", "plan", "chat", ""] = Field(
         default="", alias="agentMode"
@@ -431,19 +459,42 @@ class AgentChatResponse(_GatewayBaseModel):
         return self
 
 
-class ToolResultRequest(_GatewayBaseModel):
+class AgentChatHttpResponse(AgentChatResponse):
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    sequence: int = Field(default=1, ge=1)
+
+    @field_validator("conversation_id")
+    def _validate_http_response_conversation_id(cls, value: str) -> str:
+        return validate_conversation_uuid4(value)
+
+    @field_validator("run_id")
+    def _validate_http_response_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
+
+    @field_validator("request_id", "correlation_id")
+    def _validate_http_response_request_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value)
+
+
+class ToolResultRequest(RequestCorrelationIdentity):
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")
     topic_id: str = Field(default="", alias="topicId")
     checkpoint_id: str = Field(default="", alias="checkpointId")
     turn: int = Field(default=0, ge=0, le=100000)
     tool_call_id: str = Field(alias="toolCallId")
+    call_id: str = Field(default="", alias="callId")
+    idempotency_key: str = Field(default="", alias="idempotencyKey")
     tool_name: str = Field(alias="toolName")
     arguments: dict[str, Any] = Field(default_factory=dict)
     status: Literal["success", "failed", "rejected", "cancelled"] = "success"
     result: Any = None
     error: str = ""
     timestamp: str = ""
+    duration_ms: int = Field(default=0, alias="durationMs", ge=0, le=86_400_000)
     protocol_version: str = Field(default="1.0", alias="protocolVersion")
     graph_version: str = Field(default="", alias="graphVersion")
     skill_catalog_version: str = Field(default="", alias="skillCatalogVersion")
@@ -451,14 +502,15 @@ class ToolResultRequest(_GatewayBaseModel):
     loaded_skill_versions: dict[str, str] = Field(default_factory=dict, alias="loadedSkillVersions")
     mcp_server_ids: list[str] = Field(default_factory=list, alias="mcpServerIds")
     trace_id: str = Field(default="", alias="traceId")
+    artifact_ref: str = Field(default="", alias="artifactRef", max_length=2048)
 
     @field_validator("run_id")
     def _validate_run_id(cls, value: str) -> str:
         return validate_run_id(value)
 
-    @field_validator("tool_call_id")
+    @field_validator("tool_call_id", "call_id", "idempotency_key")
     def _validate_required_identifier(cls, value: str) -> str:
-        if not IDENTIFIER_RE.fullmatch(value):
+        if value and not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("value must be a valid identifier")
         return value
 
@@ -554,59 +606,103 @@ class ToolResultResponse(_GatewayBaseModel):
     success: bool
     message: str
     duplicate: bool = False
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    sequence: int = Field(default=1, ge=1)
+
+    @field_validator("conversation_id")
+    def _validate_tool_response_conversation(cls, value: str) -> str:
+        return validate_conversation_uuid4(value)
+
+    @field_validator("run_id")
+    def _validate_tool_response_run(cls, value: str) -> str:
+        return validate_run_id(value)
+
+    @field_validator("request_id", "correlation_id")
+    def _validate_tool_response_request_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value)
 
 
-ReadonlyMcpToolName = Literal[
-    "connection_status",
-    "diagnose_codex_input",
-    "resolve_action",
-    "get_design_versions",
-    "inspect_action",
-    "compare_designs",
-    "trace_dynamic_exception",
-    "describe_table",
-    "get_records",
-    "evaluate_node_predicate",
-    "readonly_sql",
-]
-
-
-class ReadonlyMcpToolDefinition(_GatewayBaseModel):
-    name: ReadonlyMcpToolName
+class McpToolDefinition(_GatewayBaseModel):
+    name: str
     description: str = Field(max_length=8000)
     input_schema: dict[str, Any] = Field(alias="inputSchema")
+    output_schema: dict[str, Any] | None = Field(default=None, alias="outputSchema")
+    annotations: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("input_schema")
-    def _validate_input_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
-        if value.get("type") != "object":
-            raise ValueError("MCP tool inputSchema.type must be object")
+    @field_validator("name")
+    def _validate_name(cls, value: str) -> str:
+        if not MCP_TOOL_NAME_RE.fullmatch(value):
+            raise ValueError("MCP tool name is invalid")
+        return value
+
+    @field_validator("input_schema", "output_schema")
+    def _validate_schema(
+        cls,
+        value: dict[str, Any] | None,
+        info: Any,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        if info.field_name == "input_schema" and value.get("type") != "object":
+            raise ValueError("MCP tool inputSchema type must be object")
         try:
             Draft202012Validator.check_schema(value)
         except SchemaError as exc:
-            raise ValueError(f"MCP tool inputSchema is not valid JSON Schema: {exc.message}") from exc
+            raise ValueError(
+                f"MCP tool Schema is not valid JSON Schema: {exc.message}"
+            ) from exc
+        return _validate_bounded_json(
+            value,
+            label="MCP tool Schema",
+            max_chars=MAX_TOOL_RESULT_JSON_CHARS,
+        )
+
+    @field_validator("annotations")
+    def _validate_annotations(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_bounded_json(
+            value,
+            label="MCP tool annotations",
+            max_chars=MAX_TRACE_VALUE_JSON_CHARS,
+        )
+
+
+class McpToolListResponse(_GatewayBaseModel):
+    server_id: str = Field(alias="serverId")
+    server_name: str = Field(default="", alias="serverName", max_length=128)
+    server_version: str = Field(alias="serverVersion", max_length=128)
+    tools: list[McpToolDefinition] = Field(default_factory=list, max_length=256)
+
+    @field_validator("server_id")
+    def _validate_server_id(cls, value: str) -> str:
+        if not MCP_SERVER_ID_RE.fullmatch(value):
+            raise ValueError("MCP serverId is invalid")
         return value
 
-
-class ReadonlyMcpToolListResponse(_GatewayBaseModel):
-    server_id: Literal[GXP_READONLY_MCP_SERVER_ID] = Field(alias="serverId")
-    server_version: str = Field(alias="serverVersion", min_length=1, max_length=128)
-    skill_id: Literal[GXP_LOWCODE_DEBUG_SKILL_ID] = Field(alias="skillId")
-    skill_version: Literal[GXP_LOWCODE_DEBUG_SKILL_VERSION] = Field(alias="skillVersion")
-    contract_version: Literal[GXP_READONLY_MCP_CONTRACT_VERSION] = Field(alias="contractVersion")
-    contract_hash: Literal[GXP_READONLY_MCP_CONTRACT_HASH] = Field(alias="contractHash")
-    tools: list[ReadonlyMcpToolDefinition] = Field(min_length=11, max_length=11)
+    @model_validator(mode="after")
+    def _validate_unique_tools(self) -> "McpToolListResponse":
+        names = [tool.name for tool in self.tools]
+        if len(names) != len(set(names)):
+            raise ValueError("MCP tool names must be unique")
+        return self
 
 
-class ReadonlyMcpToolCallRequest(_GatewayBaseModel):
-    tool_name: ReadonlyMcpToolName = Field(alias="toolName")
+class McpToolCallRequest(RequestCorrelationIdentity):
+    tool_name: str = Field(alias="toolName")
     arguments: dict[str, Any] = Field(default_factory=dict)
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")
     topic_id: str = Field(default="", alias="topicId")
     checkpoint_id: str = Field(default="", alias="checkpointId")
     trace_id: str = Field(default="", alias="traceId")
-    skill_id: Literal[GXP_LOWCODE_DEBUG_SKILL_ID] = Field(alias="skillId")
-    skill_version: Literal[GXP_LOWCODE_DEBUG_SKILL_VERSION] = Field(alias="skillVersion")
+
+    @field_validator("tool_name")
+    def _validate_tool_name(cls, value: str) -> str:
+        if not MCP_TOOL_NAME_RE.fullmatch(value):
+            raise ValueError("MCP toolName is invalid")
+        return value
 
     @field_validator("conversation_id")
     def _validate_conversation_id(cls, value: str) -> str:
@@ -624,39 +720,68 @@ class ReadonlyMcpToolCallRequest(_GatewayBaseModel):
 
     @field_validator("arguments")
     def _validate_arguments_size(cls, value: dict[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(value, ensure_ascii=False, default=str)
-        if len(encoded) > 2_000_000:
-            raise ValueError("MCP tool arguments exceed the 2000000 character limit")
-        return value
+        return _validate_bounded_json(
+            value,
+            label="MCP tool arguments",
+            max_chars=MAX_TOOL_RESULT_JSON_CHARS,
+        )
 
 
-class ReadonlyMcpToolCallResponse(_GatewayBaseModel):
-    server_id: Literal[GXP_READONLY_MCP_SERVER_ID] = Field(alias="serverId")
-    server_version: str = Field(alias="serverVersion", min_length=1, max_length=128)
-    skill_id: Literal[GXP_LOWCODE_DEBUG_SKILL_ID] = Field(alias="skillId")
-    skill_version: Literal[GXP_LOWCODE_DEBUG_SKILL_VERSION] = Field(alias="skillVersion")
-    contract_version: Literal[GXP_READONLY_MCP_CONTRACT_VERSION] = Field(alias="contractVersion")
-    contract_hash: Literal[GXP_READONLY_MCP_CONTRACT_HASH] = Field(alias="contractHash")
-    tool_name: ReadonlyMcpToolName = Field(alias="toolName")
-    success: bool
-    result: Any | None = None
-    error: str | None = Field(default=None, max_length=16_000)
+class McpCallResult(_GatewayBaseModel):
+    content: list[Any] = Field(default_factory=list, max_length=10_000)
+    structured_content: Any | None = Field(default=None, alias="structuredContent")
+    is_error: bool = Field(default=False, alias="isError")
+    meta: dict[str, Any] = Field(default_factory=dict, alias="_meta")
+
+    @field_validator("content", "structured_content", "meta")
+    def _validate_result_json(cls, value: Any) -> Any:
+        return _validate_bounded_json(
+            value,
+            label="MCP tool result",
+            max_chars=MAX_TOOL_RESULT_JSON_CHARS,
+        )
+
+
+class McpToolCallResponse(_GatewayBaseModel):
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    sequence: int = Field(default=1, ge=1)
+    server_id: str = Field(alias="serverId")
+    server_name: str = Field(default="", alias="serverName", max_length=128)
+    server_version: str = Field(alias="serverVersion", max_length=128)
+    tool_name: str = Field(alias="toolName")
+    result: McpCallResult
     duration_ms: int = Field(alias="durationMs", ge=0)
 
-    @model_validator(mode="after")
-    def _validate_result_shape(self) -> "ReadonlyMcpToolCallResponse":
-        if self.success and self.error is not None:
-            raise ValueError("successful MCP calls must not include error")
-        if not self.success and not self.error:
-            raise ValueError("failed MCP calls require error")
-        if not self.success and self.result is not None:
-            raise ValueError("failed MCP calls must not include result")
-        if self.success:
-            try:
-                validate_readonly_mcp_result(self.tool_name, self.result)
-            except Exception as exc:
-                raise ValueError(str(exc)) from exc
-        return self
+    @field_validator("request_id")
+    def _validate_request_id(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="requestId")
+
+    @field_validator("correlation_id")
+    def _validate_correlation_id(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="correlationId")
+
+    @field_validator("conversation_id")
+    def _validate_mcp_response_conversation_id(cls, value: str) -> str:
+        return validate_conversation_uuid4(value)
+
+    @field_validator("run_id")
+    def _validate_mcp_response_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
+
+    @field_validator("server_id")
+    def _validate_server_id(cls, value: str) -> str:
+        if not MCP_SERVER_ID_RE.fullmatch(value):
+            raise ValueError("MCP serverId is invalid")
+        return value
+
+    @field_validator("tool_name")
+    def _validate_tool_name(cls, value: str) -> str:
+        if not MCP_TOOL_NAME_RE.fullmatch(value):
+            raise ValueError("MCP toolName is invalid")
+        return value
 
 
 class ApiProfileModel(_GatewayBaseModel):
@@ -678,6 +803,7 @@ class ApiProfileModel(_GatewayBaseModel):
     )
     supports_native_tools: bool = Field(default=True, alias="supportsNativeTools")
     supports_thinking: bool = Field(default=False, alias="supportsThinking")
+    supports_streaming: bool = Field(default=True, alias="supportsStreaming")
 
     @field_validator("id")
     def _validate_id(cls, value: str) -> str:
@@ -763,6 +889,9 @@ class ApiProfileResponse(_GatewayBaseModel):
     display_name: str = Field(alias="displayName")
     protocol: Literal["openai", "claude"]
     base_url: str = Field(alias="baseUrl")
+    provider_path: Literal["/v1/chat/completions", "/v1/messages"] = Field(
+        alias="providerPath"
+    )
     default_model: str = Field(default="", alias="defaultModel")
     models: list[ApiProfileModel] = Field(default_factory=list)
     auth_mode: Literal["api-key", "bearer"] = Field(alias="authMode")
@@ -770,7 +899,53 @@ class ApiProfileResponse(_GatewayBaseModel):
     priority: int = Field(ge=1, le=10_000)
     enabled: bool
     key_configured: bool = Field(alias="keyConfigured")
+    secret_masked: str = Field(default="", alias="secretMasked", max_length=16)
     source: Literal["environment", "managed"]
+
+
+class DefaultModelUpdateRequest(_GatewayBaseModel):
+    model_id: str = Field(alias="modelId")
+
+    @field_validator("model_id")
+    def _validate_model_id(cls, value: str) -> str:
+        if not MODEL_NAME_RE.fullmatch(value):
+            raise ValueError("modelId is invalid")
+        return value
+
+
+class ProfileSecretWriteRequest(_GatewayBaseModel):
+    value: str = Field(min_length=8, max_length=8192)
+
+
+class ProfileSecretStatusResponse(_GatewayBaseModel):
+    profile_id: str = Field(alias="profileId")
+    configured: bool
+    masked: str = Field(default="", max_length=16)
+    source: Literal["environment", "managed"]
+
+
+class ProviderConnectionTestRequest(_GatewayBaseModel):
+    model: str = ""
+
+    @field_validator("model")
+    def _validate_model(cls, value: str) -> str:
+        if value and not MODEL_NAME_RE.fullmatch(value):
+            raise ValueError("model is invalid")
+        return value
+
+
+class ProviderHealthResponse(_GatewayBaseModel):
+    profile_id: str = Field(alias="profileId")
+    provider: str
+    status: Literal["disabled", "unconfigured", "unknown", "healthy", "unhealthy"]
+    checked_at: str = Field(default="", alias="checkedAt")
+    latency_ms: int = Field(default=0, alias="latencyMs", ge=0)
+    error_code: str = Field(default="", alias="errorCode", max_length=128)
+    message: str = Field(default="", max_length=1000)
+
+
+class DeleteModelResponse(_GatewayBaseModel):
+    success: bool
 
 
 class TraceError(_GatewayBaseModel):
@@ -806,9 +981,7 @@ class TraceMetadata(_GatewayBaseModel):
 
     @field_validator("conversation_id")
     def _validate_conversation_id(cls, value: str) -> str:
-        if not IDENTIFIER_RE.fullmatch(value):
-            raise ValueError("conversationId is invalid")
-        return value
+        return validate_conversation_uuid4(value)
 
     @field_validator("topic_id", "checkpoint_id", "profile_id")
     def _validate_optional_identifier(cls, value: str) -> str:
@@ -836,7 +1009,9 @@ class TraceEnvelope(_GatewayBaseModel):
     trace_run_id: str = Field(alias="traceRunId")
     parent_trace_run_id: str = Field(default="", alias="parentTraceRunId")
     agent_run_id: str = Field(alias="agentRunId")
-    request_id: str = Field(default="", alias="requestId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    retry_of: str = Field(default="", alias="retryOf")
     name: str = Field(min_length=1, max_length=512)
     run_type: Literal["graph", "chain", "llm", "tool", "retriever", "interrupt"] = Field(alias="runType")
     event: Literal["start", "end", "error"]
@@ -847,17 +1022,29 @@ class TraceEnvelope(_GatewayBaseModel):
     tags: list[str] = Field(default_factory=list, max_length=100)
     metadata: TraceMetadata
 
-    @field_validator("event_id", "trace_id", "trace_run_id", "agent_run_id")
+    @field_validator("event_id", "trace_id", "trace_run_id")
     def _validate_required_identifier(cls, value: str) -> str:
         if not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("trace identifier is invalid")
         return value
 
-    @field_validator("parent_trace_run_id", "request_id")
+    @field_validator("agent_run_id")
+    def _validate_agent_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
+
+    @field_validator("parent_trace_run_id")
     def _validate_optional_identifier(cls, value: str) -> str:
         if value and not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("trace identifier is invalid")
         return value
+
+    @field_validator("request_id")
+    def _validate_request_id(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="requestId")
+
+    @field_validator("correlation_id", "retry_of")
+    def _validate_trace_correlation_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value) if value else value
 
     @field_validator("timestamp")
     def _validate_timestamp(cls, value: str) -> str:
@@ -888,7 +1075,10 @@ class TraceEnvelope(_GatewayBaseModel):
         return self
 
 
-class TraceBatchRequest(_GatewayBaseModel):
+class TraceBatchRequest(RequestCorrelationIdentity):
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    sequence: int = Field(ge=1)
     schema_version: Literal["1.0"] = Field(alias="schemaVersion")
     content_level: Literal["metadata", "sanitized", "full"] = Field(
         alias="contentLevel"
@@ -902,6 +1092,14 @@ class TraceBatchRequest(_GatewayBaseModel):
         if parsed.tzinfo is None:
             raise ValueError("sentAt must include a timezone offset")
         return value
+
+    @field_validator("conversation_id")
+    def _validate_batch_conversation_id(cls, value: str) -> str:
+        return validate_conversation_uuid4(value)
+
+    @field_validator("run_id")
+    def _validate_batch_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
 
     @field_validator("events")
     def _validate_events(cls, value: list[TraceEnvelope]) -> list[TraceEnvelope]:
@@ -919,12 +1117,42 @@ class TraceBatchRequest(_GatewayBaseModel):
             )
         return value
 
+    @model_validator(mode="after")
+    def _validate_single_runtime_identity(self) -> "TraceBatchRequest":
+        conversations = {event.metadata.conversation_id for event in self.events}
+        runs = {event.agent_run_id for event in self.events}
+        if (
+            len(conversations) != 1
+            or len(runs) != 1
+            or conversations != {self.conversation_id}
+            or runs != {self.run_id}
+        ):
+            raise ValueError("trace batch events must share one conversationId and agentRunId")
+        return self
+
 
 class TraceBatchResponse(_GatewayBaseModel):
     export_batch_id: str = Field(alias="exportBatchId")
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    sequence: int = Field(default=1, ge=1)
     accepted: int
     rejected: int
     status: Literal["accepted", "partial", "disabled"]
+
+    @field_validator("conversation_id")
+    def _validate_trace_response_conversation_id(cls, value: str) -> str:
+        return validate_conversation_uuid4(value)
+
+    @field_validator("run_id")
+    def _validate_trace_response_run_id(cls, value: str) -> str:
+        return validate_run_id(value)
+
+    @field_validator("request_id", "correlation_id")
+    def _validate_trace_response_request_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value)
 
 
 class HealthResponse(_GatewayBaseModel):
@@ -932,8 +1160,22 @@ class HealthResponse(_GatewayBaseModel):
     runtime: Literal["thin-gateway"]
     protocol_version: Literal["1.0"] = Field(alias="protocolVersion")
     langsmith_enabled: bool = Field(alias="langsmithEnabled")
-    readonly_mcp_enabled: bool = Field(alias="readonlyMcpEnabled")
+    mcp_proxy_enabled: bool = Field(alias="mcpProxyEnabled")
     full_conversation_log_enabled: bool = Field(alias="fullConversationLogEnabled")
+
+
+class RetryPolicyResponse(_GatewayBaseModel):
+    mode: Literal["retryable-failover"] = "retryable-failover"
+    attempts_per_route: Literal[1] = Field(default=1, alias="attemptsPerRoute")
+    retryable_errors_only: Literal[True] = Field(default=True, alias="retryableErrorsOnly")
+    partial_stream_failover: Literal[False] = Field(default=False, alias="partialStreamFailover")
+
+
+class AdminRuntimePolicyResponse(_GatewayBaseModel):
+    profile_allowed_hosts: list[str] = Field(alias="profileAllowedHosts", max_length=256)
+    mcp_allowed_hosts: list[str] = Field(alias="mcpAllowedHosts", max_length=256)
+    provider_paths: dict[Literal["openai", "claude"], str] = Field(alias="providerPaths")
+    retry_policy: RetryPolicyResponse = Field(alias="retryPolicy")
 
 
 class ModelCapability(_GatewayBaseModel):
@@ -946,6 +1188,7 @@ class ModelCapability(_GatewayBaseModel):
     max_output_tokens: int = Field(alias="maxOutputTokens", gt=0)
     supports_native_tools: bool = Field(alias="supportsNativeTools")
     supports_thinking: bool = Field(alias="supportsThinking")
+    supports_streaming: bool = Field(alias="supportsStreaming")
 
 
 class ProviderCapability(_GatewayBaseModel):
@@ -981,9 +1224,14 @@ class AgentModelsResponse(_GatewayBaseModel):
 
 class RequestLogEntry(_GatewayBaseModel):
     request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    parent_request_id: str = Field(default="", alias="parentRequestId")
+    retry_of: str = Field(default="", alias="retryOf")
     timestamp: str
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")
+    trace_id: str = Field(default="", alias="traceId")
+    endpoint: str = Field(default="", max_length=512)
     provider: str
     profile_id: str = Field(alias="profileId")
     protocol: Literal["openai", "claude"]
@@ -1005,7 +1253,43 @@ class RequestLogEntry(_GatewayBaseModel):
     input_characters: int = Field(alias="inputCharacters", ge=0)
     output_characters: int = Field(alias="outputCharacters", ge=0)
     finish_reason: str = Field(default="", alias="finishReason", max_length=256)
+    stop_reason: str = Field(default="", alias="stopReason", max_length=256)
     usage: dict[str, Any] = Field(default_factory=dict)
+    request_metadata: dict[str, Any] = Field(default_factory=dict, alias="requestMetadata")
+    response_metadata: dict[str, Any] = Field(default_factory=dict, alias="responseMetadata")
+
+    @field_validator("request_id")
+    def _validate_request_id(cls, value: str) -> str:
+        try:
+            return validate_uuid4_id(value, label="requestId")
+        except ValueError:
+            return validate_safe_request_id(value)
+
+    @field_validator("correlation_id", "parent_request_id", "retry_of")
+    def _validate_history_correlation_ids(cls, value: str) -> str:
+        if not value:
+            return value
+        try:
+            return validate_uuid4_id(value)
+        except ValueError:
+            return validate_safe_request_id(value)
+
+    @field_validator("request_metadata", "response_metadata")
+    @classmethod
+    def _validate_log_metadata(cls, value: dict[str, Any], info: Any) -> dict[str, Any]:
+        return _validate_bounded_json(
+            value,
+            label=info.field_name,
+            max_chars=MAX_TRACE_VALUE_JSON_CHARS,
+        )
+
+    @field_validator("conversation_id")
+    def _validate_history_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
+
+    @field_validator("run_id")
+    def _validate_history_run_id(cls, value: str) -> str:
+        return validate_history_run_id(value)
 
 
 class RequestLogListResponse(_GatewayBaseModel):
@@ -1052,8 +1336,12 @@ class AuditLogEntry(_GatewayBaseModel):
     action: str = Field(max_length=128)
     success: bool
     actor: str = Field(max_length=256)
-    request_id: str = Field(default="", alias="requestId", max_length=256)
+    request_id: str = Field(alias="requestId", min_length=1, max_length=256)
     details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("request_id")
+    def _validate_request_id(cls, value: str) -> str:
+        return validate_safe_request_id(value)
 
 
 class AuditLogListResponse(_GatewayBaseModel):
@@ -1065,12 +1353,25 @@ class AuditLogListResponse(_GatewayBaseModel):
 
 class ConversationSummary(_GatewayBaseModel):
     conversation_id: str = Field(alias="conversationId")
+    created_at: str = Field(default="", alias="createdAt")
     started_at: str = Field(alias="startedAt")
     updated_at: str = Field(alias="updatedAt")
+    title: str = Field(default="", max_length=512)
+    user_id: str = Field(default="", alias="userId", max_length=256)
+    topic_id: str = Field(default="", alias="topicId", max_length=256)
+    first_run_id: str = Field(default="", alias="firstRunId", max_length=256)
+    latest_run_id: str = Field(default="", alias="latestRunId", max_length=256)
     size_bytes: int = Field(alias="sizeBytes", ge=0)
     event_count: int = Field(alias="eventCount", ge=0)
+    message_count: int = Field(default=0, alias="messageCount", ge=0)
+    tool_result_count: int = Field(default=0, alias="toolResultCount", ge=0)
+    last_sequence: int = Field(default=0, alias="lastSequence", ge=0)
     status: Literal["open", "completed", "aborted"] = "open"
     incomplete_reason: str = Field(default="", alias="incompleteReason", max_length=256)
+
+    @field_validator("conversation_id")
+    def _validate_history_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
 
 
 class ConversationListResponse(_GatewayBaseModel):
@@ -1082,10 +1383,182 @@ class ConversationListResponse(_GatewayBaseModel):
 
 class ConversationEventsResponse(_GatewayBaseModel):
     conversation_id: str = Field(alias="conversationId")
-    items: list[dict[str, Any]]
+    items: list[dict[str, Any]] = Field(max_length=500)
     total: int = Field(ge=0)
     limit: int = Field(ge=1, le=500)
     offset: int = Field(ge=0)
+
+    @field_validator("conversation_id")
+    def _validate_history_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
+
+
+class MessageRecord(_GatewayBaseModel):
+    message_id: str = Field(alias="messageId")
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(default="", alias="correlationId")
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str = Field(default="", max_length=MAX_PROMPT_CHARS)
+    tool_calls: list[NativeToolCall] = Field(default_factory=list, alias="toolCalls", max_length=128)
+    tool_result_refs: list[str] = Field(default_factory=list, alias="toolResultRefs", max_length=256)
+    incomplete_reason: str = Field(default="", alias="incompleteReason", max_length=256)
+    sequence: int = Field(gt=0)
+    created_at: str = Field(alias="createdAt")
+
+    @field_validator("message_id")
+    def _validate_message_id(cls, value: str) -> str:
+        return validate_uuid4_id(value, label="messageId")
+
+    @field_validator("conversation_id")
+    def _validate_message_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
+
+    @field_validator("run_id")
+    def _validate_message_run_id(cls, value: str) -> str:
+        return validate_history_run_id(value)
+
+    @field_validator("request_id", "correlation_id")
+    def _validate_message_request_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value) if value else value
+
+
+class ConversationTranscriptResponse(_GatewayBaseModel):
+    conversation_id: str = Field(alias="conversationId")
+    messages: list[MessageRecord] = Field(max_length=10_000)
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1, le=500)
+    offset: int = Field(ge=0)
+    incomplete_reason: str = Field(default="", alias="incompleteReason", max_length=256)
+
+    @field_validator("conversation_id")
+    def _validate_transcript_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
+
+
+class ToolResultLogRecord(_GatewayBaseModel):
+    conversation_id: str = Field(alias="conversationId")
+    run_id: str = Field(alias="runId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
+    parent_request_id: str = Field(default="", alias="parentRequestId")
+    retry_of: str = Field(default="", alias="retryOf")
+    topic_id: str = Field(default="", alias="topicId", max_length=256)
+    checkpoint_id: str = Field(default="", alias="checkpointId", max_length=256)
+    protocol_version: str = Field(default="1.0", alias="protocolVersion", max_length=32)
+    graph_version: str = Field(default="", alias="graphVersion", max_length=32)
+    skill_catalog_version: str = Field(
+        default="", alias="skillCatalogVersion", max_length=32
+    )
+    skill_catalog_hash: str = Field(default="", alias="skillCatalogHash", max_length=71)
+    loaded_skill_versions: dict[str, str] = Field(
+        default_factory=dict,
+        alias="loadedSkillVersions",
+        max_length=32,
+    )
+    mcp_server_ids: list[str] = Field(
+        default_factory=list,
+        alias="mcpServerIds",
+        max_length=32,
+    )
+    tool_call_id: str = Field(alias="toolCallId")
+    call_id: str = Field(alias="callId")
+    idempotency_key: str = Field(alias="idempotencyKey")
+    tool_name: str = Field(alias="toolName")
+    status: Literal["success", "failed", "rejected", "cancelled"]
+    trace_id: str = Field(default="", alias="traceId")
+    turn: int = Field(default=0, ge=0)
+    duplicate: bool = False
+    success: bool
+    duration_ms: int = Field(default=0, alias="durationMs", ge=0)
+    sanitized_input: dict[str, Any] = Field(alias="sanitizedInput")
+    sanitized_output: Any = Field(alias="sanitizedOutput")
+    result_metadata: dict[str, Any] = Field(alias="resultMetadata")
+    artifact_ref: str = Field(default="", alias="artifactRef", max_length=2048)
+    source_artifact_ref: str = Field(
+        default="", alias="sourceArtifactRef", max_length=2048
+    )
+    inline_result: Any = Field(default=None, alias="inlineResult")
+    error: str = Field(default="", max_length=16_000)
+    created_at: str = Field(alias="createdAt")
+
+    @field_validator("conversation_id")
+    def _validate_tool_log_conversation_id(cls, value: str) -> str:
+        return validate_history_conversation_id(value)
+
+    @field_validator("run_id")
+    def _validate_tool_log_run_id(cls, value: str) -> str:
+        return validate_history_run_id(value)
+
+    @field_validator("request_id", "correlation_id", "parent_request_id", "retry_of")
+    def _validate_tool_log_request_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value) if value else value
+
+    @field_validator("topic_id", "checkpoint_id")
+    def _validate_tool_log_optional_ids(cls, value: str) -> str:
+        if value and not IDENTIFIER_RE.fullmatch(value):
+            raise ValueError("tool result audit identifier is invalid")
+        return value
+
+    @field_validator("skill_catalog_hash")
+    def _validate_tool_log_skill_catalog_hash(cls, value: str) -> str:
+        if value and not SHA256_RE.fullmatch(value):
+            raise ValueError("skillCatalogHash must be a sha256 hash")
+        return value
+
+    @field_validator("loaded_skill_versions")
+    def _validate_tool_log_skill_versions(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(
+            not IDENTIFIER_RE.fullmatch(skill_id) or not version or len(version) > 32
+            for skill_id, version in value.items()
+        ):
+            raise ValueError("loaded Skill version metadata is invalid")
+        return value
+
+    @field_validator("mcp_server_ids")
+    def _validate_tool_log_mcp_servers(cls, value: list[str]) -> list[str]:
+        if any(not IDENTIFIER_RE.fullmatch(item) for item in value):
+            raise ValueError("MCP server metadata is invalid")
+        if len(value) != len(set(value)):
+            raise ValueError("MCP server ids must be unique")
+        return value
+
+    @field_validator("result_metadata")
+    @classmethod
+    def _validate_result_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_bounded_json(
+            value,
+            label="tool result metadata",
+            max_chars=MAX_TRACE_VALUE_JSON_CHARS,
+        )
+
+    @field_validator("sanitized_input")
+    @classmethod
+    def _validate_sanitized_input(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_bounded_json(
+            value,
+            label="sanitized tool input",
+            max_chars=MAX_TOOL_ARGUMENTS_JSON_CHARS,
+        )
+
+    @field_validator("sanitized_output")
+    @classmethod
+    def _validate_sanitized_output(cls, value: Any) -> Any:
+        return _validate_bounded_json(
+            value,
+            label="sanitized tool output",
+            max_chars=MAX_TRACE_VALUE_JSON_CHARS,
+        )
+
+    @field_validator("inline_result")
+    @classmethod
+    def _validate_inline_result(cls, value: Any) -> Any:
+        return _validate_bounded_json(
+            value,
+            label="inline tool result",
+            max_chars=32_768,
+        )
 
 
 class ConversationSealRequest(_GatewayBaseModel):
@@ -1103,6 +1576,8 @@ class GatewayEventEnvelope(_GatewayBaseModel):
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")
     trace_id: str = Field(alias="traceId")
+    request_id: str = Field(alias="requestId")
+    correlation_id: str = Field(alias="correlationId")
     timestamp: str
     event_type: Literal["model.delta", "model.completed", "gateway.error"] = Field(alias="type")
     payload: dict[str, Any]
@@ -1129,6 +1604,10 @@ class GatewayEventEnvelope(_GatewayBaseModel):
         if not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("gateway event identifier is invalid")
         return value
+
+    @field_validator("request_id", "correlation_id")
+    def _validate_request_correlation_ids(cls, value: str) -> str:
+        return validate_uuid4_id(value)
 
     @field_validator("timestamp")
     def _validate_timestamp(cls, value: str) -> str:

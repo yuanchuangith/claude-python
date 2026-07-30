@@ -33,6 +33,9 @@ OTHER_RUN_ID = "run_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 SERVICE_AUTH_RUN_ID = "run_cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 SEAL_RUN_ID = "run_dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 FORWARDED_RUN_ID = "run_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+REQUEST_ID = "99999999-9999-4999-8999-999999999999"
+SECOND_REQUEST_ID = "98989898-9898-4898-8898-989898989898"
+CORRELATION_ID = "12121212-1212-4212-8212-121212121212"
 
 
 def make_settings(tmp_path, **overrides):
@@ -51,8 +54,10 @@ def make_settings(tmp_path, **overrides):
         "claude_code_default_model": "claude-sonnet-4-5",
         "claude_code_models": ["claude-sonnet-4-5"],
         "profile_store_path": tmp_path / "profiles.json",
+        "managed_secret_store_path": tmp_path / "managed-secrets.json",
         "profile_admin_token": "admin-token",
         "admin_allow_remote": True,
+        "admin_require_https_remote": False,
         "profile_allowed_hosts": [
             "token-plan-cn.xiaomimimo.com",
             "api.anthropic.com",
@@ -90,6 +95,8 @@ def chat_payload(**overrides):
         "provider": "mimo",
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "agentMode": "normal",
         "systemPrompt": "You are the ActionDesign system agent.",
         "prompt": "Create a node",
@@ -120,6 +127,18 @@ def identity_headers(payload, **extra):
     return {
         "X-Conversation-Id": payload["conversationId"],
         "X-Agent-Run-Id": payload["runId"],
+        "X-Request-Id": payload["requestId"],
+        "X-Correlation-Id": payload["correlationId"],
+        **(
+            {"X-Retry-Of": payload["retryOf"]}
+            if payload.get("retryOf")
+            else {}
+        ),
+        **(
+            {"X-Parent-Request-Id": payload["parentRequestId"]}
+            if payload.get("parentRequestId")
+            else {}
+        ),
         **extra,
     }
 
@@ -163,6 +182,8 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
     payload = {
         "conversationId": SERVICE_AUTH_CONVERSATION_ID,
         "runId": SERVICE_AUTH_RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "toolCallId": "call_service_auth",
         "toolName": "create_node",
         "arguments": {"elementKey": "ExitAction"},
@@ -218,7 +239,7 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
 
 def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
     schema = make_client(tmp_path).get("/openapi.json").json()
-    assert schema["info"]["version"] == "2.2.0"
+    assert schema["info"]["version"] == "3.1.0"
     protected = {
         ("/api/actiondesign-agent/chat", "post"),
         ("/api/actiondesign-agent/chat/stream", "post"),
@@ -228,8 +249,8 @@ def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
         ("/api/actiondesign-agent/claude-code/chat/stream", "post"),
         ("/api/actiondesign-agent/tool-result", "post"),
         ("/api/actiondesign-agent/conversations/{conversation_id}/seal", "post"),
-        ("/api/actiondesign-agent/mcp/gxp-lowcode-readonly/tools", "get"),
-        ("/api/actiondesign-agent/mcp/gxp-lowcode-readonly/call", "post"),
+        ("/api/actiondesign-agent/mcp/{server_id}/tools", "get"),
+        ("/api/actiondesign-agent/mcp/{server_id}/call", "post"),
         ("/api/actiondesign-agent/telemetry/langsmith/runs/batch", "post"),
     }
     for path, method in protected:
@@ -259,9 +280,11 @@ def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
         ("/api/actiondesign-agent/chat/stream", chat_payload(stream=True)),
         (
             "/api/actiondesign-agent/tool-result",
-            {
-                "conversationId": CONVERSATION_ID,
-                "runId": RUN_ID,
+                {
+                    "conversationId": CONVERSATION_ID,
+                    "runId": RUN_ID,
+                    "requestId": REQUEST_ID,
+                    "correlationId": CORRELATION_ID,
                 "toolCallId": "call_identity",
                 "toolName": "create_node",
                 "arguments": {"elementKey": "ExitAction"},
@@ -305,15 +328,11 @@ def test_request_identity_headers_are_required_and_must_match_body(tmp_path, pat
         "fields": ["X-Agent-Run-Id"],
     }
     assert mismatched_conversation.status_code == 409
-    assert mismatched_conversation.json()["detail"] == {
-        "code": "REQUEST_IDENTITY_MISMATCH",
-        "fields": ["conversationId"],
-    }
+    assert mismatched_conversation.json()["detail"]["code"] == "REQUEST_IDENTITY_MISMATCH"
+    assert mismatched_conversation.json()["detail"]["fields"] == ["conversationId"]
     assert mismatched_run.status_code == 409
-    assert mismatched_run.json()["detail"] == {
-        "code": "REQUEST_IDENTITY_MISMATCH",
-        "fields": ["runId"],
-    }
+    assert mismatched_run.json()["detail"]["code"] == "REQUEST_IDENTITY_MISMATCH"
+    assert mismatched_run.json()["detail"]["fields"] == ["runId"]
 
 
 def test_request_identity_body_fields_are_required_and_conversation_id_is_uuid4(tmp_path):
@@ -387,9 +406,11 @@ def test_request_identity_rejects_noncanonical_or_non_v4_conversation_ids(
         ("/api/actiondesign-agent/chat/stream", chat_payload(stream=True)),
         (
             "/api/actiondesign-agent/tool-result",
-            {
-                "conversationId": CONVERSATION_ID,
-                "runId": RUN_ID,
+                {
+                    "conversationId": CONVERSATION_ID,
+                    "runId": RUN_ID,
+                    "requestId": REQUEST_ID,
+                    "correlationId": CORRELATION_ID,
                 "toolCallId": "call_run_identity",
                 "toolName": "create_node",
             },
@@ -422,6 +443,8 @@ def test_sse_envelope_uses_runtime_identity_contract():
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
         "traceId": "trace_test",
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "timestamp": "2026-07-28T00:00:00Z",
         "type": "model.delta",
         "payload": {"content": "ok"},
@@ -450,7 +473,7 @@ def test_service_auth_seal_is_explicit_and_turn_failure_does_not_seal(tmp_path, 
             },
         )
 
-    monkeypatch.setattr(gateway_app, "call_mimo", failing_call)
+    monkeypatch.setattr(gateway_app, "call_provider", failing_call)
     client = make_client(
         tmp_path,
         service_auth_mode="required",
@@ -480,7 +503,11 @@ def test_service_auth_seal_is_explicit_and_turn_failure_does_not_seal(tmp_path, 
     )
     sealed = client.post(
         f"/api/actiondesign-agent/conversations/{SEAL_CONVERSATION_ID}/seal",
-        headers={"X-ActionDesign-Service-Token": service_token},
+        headers={
+            "X-ActionDesign-Service-Token": service_token,
+            "X-Request-Id": REQUEST_ID,
+            "X-Correlation-Id": CORRELATION_ID,
+        },
         json={"status": "completed"},
     )
 
@@ -488,7 +515,7 @@ def test_service_auth_seal_is_explicit_and_turn_failure_does_not_seal(tmp_path, 
     assert all(event["type"] != "conversation_sealed" for event in before_seal)
     assert denied.status_code == 401
     assert sealed.status_code == 200
-    assert sealed.headers["x-request-id"].startswith("req_")
+    assert sealed.headers["x-request-id"] == REQUEST_ID
     assert sealed.json() == {"success": True, "status": "completed"}
     assert conversation_events(
         tmp_path / "conversations",
@@ -570,7 +597,7 @@ def test_chat_forwards_native_tool_schema_and_records_details(tmp_path, monkeypa
             "usage": {"input_tokens": 10, "output_tokens": 4},
         }
 
-    monkeypatch.setattr(gateway_app, "call_mimo", fake_call)
+    monkeypatch.setattr(gateway_app, "call_provider", fake_call)
     payload = chat_payload()
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/mimo/chat",
@@ -642,7 +669,7 @@ def test_stream_uses_versioned_monotonic_sse_envelopes(tmp_path, monkeypatch):
             },
         }
 
-    monkeypatch.setattr(gateway_app, "stream_mimo", fake_stream)
+    monkeypatch.setattr(gateway_app, "stream_provider", fake_stream)
     payload = chat_payload(stream=True, traceId="trace_test")
     with make_client(tmp_path).stream(
         "POST",
@@ -683,7 +710,7 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
             yield {}
         raise RuntimeError("authorization=Bearer upstream-secret")
 
-    monkeypatch.setattr(gateway_app, "stream_mimo", fake_stream)
+    monkeypatch.setattr(gateway_app, "stream_provider", fake_stream)
     payload = chat_payload(stream=True, traceId="trace_secret")
     with make_client(tmp_path).stream(
         "POST",
@@ -702,7 +729,8 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
     assert events[0]["type"] == "gateway.error"
     serialized = json.dumps(events, ensure_ascii=False)
     assert "upstream-secret" not in serialized
-    assert "[REDACTED]" in serialized
+    assert "authorization" not in serialized.lower()
+    assert events[0]["payload"]["message"] == "Gateway request failed"
     persisted = json.dumps(
         conversation_events(tmp_path / "conversations", CONVERSATION_ID),
         ensure_ascii=False,
@@ -710,11 +738,191 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
     assert "upstream-secret" not in persisted
 
 
+def test_nonstream_provider_error_redacts_exact_configured_secret(
+    tmp_path,
+    monkeypatch,
+):
+    async def failing_call(_req, _profile):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "PROVIDER_STREAM_ERROR",
+                "message": "upstream echoed mimo-secret verbatim",
+                "retryable": False,
+                "failoverScope": "none",
+            },
+        )
+
+    monkeypatch.setattr(gateway_app, "call_provider", failing_call)
+    payload = chat_payload()
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    assert response.status_code == 502
+    assert "mimo-secret" not in response.text
+    assert response.json()["detail"]["message"] == (
+        "upstream echoed [REDACTED] verbatim"
+    )
+    persisted = json.dumps(
+        conversation_events(tmp_path / "conversations", CONVERSATION_ID),
+        ensure_ascii=False,
+    )
+    request_log = (tmp_path / "request-logs.jsonl").read_text(encoding="utf-8")
+    assert "mimo-secret" not in persisted
+    assert "mimo-secret" not in request_log
+
+
+def test_full_conversation_request_log_redacts_exact_configured_secret(
+    tmp_path,
+    monkeypatch,
+):
+    async def successful_call(req, _profile):
+        return {
+            "provider": "mimo",
+            "model": req.model or "mimo-v2.5",
+            "content": "ok",
+            "tool_calls": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "finish_reason": "stop"},
+        }
+
+    monkeypatch.setattr(gateway_app, "call_provider", successful_call)
+    payload = chat_payload(prompt="Never persist mimo-secret in the transcript")
+    response = make_client(tmp_path).post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    persisted = json.dumps(
+        conversation_events(tmp_path / "conversations", CONVERSATION_ID),
+        ensure_ascii=False,
+    )
+    assert "mimo-secret" not in persisted
+    assert "Never persist [REDACTED] in the transcript" in persisted
+
+
+def test_provider_success_redacts_exact_configured_secret_in_http_and_sse(
+    tmp_path,
+    monkeypatch,
+):
+    async def successful_call(req, _profile):
+        return {
+            "provider": "mimo",
+            "model": req.model or "mimo-v2.5",
+            "content": "provider echoed mimo-secret",
+            "tool_calls": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    async def successful_stream(req, _profile):
+        yield {"kind": "delta", "content": "mimo-secret"}
+        yield {
+            "kind": "completed",
+            "payload": {
+                "provider": "mimo",
+                "model": req.model or "mimo-v2.5",
+                "content": "mimo-secret",
+                "tool_calls": [],
+                "success": True,
+                "error": None,
+                "code": None,
+                "duration_ms": 1,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        }
+
+    monkeypatch.setattr(gateway_app, "call_provider", successful_call)
+    monkeypatch.setattr(gateway_app, "stream_provider", successful_stream)
+    client = make_client(tmp_path)
+    payload = chat_payload()
+    http_response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+    stream_payload = chat_payload(
+        conversationId=OTHER_CONVERSATION_ID,
+        runId=OTHER_RUN_ID,
+        requestId=SECOND_REQUEST_ID,
+        stream=True,
+    )
+    with client.stream(
+        "POST",
+        "/api/actiondesign-agent/mimo/chat/stream",
+        headers=identity_headers(stream_payload),
+        json=stream_payload,
+    ) as stream_response:
+        stream_text = "\n".join(stream_response.iter_lines())
+
+    assert http_response.status_code == 200
+    assert stream_response.status_code == 200
+    assert "mimo-secret" not in http_response.text
+    assert "mimo-secret" not in stream_text
+    assert "[REDACTED]" in http_response.text
+    assert "[REDACTED]" in stream_text
+
+
+def test_nonstream_unknown_provider_error_is_audited_without_secret_leak(
+    tmp_path,
+    monkeypatch,
+):
+    async def failing_call(_req, _profile):
+        raise RuntimeError("unexpected failure containing mimo-secret")
+
+    monkeypatch.setattr(gateway_app, "call_provider", failing_call)
+    payload = chat_payload()
+    client = make_client(tmp_path)
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "GATEWAY_ERROR"
+    assert "mimo-secret" not in response.text
+    events = conversation_events(tmp_path / "conversations", CONVERSATION_ID)
+    assert [event["type"] for event in events] == [
+        "gateway_request",
+        "gateway_error",
+    ]
+    assert events[-1]["turnStatus"] == "error"
+    request_entries = [
+        json.loads(line)
+        for line in (tmp_path / "request-logs.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert request_entries[-1]["status"] == "error"
+    assert request_entries[-1]["httpStatus"] == 500
+    assert "mimo-secret" not in json.dumps(events + request_entries)
+    health = client.get(
+        "/api/actiondesign-agent/admin/profiles/default-mimo/health",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert health.json()["status"] == "unhealthy"
+
+
 def test_tool_result_logging_is_idempotent(tmp_path):
     client = make_client(tmp_path)
     payload = {
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "toolCallId": "call_1",
         "toolName": "create_node",
         "arguments": {
@@ -733,15 +941,20 @@ def test_tool_result_logging_is_idempotent(tmp_path):
         headers=identity_headers(payload),
         json=payload,
     )
+    retry_payload = {
+        **payload,
+        "requestId": SECOND_REQUEST_ID,
+        "retryOf": first.headers["x-request-id"],
+    }
     second = client.post(
         "/api/actiondesign-agent/tool-result",
-        headers=identity_headers(payload),
-        json=payload,
+        headers=identity_headers(retry_payload),
+        json=retry_payload,
     )
 
     assert first.status_code == 200
-    assert first.headers["x-request-id"].startswith("req_")
-    assert second.headers["x-request-id"].startswith("req_")
+    assert first.headers["x-request-id"] == REQUEST_ID
+    assert second.headers["x-request-id"] == SECOND_REQUEST_ID
     assert first.headers["x-request-id"] != second.headers["x-request-id"]
     assert first.json()["duplicate"] is False
     assert second.json()["duplicate"] is True
@@ -751,9 +964,9 @@ def test_tool_result_logging_is_idempotent(tmp_path):
         first.headers["x-request-id"],
         second.headers["x-request-id"],
     ]
-    assert all(event["arguments"]["apiKey"] == "[REDACTED]" for event in events)
+    assert all(event["sanitizedInput"]["apiKey"] == "[REDACTED]" for event in events)
     assert all(
-        event["result"]["authorization"] == "[REDACTED]" for event in events
+        event["inlineResult"]["authorization"] == "[REDACTED]" for event in events
     )
     persisted = json.dumps(events, ensure_ascii=False)
     assert "tool-argument-secret" not in persisted
@@ -765,6 +978,53 @@ def test_tool_result_logging_is_idempotent(tmp_path):
     )
     assert len(canonical) == 1
     assert canonical[0]["requestId"] == first.headers["x-request-id"]
+
+
+def test_tool_result_idempotency_uses_tool_call_id_and_survives_restart(tmp_path):
+    payload = {
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
+        "toolCallId": "call_persisted",
+        "callId": "transport_call_a",
+        "idempotencyKey": "caller_key_a",
+        "toolName": "create_node",
+        "arguments": {"elementKey": "ExitAction"},
+        "status": "success",
+        "result": {"nodeKey": "node_persisted"},
+    }
+    first_client = make_client(tmp_path)
+    first = first_client.post(
+        "/api/actiondesign-agent/tool-result",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    second_payload = {
+        **payload,
+        "requestId": SECOND_REQUEST_ID,
+        "callId": "transport_call_b",
+        "idempotencyKey": "caller_key_b",
+        "retryOf": REQUEST_ID,
+    }
+    restarted_client = make_client(tmp_path)
+    second = restarted_client.post(
+        "/api/actiondesign-agent/tool-result",
+        headers=identity_headers(second_payload),
+        json=second_payload,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+    canonical = audit_events(
+        tmp_path / "audit",
+        CONVERSATION_ID,
+        "tool-results.jsonl",
+    )
+    assert len(canonical) == 1
+    assert canonical[0]["toolCallId"] == "call_persisted"
 
 
 def test_profile_admin_path_id_is_strictly_validated(tmp_path):
@@ -821,6 +1081,8 @@ def test_tool_result_rejects_coerced_and_unbounded_json(tmp_path):
     base = {
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "toolCallId": "call_1",
         "toolName": "create_node",
         "arguments": {"elementKey": "ExitAction"},
@@ -890,6 +1152,35 @@ def test_profile_admin_never_echoes_secret(tmp_path):
     assert events[1]["success"] is True
     audit_text = json.dumps(events, ensure_ascii=False)
     assert "managed-secret" not in audit_text
+
+
+@pytest.mark.parametrize("unsafe_request_id", ["../escape", "r" * 257])
+def test_admin_mutation_rejects_unsafe_audit_request_header(
+    tmp_path,
+    unsafe_request_id,
+):
+    client = make_client(tmp_path)
+    headers = {
+        "Authorization": "Bearer admin-token",
+        "X-Request-Id": unsafe_request_id,
+    }
+
+    response = client.post(
+        "/api/actiondesign-agent/admin/access-key/rotate",
+        headers=headers,
+        json={"apiKey": "browser-key-that-must-not-be-persisted"},
+    )
+    status = client.get(
+        "/api/actiondesign-agent/admin/access-key",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_REQUEST_ID"
+    assert status.status_code == 200
+    assert status.json()["configured"] is False
+    audit_path = tmp_path / "audit" / "system" / "admin-audit.jsonl"
+    assert not audit_path.exists()
 
 
 def test_dynamic_openai_channel_routes_through_generic_endpoint_and_logs_metadata(
@@ -966,7 +1257,7 @@ def test_dynamic_openai_channel_routes_through_generic_endpoint_and_logs_metadat
 
     assert created.status_code == 200
     assert response.status_code == 200
-    assert response.headers["x-request-id"].startswith("req_")
+    assert response.headers["x-request-id"] == REQUEST_ID
     assert captured["profile"].id == "team-openai"
     assert captured["profile"].protocol == "openai"
     assert logs.status_code == 200
@@ -1195,6 +1486,11 @@ def test_removed_agent_endpoints_are_not_registered(tmp_path):
         "/api/actiondesign-agent/knowledge/search",
         "/api/actiondesign-agent/knowledge/read",
         "/api/actiondesign-agent/knowledge/upload",
+        "/api/actiondesign-agent/agent/plan",
+        "/api/actiondesign-agent/agent/completion",
+        "/api/actiondesign-agent/review",
+        "/api/actiondesign-agent/topic/classify",
+        "/api/actiondesign-agent/canvas/write",
     ]:
         assert client.post(path, json={}).status_code == 404
 
@@ -1204,6 +1500,8 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
         "schemaVersion": "1.0",
         "eventId": "event_1",
         "traceId": "trace_1",
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "traceRunId": "trace_run_1",
         "agentRunId": RUN_ID,
         "name": "actiondesign-agent",
@@ -1223,14 +1521,21 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
             "agentMode": "normal",
         },
     }
+    batch = {
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
+        "sequence": 1,
+        "schemaVersion": "1.0",
+        "contentLevel": "sanitized",
+        "sentAt": "2026-07-25T00:00:00Z",
+        "events": [trace_event],
+    }
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
-        json={
-            "schemaVersion": "1.0",
-            "contentLevel": "sanitized",
-            "sentAt": "2026-07-25T00:00:00Z",
-            "events": [trace_event],
-        },
+        headers=identity_headers(batch),
+        json=batch,
     )
 
     assert response.status_code == 200
@@ -1249,6 +1554,68 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
         "type": "langsmith_trace_batch_result",
         **body,
     }
+    session_events = conversation_events(tmp_path / "conversations", CONVERSATION_ID)
+    assert session_events[0]["type"] == "trace"
+    assert session_events[0]["trace"]["eventId"] == "event_1"
+    assert session_events[0]["trace"]["metadata"]["conversationId"] == CONVERSATION_ID
+
+
+def test_langsmith_batch_requires_canonical_runtime_identity(tmp_path):
+    client = make_client(tmp_path)
+
+    def trace_event(*, conversation_id=CONVERSATION_ID, run_id=RUN_ID):
+        return {
+            "schemaVersion": "1.0",
+            "eventId": "provider.event:1",
+            "traceId": "provider.trace:1",
+            "traceRunId": "provider.tree:1",
+            "parentTraceRunId": "provider.parent:1",
+            "agentRunId": run_id,
+            "requestId": REQUEST_ID,
+            "correlationId": CORRELATION_ID,
+            "name": "actiondesign-agent",
+            "runType": "graph",
+            "event": "start",
+            "timestamp": "2026-07-25T00:00:00Z",
+            "metadata": {
+                "environment": "test",
+                "conversationId": conversation_id,
+                "graphVersion": "1.1.0",
+                "protocolVersion": "1.0",
+                "promptManifestVersion": "2.0.0",
+                "promptManifestHash": "sha256:" + ("a" * 64),
+                "toolCatalogVersion": "1.1.0",
+                "toolCatalogHash": "sha256:" + ("b" * 64),
+                "agentMode": "normal",
+            },
+        }
+
+    def send(event):
+        batch = {
+            "conversationId": event["metadata"]["conversationId"],
+            "runId": event["agentRunId"],
+            "requestId": REQUEST_ID,
+            "correlationId": CORRELATION_ID,
+            "sequence": 1,
+            "schemaVersion": "1.0",
+            "contentLevel": "sanitized",
+            "sentAt": "2026-07-25T00:00:00Z",
+            "events": [event],
+        }
+        return client.post(
+            "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
+            headers=identity_headers(batch),
+            json=batch,
+        )
+
+    assert send(trace_event()).status_code == 200
+    invalid_events = [
+        trace_event(conversation_id="legacy_conversation"),
+        trace_event(conversation_id="AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"),
+        trace_event(run_id="run_test"),
+        trace_event(run_id="run_11111111-1111-1111-8111-111111111111"),
+    ]
+    assert [send(event).status_code for event in invalid_events] == [422] * 4
 
 
 def test_langsmith_trace_rejects_unbounded_inputs(tmp_path):
@@ -1256,6 +1623,8 @@ def test_langsmith_trace_rejects_unbounded_inputs(tmp_path):
         "schemaVersion": "1.0",
         "eventId": "event_1",
         "traceId": "trace_1",
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "traceRunId": "trace_run_1",
         "agentRunId": RUN_ID,
         "name": "actiondesign-agent",
@@ -1276,26 +1645,30 @@ def test_langsmith_trace_rejects_unbounded_inputs(tmp_path):
         },
     }
 
+    batch = {
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
+        "sequence": 1,
+        "schemaVersion": "1.0",
+        "contentLevel": "sanitized",
+        "sentAt": "2026-07-25T00:00:00Z",
+        "events": [trace_event],
+    }
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
-        json={
-            "schemaVersion": "1.0",
-            "contentLevel": "sanitized",
-            "sentAt": "2026-07-25T00:00:00Z",
-            "events": [trace_event],
-        },
+        headers=identity_headers(batch),
+        json=batch,
     )
 
     assert response.status_code == 422
 
+    invalid_batch = {**batch, "schemaVersion": "9.9"}
     invalid_version = make_client(tmp_path).post(
         "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
-        json={
-            "schemaVersion": "9.9",
-            "contentLevel": "sanitized",
-            "sentAt": "2026-07-25T00:00:00Z",
-            "events": [trace_event],
-        },
+        headers=identity_headers(invalid_batch),
+        json=invalid_batch,
     )
     assert invalid_version.status_code == 422
 
@@ -1310,52 +1683,71 @@ def test_langsmith_forward_result_is_written_to_audit_log(
     forwarded,
     expected_status,
 ):
-    async def fake_forward_trace_batch(_settings, _events):
+    forwarded_events = []
+
+    async def fake_forward_trace_batch(_settings, events):
+        forwarded_events.extend(events)
         return forwarded
 
     monkeypatch.setattr(gateway_app, "forward_trace_batch", fake_forward_trace_batch)
+    batch = {
+        "conversationId": FORWARDED_CONVERSATION_ID,
+        "runId": FORWARDED_RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
+        "sequence": 1,
+        "schemaVersion": "1.0",
+        "contentLevel": "sanitized",
+        "sentAt": "2026-07-25T00:00:00Z",
+        "events": [
+            {
+                "schemaVersion": "1.0",
+                "eventId": "event_forwarded",
+                "traceId": "trace_forwarded",
+                "requestId": REQUEST_ID,
+                "correlationId": CORRELATION_ID,
+                "traceRunId": "trace_forwarded",
+                "agentRunId": FORWARDED_RUN_ID,
+                "name": "actiondesign-agent",
+                "runType": "graph",
+                "event": "start",
+                "timestamp": "2026-07-25T00:00:00Z",
+                "inputs": {"echo": "langsmith-secret"},
+                "tags": ["actiondesign"],
+                "metadata": {
+                    "environment": "test",
+                    "conversationId": FORWARDED_CONVERSATION_ID,
+                    "graphVersion": "1.9.0",
+                    "protocolVersion": "1.0",
+                    "promptManifestVersion": "2.2.0",
+                    "promptManifestHash": "sha256:" + ("a" * 64),
+                    "toolCatalogVersion": "1.5.0",
+                    "toolCatalogHash": "sha256:" + ("b" * 64),
+                    "agentMode": "normal",
+                },
+            }
+        ],
+    }
     response = make_client(
         tmp_path,
         langsmith_enabled=True,
         langsmith_api_key="langsmith-secret",
     ).post(
         "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
-        json={
-            "schemaVersion": "1.0",
-            "contentLevel": "sanitized",
-            "sentAt": "2026-07-25T00:00:00Z",
-            "events": [
-                {
-                    "schemaVersion": "1.0",
-                    "eventId": "event_forwarded",
-                    "traceId": "trace_forwarded",
-                    "traceRunId": "trace_forwarded",
-                    "agentRunId": FORWARDED_RUN_ID,
-                    "name": "actiondesign-agent",
-                    "runType": "graph",
-                    "event": "start",
-                    "timestamp": "2026-07-25T00:00:00Z",
-                    "tags": ["actiondesign"],
-                    "metadata": {
-                        "environment": "test",
-                        "conversationId": FORWARDED_CONVERSATION_ID,
-                        "graphVersion": "1.9.0",
-                        "protocolVersion": "1.0",
-                        "promptManifestVersion": "2.2.0",
-                        "promptManifestHash": "sha256:" + ("a" * 64),
-                        "toolCatalogVersion": "1.5.0",
-                        "toolCatalogHash": "sha256:" + ("b" * 64),
-                        "agentMode": "normal",
-                    },
-                }
-            ],
-        },
+        headers=identity_headers(batch),
+        json=batch,
     )
 
     assert response.status_code == 200
     body = response.json()
+    echoed_request_id = response.headers["x-request-id"]
     assert body == {
         "exportBatchId": body["exportBatchId"],
+        "conversationId": FORWARDED_CONVERSATION_ID,
+        "runId": FORWARDED_RUN_ID,
+        "requestId": echoed_request_id,
+        "correlationId": CORRELATION_ID,
+        "sequence": 1,
         "accepted": forwarded[0],
         "rejected": forwarded[1],
         "status": expected_status,
@@ -1369,17 +1761,293 @@ def test_langsmith_forward_result_is_written_to_audit_log(
         "type": "langsmith_trace_batch_result",
         **body,
     }
+    assert forwarded_events[0]["inputs"]["echo"] == "[REDACTED]"
+    persisted = json.dumps(events, ensure_ascii=False)
+    assert "langsmith-secret" not in persisted
 
 
 def test_langsmith_rejects_incomplete_trace_envelope(tmp_path):
+    batch = {
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
+        "sequence": 1,
+        "schemaVersion": "1.0",
+        "contentLevel": "sanitized",
+        "sentAt": "2026-07-25T00:00:00Z",
+        "events": [{"eventId": "event_1"}],
+    }
     response = make_client(tmp_path).post(
         "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
-        json={
-            "schemaVersion": "1.0",
-            "contentLevel": "sanitized",
-            "sentAt": "2026-07-25T00:00:00Z",
-            "events": [{"eventId": "event_1"}],
-        },
+        headers=identity_headers(batch),
+        json=batch,
     )
 
     assert response.status_code == 422
+
+
+def test_request_and_correlation_headers_are_required_and_must_match_body(
+    tmp_path,
+    monkeypatch,
+):
+    async def successful_call(req, _profile):
+        return {
+            "provider": "mimo",
+            "model": req.model or "mimo-v2.5",
+            "content": "ok",
+            "tool_calls": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "finish_reason": "stop"},
+        }
+
+    monkeypatch.setattr(gateway_app, "call_provider", successful_call)
+    client = make_client(tmp_path)
+    payload = chat_payload()
+    missing = client.post(
+        "/api/actiondesign-agent/chat",
+        headers={
+            "X-Conversation-Id": CONVERSATION_ID,
+            "X-Agent-Run-Id": RUN_ID,
+        },
+        json=payload,
+    )
+    mismatched_header_request_id = client.post(
+        "/api/actiondesign-agent/chat",
+        headers=identity_headers(
+            payload,
+            **{"X-Request-Id": SECOND_REQUEST_ID},
+        ),
+        json=payload,
+    )
+    mismatched_body_request_id = client.post(
+        "/api/actiondesign-agent/chat",
+        headers=identity_headers(payload),
+        json={**payload, "requestId": SECOND_REQUEST_ID},
+    )
+    accepted = client.post(
+        "/api/actiondesign-agent/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["code"] == "REQUEST_CORRELATION_REQUIRED"
+    assert mismatched_header_request_id.status_code == 409
+    assert mismatched_header_request_id.json()["detail"]["code"] == "REQUEST_CORRELATION_MISMATCH"
+    assert mismatched_body_request_id.status_code == 409
+    assert mismatched_body_request_id.json()["detail"]["code"] == "REQUEST_CORRELATION_MISMATCH"
+    assert accepted.status_code == 200
+    assert accepted.headers["x-request-id"] == REQUEST_ID
+    assert accepted.json()["requestId"] == REQUEST_ID
+
+
+def test_nonstream_error_echoes_full_runtime_identity(tmp_path, monkeypatch):
+    async def failing_call(_req, _profile):
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "PROVIDER_TIMEOUT", "message": "timed out"},
+        )
+
+    monkeypatch.setattr(gateway_app, "call_provider", failing_call)
+    payload = chat_payload()
+    response = make_client(tmp_path).post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+
+    assert response.status_code == 502
+    echoed_request_id = response.headers["x-request-id"]
+    assert echoed_request_id == REQUEST_ID
+    assert response.headers["x-correlation-id"] == CORRELATION_ID
+    detail = response.json()["detail"]
+    assert detail["conversationId"] == CONVERSATION_ID
+    assert detail["runId"] == RUN_ID
+    assert detail["requestId"] == echoed_request_id
+    assert detail["correlationId"] == CORRELATION_ID
+    assert detail["sequence"] == 1
+
+
+def test_transcript_reconstruction_deduplicates_retry_and_externalizes_large_tool_result(
+    tmp_path,
+    monkeypatch,
+):
+    async def successful_call(req, _profile):
+        return {
+            "provider": "mimo",
+            "model": req.model or "mimo-v2.5",
+            "content": "assistant answer",
+            "tool_calls": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 2,
+            "usage": {"input_tokens": 2, "output_tokens": 3, "finish_reason": "stop"},
+        }
+
+    monkeypatch.setattr(gateway_app, "call_provider", successful_call)
+    client = make_client(tmp_path)
+    first_payload = chat_payload(userId="user-1", topicId="topic-1", prompt="Visible user text")
+    first = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(first_payload),
+        json=first_payload,
+    )
+    retry_payload = {
+        **first_payload,
+        "requestId": SECOND_REQUEST_ID,
+        "retryOf": first.headers["x-request-id"],
+    }
+    retry = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(retry_payload),
+        json=retry_payload,
+    )
+    tool_request_id = "97979797-9797-4797-8797-979797979797"
+    tool_payload = {
+        "conversationId": CONVERSATION_ID,
+        "runId": RUN_ID,
+        "requestId": tool_request_id,
+        "correlationId": CORRELATION_ID,
+        "toolCallId": "call_large",
+        "callId": "call_large",
+        "idempotencyKey": "idem_large",
+        "toolName": "inspect_action",
+        "arguments": {"actionId": "action-1"},
+        "status": "success",
+        "durationMs": 7,
+        "result": {
+            "outputText": "large result " * 4_000,
+            "apiKey": "artifact-secret-value",
+        },
+    }
+    tool = client.post(
+        "/api/actiondesign-agent/tool-result",
+        headers=identity_headers(tool_payload),
+        json=tool_payload,
+    )
+    transcript = client.get(
+        f"/api/actiondesign-agent/admin/conversations/{CONVERSATION_ID}/transcript",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    listing = client.get(
+        "/api/actiondesign-agent/admin/conversations",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    request_detail = client.get(
+        f"/api/actiondesign-agent/admin/request-logs/{first.headers['x-request-id']}",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert tool.status_code == 200
+    assert transcript.status_code == 200
+    assert transcript.json()["incompleteReason"] == ""
+    messages = transcript.json()["messages"]
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "assistant",
+        "tool",
+    ]
+    assert [message["sequence"] for message in messages] == [1, 2, 3, 4, 5]
+    assert sum(message["role"] == "user" for message in messages) == 1
+    assert messages[-1]["toolResultRefs"][0].startswith("artifact:sha256:")
+    assert json.loads(messages[-1]["content"])["outputText"] == "large result " * 4_000
+    assert json.loads(messages[-1]["content"])["apiKey"] == "[REDACTED]"
+    assert messages[-1]["incompleteReason"] == ""
+    summary = listing.json()["items"][0]
+    assert summary["title"] == "Visible user text"
+    assert summary["userId"] == "user-1"
+    assert summary["topicId"] == "topic-1"
+    assert summary["firstRunId"] == RUN_ID
+    assert summary["latestRunId"] == RUN_ID
+    assert summary["messageCount"] == 5
+    assert summary["toolResultCount"] == 1
+    detail = request_detail.json()
+    assert detail["correlationId"] == CORRELATION_ID
+    assert detail["endpoint"] == "/api/actiondesign-agent/mimo/chat"
+    assert detail["stopReason"] == "stop"
+    assert "prompt" not in detail["requestMetadata"]
+    assert "systemPrompt" not in detail["requestMetadata"]
+    assert detail["responseMetadata"]["contentSha256"].startswith("sha256:")
+    tool_log = audit_events(
+        tmp_path / "audit",
+        CONVERSATION_ID,
+        "tool-results.jsonl",
+    )[0]
+    assert tool_log["inlineResult"] is None
+    assert tool_log["artifactRef"].startswith("artifact:sha256:")
+    assert tool_log["resultMetadata"]["artifactStored"] is True
+    assert tool_log["resultMetadata"]["characters"] > 32_768
+    assert "x" * 256 not in json.dumps(tool_log, ensure_ascii=False)
+    artifact_files = list(
+        (tmp_path / "conversations" / "artifacts" / CONVERSATION_ID).glob("*.json")
+    )
+    assert len(artifact_files) == 1
+    artifact_payload = json.loads(artifact_files[0].read_text(encoding="utf-8"))
+    assert artifact_payload["outputText"] == "large result " * 4_000
+    assert artifact_payload["apiKey"] == "[REDACTED]"
+    assert "artifact-secret-value" not in artifact_files[0].read_text(encoding="utf-8")
+    artifact_files[0].unlink()
+    incomplete_transcript = client.get(
+        f"/api/actiondesign-agent/admin/conversations/{CONVERSATION_ID}/transcript",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert incomplete_transcript.status_code == 200
+    incomplete_tool_message = incomplete_transcript.json()["messages"][-1]
+    assert incomplete_tool_message["incompleteReason"] == "artifact_missing_or_invalid"
+
+
+def test_transcript_marks_corrupt_jsonl_as_incomplete(tmp_path, monkeypatch):
+    async def successful_call(req, _profile):
+        return {
+            "provider": "mimo",
+            "model": req.model or "mimo-v2.5",
+            "content": "assistant answer",
+            "tool_calls": [],
+            "success": True,
+            "error": None,
+            "code": None,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "finish_reason": "stop"},
+        }
+
+    monkeypatch.setattr(gateway_app, "call_provider", successful_call)
+    client = make_client(tmp_path)
+    payload = chat_payload(prompt="Visible request")
+    response = client.post(
+        "/api/actiondesign-agent/mimo/chat",
+        headers=identity_headers(payload),
+        json=payload,
+    )
+    assert response.status_code == 200
+
+    matches = list(
+        (tmp_path / "conversations").glob(
+            f"????????_??????_{CONVERSATION_ID}.jsonl"
+        )
+    )
+    assert len(matches) == 1
+    with matches[0].open("a", encoding="utf-8") as handle:
+        handle.write("{corrupt-jsonl-event}\n")
+
+    transcript = client.get(
+        f"/api/actiondesign-agent/admin/conversations/{CONVERSATION_ID}/transcript",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    reconstruction = client.get(
+        f"/api/actiondesign-agent/admin/conversations/{CONVERSATION_ID}/reconstruction",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+
+    assert transcript.status_code == reconstruction.status_code == 200
+    assert transcript.json()["incompleteReason"] == "invalid_jsonl_event"
+    assert reconstruction.json()["incompleteReason"] == "invalid_jsonl_event"
+    assert transcript.json()["messages"]

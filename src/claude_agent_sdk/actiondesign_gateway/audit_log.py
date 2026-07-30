@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .models import AuditLogEntry
 from .redaction import redact_value
 
 
@@ -33,14 +34,16 @@ class AuditLogStore:
         request_id: str,
         details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "action": action[:128],
-            "success": success,
-            "actor": actor[:256],
-            "requestId": request_id[:256],
-            "details": redact_value(details or {}),
-        }
+        entry = AuditLogEntry.model_validate(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": action[:128],
+                "success": success,
+                "actor": actor[:256],
+                "requestId": request_id,
+                "details": redact_value(details or {}),
+            }
+        ).model_dump(mode="json", by_alias=True)
         serialized = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         size = len(serialized.encode("utf-8")) + 1
         with self._lock:
@@ -73,8 +76,17 @@ class AuditLogStore:
                         value = json.loads(line)
                     except (ValueError, TypeError):
                         continue
-                    if isinstance(value, dict):
-                        entries.append(value)
+                    if not isinstance(value, dict):
+                        continue
+                    try:
+                        entries.append(
+                            AuditLogEntry.model_validate(value).model_dump(
+                                mode="json",
+                                by_alias=True,
+                            )
+                        )
+                    except (ValueError, TypeError):
+                        continue
         entries.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
         return entries[offset : offset + limit], len(entries)
 

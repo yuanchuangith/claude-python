@@ -63,7 +63,7 @@ tar -czf "$ARCHIVE" \
   --exclude="__pycache__" \
   --exclude="*.pyc" \
   --exclude=".pytest_cache" \
-  src tests pyproject.toml README.md claude-agent-sdk.md
+  src tests scripts pyproject.toml README.md claude-agent-sdk.md
 
 SIZE=$(stat -c%s "$ARCHIVE" 2>/dev/null || stat -f%z "$ARCHIVE")
 echo "  archive: $ARCHIVE ($((SIZE / 1024)) KB)"

@@ -16,6 +16,8 @@ from claude_agent_sdk.actiondesign_gateway.settings import Settings
 
 CONVERSATION_ID = "66666666-6666-4666-8666-666666666666"
 RUN_ID = "run_66666666-6666-4666-8666-666666666666"
+REQUEST_ID = "77777777-7777-4777-8777-777777777777"
+CORRELATION_ID = "88888888-8888-4888-8888-888888888888"
 
 
 def make_settings(tmp_path, **overrides):
@@ -32,6 +34,7 @@ def make_settings(tmp_path, **overrides):
         "profile_admin_token": "legacy-admin-token",
         "admin_password": "ailxhmm12",
         "admin_allow_remote": True,
+        "admin_require_https_remote": False,
         "browser_api_key_store_path": tmp_path / "secrets" / "browser-key.json",
         "profile_allowed_hosts": ["api.example.test", "api.anthropic.com", "token-plan-cn.xiaomimimo.com"],
         "langsmith_enabled": False,
@@ -93,6 +96,8 @@ def chat_payload(**overrides):
     payload = {
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "systemPrompt": "system secret-free instructions",
         "prompt": "full user request",
         "maxTokens": 1024,
@@ -105,6 +110,8 @@ def identity_headers(**extra):
     return {
         "X-Conversation-Id": CONVERSATION_ID,
         "X-Agent-Run-Id": RUN_ID,
+        "X-Request-Id": REQUEST_ID,
+        "X-Correlation-Id": CORRELATION_ID,
         **extra,
     }
 
@@ -372,7 +379,7 @@ def test_admin_login_browser_key_audit_and_conversation_endpoints(tmp_path, monk
     async def fake_mimo(req, profile):
         return success(req, profile)
 
-    monkeypatch.setattr(gateway_app, "call_mimo", fake_mimo)
+    monkeypatch.setattr(gateway_app, "call_provider", fake_mimo)
     login = client.post(
         "/api/actiondesign-agent/admin/login",
         json={"password": "ailxhmm12"},
@@ -472,6 +479,33 @@ def test_admin_remote_access_is_disabled_by_default(tmp_path):
     assert login.status_code == 403
     assert login.json()["detail"]["code"] == "ADMIN_REMOTE_DISABLED"
     assert profiles.status_code == 403
+
+
+def test_admin_remote_access_requires_https_when_enabled(tmp_path):
+    app = create_app(
+        make_settings(
+            tmp_path,
+            admin_allow_remote=True,
+            admin_require_https_remote=True,
+        ),
+        profile_secret_store=MemoryProfileSecretStore(),
+    )
+    http_client = TestClient(app, base_url="http://testserver")
+    https_client = TestClient(app, base_url="https://testserver")
+
+    denied = http_client.post(
+        "/api/actiondesign-agent/admin/login",
+        json={"password": "ailxhmm12"},
+    )
+    accepted = https_client.post(
+        "/api/actiondesign-agent/admin/login",
+        json={"password": "ailxhmm12"},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "ADMIN_HTTPS_REQUIRED"
+    assert accepted.status_code == 200
+    assert accepted.json()["sessionToken"]
 
 
 def test_admin_login_is_disabled_without_server_password(tmp_path):

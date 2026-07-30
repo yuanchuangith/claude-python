@@ -1,4 +1,4 @@
-# ActionDesign Thin Agent Gateway
+# ActionDesign Thin Gateway
 
 该服务是 ActionDesign 前端 LangGraph Agent 的轻量 Python 网关。它不是 Agent 运行时。
 
@@ -10,7 +10,7 @@
 - 记录 request、response、usage、耗时、错误和前端 tool result。
 - 管理 API Profile 与 Key，API 永不回显 secret。
 - 脱敏转发前端 LangGraph trace 到 LangSmith。
-- 通过固定 server ID 和固定工具白名单转发 `gxp-lowcode-readonly` stdio MCP；只做传输、校验、超时和元数据日志。
+- 通过环境只读或管理员 managed 的通用 stdio/streamable HTTP MCP proxy 注入目标 Secret、透传 Schema/result，并记录元数据日志。
 - 使用 Pydantic v2 校验请求、配置、SSE、响应、Profile、tool result 和 trace；使用 Draft 2020-12 JSON Schema 校验 Provider 返回的动态工具参数。
 
 ## 明确不负责
@@ -20,7 +20,7 @@
 - 不执行 Review、Topic classifier、计划闸门或完成闸门。
 - 不提供知识库、embedding、Markdown index 或 Qdrant。
 - 不接受任意 URL 转发；受管 Profile host 必须在 allowlist 中，OpenAI `/v1/chat/completions` 或 Claude `/v1/messages` path 由网关按协议规范化。
-- 不接受浏览器传入 MCP 命令、脚本路径、环境变量或任意 server ID；不复制 GXP 查询业务逻辑，不执行数据库或设计写入。
+- 普通 MCP runtime 请求不接受浏览器传入命令、脚本路径、环境变量或任意目标 authority；只有管理员 Bearer 管理 API 可以提交 strict Server 配置，且不能扩大部署级 allowlist。不复制 GXP 查询业务逻辑，不执行数据库或设计写入。
 
 ## 启动
 
@@ -70,7 +70,7 @@ Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and
   "skillCatalogVersion": "1.0.0",
   "skillCatalogHash": "sha256:...",
   "loadedSkillVersions": { "gxp-lowcode-debug": "1.0.0" },
-  "mcpServerIds": ["gxp-lowcode-readonly"],
+  "mcpServerIds": ["shared-readonly"],
   "tools": [
     {
       "name": "inspect_action",
@@ -88,7 +88,7 @@ Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and
 
 `systemPrompt` 是必填非空字段，并映射到 Provider 的独立 `system` 字段；不会拼接到普通 `prompt`。缺失、仅空白、超长或结构不合法的请求在发起 Provider 调用前返回 422。
 
-网关只做通用传输层结构校验，不维护 ActionDesign 画布业务工具白名单。业务工具名称、计划范围、画布目标、写入冲突和完成闸门继续由前端 LangGraph 校验。只读 MCP 转发例外地维护固定的传输安全白名单：唯一 server ID 为 `gxp-lowcode-readonly`，唯一工具集合为代码中 11 个只读工具；该白名单不能由请求覆盖，也不负责业务调用顺序。
+网关只做通用传输层结构校验，不维护 ActionDesign 画布业务工具白名单。业务工具名称、计划范围、画布目标、写入冲突和完成闸门继续由前端 LangGraph 校验。MCP Server 与 transport 由管理员固定配置，请求不能覆盖 URL、command、Secret 或认证绑定；网关只校验调用方指定的工具确实由该 Server 的实时 tools/list 暴露。
 
 非流式响应：
 
@@ -131,17 +131,18 @@ data: {"protocolVersion":"1.0","sequence":2,"conversationId":"11111111-1111-4111
 
 该接口只记录前端工具执行结果，并按 `conversationId + runId + toolCallId` 幂等；不会触发下一轮模型调用。
 
-### GXP 只读 MCP
+### 通用 MCP transport / Secret proxy
 
-- `GET /api/actiondesign-agent/mcp/gxp-lowcode-readonly/tools`
-- `POST /api/actiondesign-agent/mcp/gxp-lowcode-readonly/call`
+- `GET /api/actiondesign-agent/mcp/{serverId}/tools`
+- `POST /api/actiondesign-agent/mcp/{serverId}/call`
 
 规则：
 
-- 只允许 `connection_status`、`diagnose_codex_input`、`resolve_action`、`get_design_versions`、`inspect_action`、`compare_designs`、`trace_dynamic_exception`、`describe_table`、`get_records`、`evaluate_node_predicate`、`readonly_sql`。
-- 请求只能提交固定工具名和参数，不能提交进程命令、脚本路径、工作目录或环境变量。
-- MCP 子进程只继承运行所需的系统环境，不继承 Provider Key、LangSmith Key 或 Profile Admin Token。
-- `connection_status` 响应会删除配置路径和连接字段；调用日志只记录参数/result 的 hash、长度、键名、耗时和版本，不保存原始查询或业务结果。
+- MCP Server 来自环境只读配置或管理员 managed store；普通调用方只能提交 serverId、该 Server 实时暴露的 toolName 和 arguments。
+- 仅支持后端 `stdio` 与 `streamable_http`。HTTP 强制 HTTPS、精确 authority/path allowlist、禁止 redirect；stdio 强制现存绝对 executable allowlist。
+- stdio 子进程只继承最小系统环境并注入当前 Server 显式绑定的 Secret；HTTP 只向当前 Server 的固定 Header 注入 Secret。Provider、LangSmith、Admin 和其他 MCP Secret 不会交叉继承。
+- tools/list 的 Draft 2020-12 input/output Schema 与 call result 使用有界 JSON 原样透传。网关不按业务含义选择工具、不解析 SQL、不解释结果，也不包含固定 Skill、工具目录或业务结果 Schema。
+- 调用日志只记录参数/result 的 hash、长度、键名、耗时和 `isError`，不保存参数或结果正文。
 - 启用时 `ACTIONDESIGN_AGENT_ALLOW_ORIGINS` 必须是显式 Origin，禁止 `*`。生产环境仍应放在已认证反向代理之后。
 - 前端 Skill/Graph 决定调用顺序；网关不实现诊断工作流、不读取 Skill prompt、不判断业务结论。
 
@@ -152,8 +153,24 @@ data: {"protocolVersion":"1.0","sequence":2,"conversationId":"11111111-1111-4111
 - `GET /api/actiondesign-agent/admin/access-key`
 - `POST /api/actiondesign-agent/admin/access-key/rotate`
 - `GET /api/actiondesign-agent/admin/profiles`
+- `GET /api/actiondesign-agent/admin/profiles/{profileId}`
 - `PUT /api/actiondesign-agent/admin/profiles/{profileId}`
 - `DELETE /api/actiondesign-agent/admin/profiles/{profileId}`
+- `GET|PUT|DELETE /api/actiondesign-agent/admin/providers/{providerId}`
+- `GET|POST /api/actiondesign-agent/admin/profiles/{profileId}/models`
+- `GET|PUT|DELETE /api/actiondesign-agent/admin/profiles/{profileId}/models/{modelId}`
+- `PUT /api/actiondesign-agent/admin/profiles/{profileId}/default-model`
+- `GET|PUT|DELETE /api/actiondesign-agent/admin/profiles/{profileId}/secret`
+- `POST /api/actiondesign-agent/admin/profiles/{profileId}/secret/rotate`
+- `POST /api/actiondesign-agent/admin/profiles/{profileId}/connection-test`
+- `GET /api/actiondesign-agent/admin/profiles/{profileId}/health`
+- `GET /api/actiondesign-agent/admin/channels/health`
+- `GET /api/actiondesign-agent/admin/mcp-servers`
+- `GET|PUT|DELETE /api/actiondesign-agent/admin/mcp-servers/{serverId}`
+- `PUT /api/actiondesign-agent/admin/mcp-servers/{serverId}/enabled`
+- `POST /api/actiondesign-agent/admin/mcp-servers/{serverId}/connection-test`
+- `GET|PUT|DELETE /api/actiondesign-agent/admin/secrets/{secretId}`
+- `POST /api/actiondesign-agent/admin/secrets/{secretId}/rotate`
 - `GET /api/actiondesign-agent/admin/request-logs`
 - `GET /api/actiondesign-agent/admin/request-logs/{requestId}`
 - `GET /api/actiondesign-agent/admin/audit-logs`
@@ -170,11 +187,11 @@ Authorization: Bearer <short-lived-session-token>
 
 规则：
 
-- 管理密码不硬编码在源码中；本项目部署时通过隔离 `.env` 设置 `ACTIONDESIGN_ADMIN_PASSWORD=ailxhmm12`，未配置时登录端点返回 `ADMIN_LOGIN_DISABLED`。登录连续失败 5 次后，同一来源会被限制 30 分钟。密码只在登录请求中发送，不写日志。`ACTIONDESIGN_ADMIN_ALLOW_REMOTE` 默认 `false`，因此公网 8888 的 admin 路由不可访问；生产前端必须由 loopback 上的 HTTPS 同源代理转发，或在完成网络边界保护后显式开启远程管理。
+- 管理密码不硬编码在源码中；本项目部署时通过隔离 `.env` 设置 `ACTIONDESIGN_ADMIN_PASSWORD=<set-in-deployment>`，未配置时登录端点返回 `ADMIN_LOGIN_DISABLED`。登录连续失败 5 次后，同一来源会被限制 30 分钟。密码只在登录请求中发送，不写日志。`ACTIONDESIGN_ADMIN_ALLOW_REMOTE` 默认 `false`，因此公网 admin 路由不可访问；生产前端必须由 loopback 上的 HTTPS 同源代理转发，或在完成网络边界保护后显式开启远程管理。
 - `/admin/` 直接调用同源管理 API，覆盖渠道、模型、路由优先级、Browser API Key、系统审计、完整 Conversation 和 metadata 请求日志。管理密码、session、Provider Key 与新生成的 Browser API Key 都只保存在当前页面内存；页面刷新后需要重新登录。
 - 浏览器可直接把短期管理 session 放入 `X-ActionDesign-Api-Key` 调用模型；长期浏览器/CLI Key 通过 access-key rotate 创建或轮换，明文只在该次响应出现，后端仅持久化盐化摘要和末尾掩码。
 - 内部服务继续独立使用 `X-ActionDesign-Service-Token`，不得把 Provider Key 或 Service Token 下发给浏览器。
-- Profile API 响应只有 `keyConfigured`，绝不返回 Provider Key。
+- Profile API 响应只有 `keyConfigured` 与末四位掩码 `secretMasked`，绝不返回 Provider Key。通用 Secret 查询同样只返回状态、类型、时间和掩码。
 - 更新时 `apiKey` 为空会保留已有 Key。
 - 每个 Profile 包含动态 `provider` 渠道 ID、`displayName`、`protocol=openai|claude`、`priority`、`models[].priority`、`defaultModel`、Base URL、认证方式、超时和启用状态。priority 为 1..10000，数值越大越优先。
 - `/models.routingOrder` 返回真实全局顺序。无显式选择时先使用最高优先级渠道的 `defaultModel`；显式 profile/model 始终作为首选。可重试故障先切同 Profile 其余模型（按 priority），再切其他 Profile 的默认模型及模型链。
@@ -214,7 +231,7 @@ ACTIONDESIGN_REQUEST_LOG_BACKUP_COUNT=5
 
 请求日志只保留严格白名单内的 usage/error、hash、长度、耗时和路由元数据；读取历史行时再次清洗。默认单文件 10 MiB、保留 5 个备份，列表与详情使用有界分块反向读取，不会把整个日志文件载入内存。
 
-生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要删除客户端伪造的 Service Token Header；浏览器使用短期 session 或独立 Browser API Key，不读取 Provider Key/Service Token。`chat`、流式路由、兼容 Provider 路由、`tool-result`、固定 MCP 和 LangSmith batch 接受有效 `X-ActionDesign-Api-Key`，内部调用也可使用 `X-ActionDesign-Service-Token`；`health/models` 保持公开只读。短期 session 只应放内存或 sessionStorage，不应放 localStorage。
+生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要删除客户端伪造的 Service Token Header；浏览器使用短期 session 或独立 Browser API Key，不读取 Provider Key/Service Token。`chat`、流式路由、兼容 Provider 路由、`tool-result`、通用 MCP 和 LangSmith batch 接受有效 `X-ActionDesign-Api-Key`，内部调用也可使用 `X-ActionDesign-Service-Token`；`health/models` 保持公开只读。短期 session 只应放内存或 sessionStorage，不应放 localStorage。
 
 ### MiMo
 
@@ -253,6 +270,7 @@ ANTHROPIC_MODEL=claude-sonnet-4-5
 ACTIONDESIGN_PROFILE_STORE_PATH=config/actiondesign-api-profiles.json
 ACTIONDESIGN_PROFILE_SECRET_STORE_BACKEND=keyring
 ACTIONDESIGN_PROFILE_SECRET_STORE_PATH=config/actiondesign-api-profile-secrets.json
+ACTIONDESIGN_MANAGED_SECRET_STORE_PATH=config/actiondesign-managed-secrets.json
 ACTIONDESIGN_PROFILE_ADMIN_TOKEN=...
 ACTIONDESIGN_ADMIN_PASSWORD=ailxhmm12
 ACTIONDESIGN_ADMIN_SESSION_TTL_SECONDS=3600
@@ -272,21 +290,25 @@ LANGSMITH_WORKSPACE_ID=...
 ACTIONDESIGN_LANGSMITH_TIMEOUT_SECONDS=15
 ```
 
-### GXP 只读 MCP
+### 通用 MCP proxy
 
 ```text
-ACTIONDESIGN_GXP_READONLY_MCP_ENABLED=true
-ACTIONDESIGN_GXP_READONLY_MCP_PYTHON_PATH=C:\path\to\GxpLowcodeReadonly\.venv\Scripts\python.exe
-ACTIONDESIGN_GXP_READONLY_MCP_SERVER_PATH=C:\path\to\gxp-lowcode-readonly\mcp\server.py
-ACTIONDESIGN_GXP_READONLY_MCP_TIMEOUT_SECONDS=30
+ACTIONDESIGN_MCP_PROXY_ENABLED=true
+ACTIONDESIGN_MCP_TIMEOUT_SECONDS=30
+ACTIONDESIGN_MCP_ALLOWED_HOSTS=mcp.example.com
+ACTIONDESIGN_MCP_ALLOWED_HTTP_PATHS=/mcp
+ACTIONDESIGN_MCP_ALLOWED_EXECUTABLE_PATHS=C:\absolute\path\to\mcp-server.exe
+ACTIONDESIGN_MCP_SERVER_STORE_PATH=config/actiondesign-managed-mcp-servers.json
+ACTIONDESIGN_MCP_SERVERS_JSON=[{"id":"shared","transport":"streamable_http","url":"https://mcp.example.com/mcp","secretId":"mcp-main","secretBinding":{"target":"header","name":"Authorization","prefix":"Bearer "}}]
 ```
 
-两个路径必须是现存的绝对文件路径。启用固定 MCP 时 `ACTIONDESIGN_SERVICE_AUTH_MODE` 必须为 `required`，且 Origin 必须显式配置，禁止 `*`。数据库配置和密码继续由外部 `gxp-lowcode-readonly` 插件管理，不得复制到本仓环境变量或日志。
+`ACTIONDESIGN_MCP_SERVERS_JSON` 只提供只读环境来源；管理页面新增的 Server 写入 `ACTIONDESIGN_MCP_SERVER_STORE_PATH`，保存、启停或删除后立即热加载到当前 proxy。启用 MCP proxy 时允许初始零 Server，但 `ACTIONDESIGN_SERVICE_AUTH_MODE` 必须为 `required`，且 Origin 必须显式配置，禁止 `*`。普通调用方不能覆盖 transport、URL、command、Header、环境变量或 Secret；Secret 明文只通过管理员 Secret API 写入安全后端，Server 响应只返回 masked/configured binding 状态。
 
 ## 日志与脱敏
 
 - 系统修改审计日志独立写入 `debug_logs/actiondesign-agent/system/admin-audit.jsonl`，记录登录、Profile/Key/priority、Browser API Key 和 seal 操作的 actor/IP、requestId、结果与脱敏详情。
 - metadata 请求日志独立写入 `request-logs.jsonl` 并轮转；每个实际 fallback attempt 都记录 attempt、实际 Profile/协议/模型，不保存正文。
+- chat、stream、tool-result、MCP 和 LangSmith transport 的每个真实 HTTP 请求都由后端生成独立 canonical UUID v4 `requestId`；调用方传入的 legacy `requestId` 不会成为服务端请求身份，同一次 Provider fallback 的 attempts 复用后端 requestId。
 - 完整会话日志默认开启，按 `conversationId` 同步追加到 `logs/actiondesign-agent/yyyyMMdd_HHmmss_{conversationId}.jsonl`，使用 per-conversation lock，目录/文件权限尝试设为 `0700`/`0600`。
 - 完整会话日志保存每轮 systemPrompt、prompt、请求参数、每次 fallback、最终响应/工具调用/错误；图片只保存类型、来源、长度和 SHA-256，不保存原始 base64。
 - conversation 默认 `open`，仅显式 seal 后为 `completed|aborted`；断线/timeout 只把 turn 标成 cancelled/error，不伪称会话完成。超过大小上限会写 `incompleteReason`。
@@ -294,7 +316,7 @@ ACTIONDESIGN_GXP_READONLY_MCP_TIMEOUT_SECONDS=30
 - 所有会话日志在最终持久化写入层再次统一脱敏，调用方不能绕过该边界；SSE 错误文本也会在返回和记录前脱敏。
 - Profile secret 不进入普通 API 响应或请求日志。
 - 管理员请求日志 API 只返回 requestId、渠道/Profile/协议/模型、状态、耗时、Prompt/System 长度与 SHA-256、图片/工具计数、usage 和错误码，不返回完整输入、图片或业务正文。
-- MCP 原始参数和结果不进入会话日志；只记录脱敏元数据、版本、hash、长度和耗时。
+- MCP 原始 Secret 和未脱敏正文不进入会话日志；小结果内联保存脱敏副本，大结果写入有大小/总量上限、SHA-256 校验和 `0600` 权限的 content-addressed artifact。普通 tool-result 与 MCP tool-result 均可由 transcript 恢复；artifact 缺失或损坏会明确返回 `incompleteReason`。
 
 ## 验证
 
@@ -306,9 +328,11 @@ python -m pytest \
   tests/test_actiondesign_gateway_provider_http.py \
   tests/test_actiondesign_gateway_profile_store.py \
   tests/test_actiondesign_gateway_langsmith.py \
-  tests/test_actiondesign_gateway_readonly_mcp.py -q
+  tests/test_actiondesign_gateway_admin_boundaries.py \
+  tests/test_actiondesign_gateway_mcp_proxy.py \
+  tests/test_actiondesign_gateway_secret_store.py -q
 ```
 
 `verify_actiondesign_gateway_local.py` 使用临时回环 Anthropic-compatible HTTP Provider 验证真实网关 `/models`、managed Profile HTTP CRUD、Key 只写不回显、使用该 Profile 的非流式 native tool call、SSE `model.completed`、删除回滚边界和日志不泄漏 Key；Secret Store 仅为进程内存，不访问外部网络、不使用真实凭据、不启动 MCP 或写入持久配置。真实 Provider 凭据、系统 Keyring 服务账户和 LangSmith workspace 仍需部署环境另行验收。
 
-已删除且不应恢复的路由：`/review`、`/topic/classify`、`/knowledge/*`、`/tool-results/*`。
+已删除且不应恢复的路由：`/review`、`/topic/classify`、`/knowledge/*`、`/tool-results/*`。MCP 只通过通用 `{serverId}` transport 路由暴露；任何历史 server ID 若仍需使用，也只能作为普通预配置 server，不再拥有专用路由、Schema 或工具白名单。

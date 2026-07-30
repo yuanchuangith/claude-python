@@ -46,7 +46,7 @@ def test_managed_profile_persists_only_secret_reference_and_never_plaintext(tmp_
 
     assert public["keyConfigured"] is True
     assert "api_key" not in public
-    assert payload["schemaVersion"] == "4"
+    assert payload["schemaVersion"] == "5"
     assert payload["profiles"][0]["secret_ref"].startswith("profile:")
     assert "api_key" not in payload["profiles"][0]
     assert "managed-secret" not in persisted_text
@@ -228,10 +228,21 @@ def test_environment_profile_host_is_validated_before_registration(tmp_path):
         ApiProfileStore(gateway_settings, MemoryProfileSecretStore())
 
 
-def test_environment_profiles_cannot_be_deleted(tmp_path):
-    store = ApiProfileStore(settings(tmp_path), MemoryProfileSecretStore())
+def test_environment_profile_delete_is_persisted_and_removed_from_routing(tmp_path):
+    gateway_settings = settings(tmp_path)
+    store = ApiProfileStore(gateway_settings, MemoryProfileSecretStore())
 
-    assert store.delete("default-mimo") is False
+    assert store.delete("default-mimo") is True
+
+    payload = json.loads((tmp_path / "profiles.json").read_text(encoding="utf-8"))
+    reloaded = ApiProfileStore(gateway_settings, MemoryProfileSecretStore())
+    assert payload["schemaVersion"] == "5"
+    assert payload["environmentOverrides"][0]["id"] == "default-mimo"
+    assert payload["environmentOverrides"][0]["deleted"] is True
+    assert "default-mimo" not in {item["id"] for item in reloaded.list_public()}
+    assert "default-mimo" not in {
+        item.profile.id for item in reloaded.route_candidates(provider="auto")
+    }
 
 
 def test_environment_profiles_cannot_be_overwritten(tmp_path):
@@ -439,8 +450,28 @@ def test_schema_v3_profiles_are_migrated_with_default_priorities(tmp_path):
 
     assert migrated.priority == 100
     assert migrated.models[0].priority == 100
-    assert payload["schemaVersion"] == "4"
+    assert payload["schemaVersion"] == "5"
     assert payload["profiles"][0]["priority"] == 100
+
+
+def test_schema_v4_profile_store_is_migrated_to_environment_deletion_schema(tmp_path):
+    path = tmp_path / "profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "4",
+                "profiles": [],
+                "environmentOverrides": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ApiProfileStore(settings(tmp_path), MemoryProfileSecretStore())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["schemaVersion"] == "5"
+    assert payload["environmentOverrides"] == []
 
 
 def test_schema_v2_profiles_are_migrated_to_protocol_and_model_schema(tmp_path):
@@ -476,7 +507,7 @@ def test_schema_v2_profiles_are_migrated_to_protocol_and_model_schema(tmp_path):
 
     assert migrated.protocol == "claude"
     assert migrated.models[0].id == "mimo-v2.5"
-    assert payload["schemaVersion"] == "4"
+    assert payload["schemaVersion"] == "5"
     assert payload["profiles"][0]["protocol"] == "claude"
     assert payload["profiles"][0]["models"]
 
@@ -539,6 +570,8 @@ def test_gateway_models_reject_type_coercion():
         ToolResultRequest.model_validate({
             "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "runId": "run_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "requestId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "correlationId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
             "toolCallId": "call_1",
             "toolName": "create_node",
             "turn": "1",

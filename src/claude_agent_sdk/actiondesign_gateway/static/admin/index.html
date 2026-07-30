@@ -10,117 +10,147 @@
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">AG</span>
-        <span><strong>ActionDesign</strong><small>Gateway Console</small></span>
-      </div>
+      <div class="brand"><span class="brand-mark">AG</span><span><strong>ActionDesign</strong><small>Gateway Console</small></span></div>
       <nav id="nav">
-        <button class="nav-item active" data-view="channels"><span>◫</span>渠道与路由</button>
-        <button class="nav-item" data-view="security"><span>⌁</span>访问 Key</button>
-        <button class="nav-item" data-view="audit"><span>≡</span>系统审计</button>
-        <button class="nav-item" data-view="conversations"><span>◌</span>完整对话</button>
+        <button class="nav-item active" data-view="channels"><span>◫</span>渠道</button>
+        <button class="nav-item" data-view="models"><span>◇</span>模型</button>
+        <button class="nav-item" data-view="secrets"><span>⌁</span>Secret</button>
         <button class="nav-item" data-view="requests"><span>↔</span>请求日志</button>
+        <button class="nav-item" data-view="conversations"><span>◌</span>完整会话</button>
+        <button class="nav-item" data-view="audit"><span>≡</span>系统审计</button>
       </nav>
-      <div class="sidebar-footer">
-        <div id="session-state" class="session-state">未登录</div>
-        <button id="logout-btn" class="ghost-btn hidden">退出管理会话</button>
-      </div>
+      <div class="sidebar-footer"><div id="session-state" class="session-state">未登录</div><button id="logout-btn" class="ghost-btn hidden">退出管理会话</button></div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div><h1 id="view-title">渠道与路由</h1><p id="view-subtitle">配置 OpenAI / Claude 渠道、模型能力和自动降级优先级</p></div>
+        <div><h1 id="view-title">渠道</h1><p id="view-subtitle">配置 Provider、固定请求路径、路由优先级和连接健康</p></div>
         <div class="health"><span id="health-dot"></span><span id="health-text">正在检查网关</span></div>
       </header>
 
       <section id="login-panel" class="login-panel">
-        <div>
-          <span class="eyebrow">ADMIN SESSION</span>
-          <h2>登录管理中心</h2>
-          <p>请输入部署时配置的管理密码。密码和短期会话仅保存在当前页面内存中。</p>
-        </div>
-        <form id="login-form" class="login-form" autocomplete="off">
-          <label>管理密码<input id="admin-password" type="password" required maxlength="8192" autocomplete="current-password" placeholder="管理密码"></label>
-          <button class="primary-btn" type="submit">登录</button>
-        </form>
+        <div><span class="eyebrow">ADMIN SESSION</span><h2>登录管理中心</h2><p>管理员 Bearer 会话仅保存在当前页面内存中；退出或失效后立即清空管理数据。</p></div>
+        <form id="login-form" class="login-form" autocomplete="off"><label>管理密码<input id="admin-password" type="password" required maxlength="8192" autocomplete="current-password" placeholder="管理密码"></label><button class="primary-btn" type="submit">登录</button></form>
       </section>
 
       <div id="notice" class="notice hidden" role="status"></div>
 
       <section id="view-channels" class="view active">
         <div class="metrics">
-          <article><span>渠道数量</span><strong id="metric-profiles">—</strong><small>环境与托管 Profile</small></article>
-          <article><span>候选路由</span><strong id="metric-routes">—</strong><small>按实际降级顺序</small></article>
+          <article><span>渠道数量</span><strong id="metric-profiles">—</strong><small>环境与托管 Provider Profile</small></article>
+          <article><span>可用路由</span><strong id="metric-routes">—</strong><small>按真实 failover 顺序</small></article>
           <article><span>默认路由</span><strong id="metric-default">—</strong><small id="metric-default-model">等待加载</small></article>
         </div>
 
         <div class="panel">
-          <div class="panel-head"><div><h2>实际自动降级顺序</h2><p>优先级数值越大越优先；同值保持配置顺序。</p></div><button id="refresh-channels" class="secondary-btn">刷新</button></div>
-          <div class="table-wrap"><table><thead><tr><th>#</th><th>渠道 / Profile</th><th>协议</th><th>模型</th><th>渠道优先级</th><th>模型优先级</th><th>标记</th></tr></thead><tbody id="routing-body"></tbody></table></div>
+          <div class="panel-head"><div><h2>Provider 渠道</h2><p>请求只会发送到 allowlist host，并追加协议对应的固定 Provider path。</p></div><div class="row-actions"><button id="refresh-channels" class="secondary-btn">刷新</button><button id="new-provider" class="primary-btn">新增渠道</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>渠道 / Profile</th><th>固定 Endpoint</th><th>配置</th><th>健康</th><th>Host / 重试</th><th></th></tr></thead><tbody id="channels-body"></tbody></table></div>
         </div>
 
         <div class="panel">
-          <div class="panel-head"><div><h2>渠道 Profile</h2><p>MiMo、Claude Code 与自定义服务均按普通渠道管理。</p></div><button id="new-profile" class="primary-btn">新增渠道</button></div>
-          <div class="table-wrap"><table><thead><tr><th>渠道</th><th>Profile ID</th><th>协议</th><th>优先级</th><th>默认模型</th><th>状态</th><th>来源</th><th></th></tr></thead><tbody id="profiles-body"></tbody></table></div>
+          <div class="panel-head"><div><h2>实际 failover 顺序</h2><p>每个候选路由最多请求一次；仅 retryable 错误进入下一个候选，流已产生内容后不切换。</p></div></div>
+          <div class="table-wrap"><table><thead><tr><th>#</th><th>渠道 / Profile</th><th>协议</th><th>模型</th><th>渠道优先级</th><th>模型优先级</th><th>标记</th></tr></thead><tbody id="routing-body"></tbody></table></div>
         </div>
 
-        <div id="profile-editor" class="panel editor hidden">
-          <div class="panel-head"><div><h2 id="profile-editor-title">新增渠道</h2><p id="profile-editor-note">Provider Key 只提交后端，保存后不回显。</p></div><button id="cancel-profile" class="ghost-btn">关闭</button></div>
-          <form id="profile-form" autocomplete="off">
-            <input id="profile-source" type="hidden">
+        <div id="provider-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="provider-editor-title">新增渠道</h2><p>Provider Secret 和模型后续通过独立 API 管理，不随渠道编辑回显。</p></div><button id="cancel-provider" class="ghost-btn">关闭</button></div>
+          <form id="provider-form" autocomplete="off">
             <div class="form-grid four">
-              <label>Profile ID<input id="profile-id" required maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="team-openai"></label>
-              <label>渠道 ID<input id="profile-provider" required maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="team-openai"></label>
-              <label>渠道名称<input id="profile-name" required maxlength="256" placeholder="团队 OpenAI"></label>
-              <label>渠道优先级<input id="profile-priority" type="number" required min="1" max="10000" value="100"></label>
-              <label>协议<select id="profile-protocol"><option value="openai">OpenAI Chat Completions</option><option value="claude">Claude / Anthropic Messages</option></select></label>
-              <label>认证方式<select id="profile-auth"><option value="bearer">Bearer</option><option value="api-key">API Key</option></select></label>
-              <label>超时（秒）<input id="profile-timeout" type="number" min="1" max="600" value="120"></label>
-              <label class="switch-label">启用<input id="profile-enabled" type="checkbox" checked></label>
+              <label>Profile ID<input id="provider-id" required maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="team-openai"></label>
+              <label>路由分组<select id="provider-type" required><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="mimo">MiMo</option><option value="claude-code">Claude Code</option></select></label>
+              <label>渠道名称<input id="provider-name" required maxlength="256" placeholder="团队 OpenAI"></label>
+              <label>优先级<input id="provider-priority" type="number" required min="1" max="10000" value="100"></label>
+              <label>协议<select id="provider-protocol"><option value="openai">OpenAI</option><option value="claude">Claude</option></select></label>
+              <label>认证方式<select id="provider-auth"><option value="bearer">Bearer</option><option value="api-key">API Key</option></select></label>
+              <label>API Key<input id="provider-api-key" type="password" required minlength="8" maxlength="8192" autocomplete="new-password" placeholder="新建渠道必填；编辑留空则保留"></label>
+              <label>超时（秒）<input id="provider-timeout" type="number" min="1" max="600" value="120"></label>
+              <label class="switch-label">启用<input id="provider-enabled" type="checkbox" checked></label>
             </div>
-            <label>Provider Base URL<input id="profile-url" type="url" required placeholder="https://api.example.com/v1"></label>
-            <label>Provider Key<input id="profile-key" type="password" maxlength="8192" autocomplete="new-password" placeholder="新增或路由认证变化时填写；永不回显"></label>
-            <div class="model-head"><div><h3>模型列表</h3><p>模型优先级越大越优先；默认模型可与最高优先级模型不同。</p></div><button id="add-model" class="secondary-btn" type="button">添加模型</button></div>
-            <div id="models-editor" class="models-editor"></div>
+            <label>Base URL<input id="provider-url" type="url" required placeholder="https://api.example.com"></label>
             <div class="form-grid two">
-              <label>默认模型<select id="profile-default-model" required></select></label>
-              <div class="form-actions"><button class="primary-btn" type="submit">保存渠道</button><button id="reset-profile" class="ghost-btn" type="button">重置</button></div>
+              <label>默认模型（必填）<input id="provider-default-model" required maxlength="256" placeholder="gpt-5.2"></label>
+              <div class="form-actions"><button class="primary-btn" type="submit">保存渠道</button><button id="save-test-provider" class="secondary-btn" type="submit">保存并测试</button><button id="reset-provider" class="ghost-btn" type="button">重置</button></div>
             </div>
           </form>
         </div>
       </section>
 
-      <section id="view-security" class="view">
-        <div class="panel narrow">
-          <div class="panel-head"><div><h2>Browser API Key</h2><p>供浏览器或外部客户端访问模型、MCP 和 Trace API。明文只在轮换响应中显示一次。</p></div><button id="refresh-key" class="secondary-btn">刷新状态</button></div>
-          <div id="key-status" class="key-status">等待登录后加载</div>
-          <form id="rotate-key-form" autocomplete="off">
-            <label>可选指定新 Key<input id="custom-access-key" type="password" minlength="16" maxlength="8192" autocomplete="new-password" placeholder="留空由后端安全生成"></label>
-            <button class="danger-btn" type="submit">创建 / 轮换访问 Key</button>
+      <section id="view-models" class="view">
+        <div class="panel">
+          <div class="panel-head"><div><h2>模型能力</h2><p>模型 CRUD、默认模型和参数上限独立于 Provider Secret。</p></div><div class="row-actions"><button id="refresh-models" class="secondary-btn">刷新</button><button id="new-model" class="primary-btn">新增模型</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>渠道</th><th>模型</th><th>能力</th><th>上下文 / 输出</th><th>优先级</th><th>可用状态</th><th></th></tr></thead><tbody id="models-body"></tbody></table></div>
+        </div>
+        <div id="model-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="model-editor-title">新增模型</h2><p>能力字段构成严格 JSON Schema 边界。</p></div><button id="cancel-model" class="ghost-btn">关闭</button></div>
+          <form id="model-form" autocomplete="off">
+            <div class="form-grid four">
+              <label>所属渠道<select id="model-profile" required></select></label>
+              <label>模型 ID<input id="model-id" required maxlength="256"></label>
+              <label>显示名称<input id="model-name" required maxlength="256"></label>
+              <label>优先级<input id="model-priority" type="number" required min="1" max="10000" value="100"></label>
+              <label>上下文 Token<input id="model-context" type="number" required min="1024" max="10000000" value="100000"></label>
+              <label>最大输出 Token<input id="model-output" type="number" required min="256" max="1000000" value="8192"></label>
+              <label class="switch-label">Streaming<input id="model-streaming" type="checkbox" checked></label>
+              <label class="switch-label">Native tools<input id="model-tools" type="checkbox" checked></label>
+              <label class="switch-label">图片<input id="model-images" type="checkbox" checked></label>
+              <label class="switch-label">Thinking<input id="model-thinking" type="checkbox"></label>
+            </div>
+            <div class="form-actions"><button class="primary-btn" type="submit">保存模型</button><button id="reset-model" class="ghost-btn" type="button">重置</button></div>
           </form>
-          <div id="revealed-key" class="revealed-key hidden"><span>仅显示一次</span><code id="revealed-key-value"></code><button id="copy-key" class="secondary-btn">复制</button></div>
         </div>
       </section>
 
-      <section id="view-audit" class="view">
-        <div class="panel"><div class="panel-head"><div><h2>系统修改日志</h2><p>管理员登录、渠道变更、访问 Key 轮换和会话归档等脱敏记录。</p></div><button id="refresh-audit" class="secondary-btn">刷新</button></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>操作者</th><th>结果</th><th>详情</th></tr></thead><tbody id="audit-body"></tbody></table></div><div id="audit-pages" class="pager"></div></div>
-      </section>
+      <section id="view-secrets" class="view">
+        <div class="panel">
+          <div class="panel-head"><div><h2>Provider API Key</h2><p>只显示掩码；环境来源不可在线修改，托管来源支持更新、轮换和撤销。</p></div><button id="refresh-secrets" class="secondary-btn">刷新</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Profile</th><th>状态</th><th>来源</th><th>最近修改</th><th></th></tr></thead><tbody id="provider-secrets-body"></tbody></table></div>
+        </div>
+        <div id="provider-secret-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="provider-secret-title">更新 Provider Secret</h2><p>明文只从当前密码框提交，完成或失败后立即清空。</p></div><button id="cancel-provider-secret" class="ghost-btn">关闭</button></div>
+          <form id="provider-secret-form" autocomplete="off"><input id="provider-secret-profile" type="hidden"><input id="provider-secret-mode" type="hidden"><div class="form-grid two"><label>新 Secret<input id="provider-secret-value" type="password" required minlength="8" maxlength="8192" autocomplete="new-password"></label><div class="form-actions"><button class="danger-btn" type="submit">提交</button></div></div></form>
+        </div>
 
-      <section id="view-conversations" class="view">
-        <div class="panel"><div class="panel-head"><div><h2>完整 Conversation 日志</h2><p>按会话查看每轮请求、响应、fallback attempts 与实际命中路由。</p></div><button id="refresh-conversations" class="secondary-btn">刷新</button></div><div class="table-wrap"><table><thead><tr><th>Conversation ID</th><th>开始</th><th>更新</th><th>状态</th><th>事件</th><th>大小</th><th></th></tr></thead><tbody id="conversations-body"></tbody></table></div><div id="conversation-pages" class="pager"></div></div>
+        <div class="panel">
+          <div class="panel-head"><div><h2>MCP / OAuth / 其他 Secret</h2><p>后端只保存元数据和安全存储引用；查询永不返回原文。</p></div><button id="new-secret" class="primary-btn">新增 Secret</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Secret</th><th>类型</th><th>状态</th><th>更新时间</th><th>修改人</th><th></th></tr></thead><tbody id="managed-secrets-body"></tbody></table></div>
+        </div>
+        <div id="managed-secret-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="managed-secret-title">新增 Secret</h2><p>更新元数据时可留空；新建或轮换必须填写新值。</p></div><button id="cancel-managed-secret" class="ghost-btn">关闭</button></div>
+          <form id="managed-secret-form" autocomplete="off"><input id="managed-secret-mode" type="hidden"><div class="form-grid four"><label>Secret ID<input id="managed-secret-id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>类型<input id="managed-secret-kind" required maxlength="64" list="secret-kinds"><datalist id="secret-kinds"><option value="mcp_key"><option value="oauth_token"><option value="provider_api_key"><option value="token_reference"></datalist></label><label>显示名称<input id="managed-secret-name" required maxlength="256"></label><label>新值<input id="managed-secret-value" type="password" minlength="8" maxlength="8192" autocomplete="new-password"></label></div><div class="form-actions"><button class="danger-btn" type="submit">提交</button></div></form>
+        </div>
+
+        <div class="panel narrow">
+          <div class="panel-head"><div><h2>Browser API Key</h2><p>管理员创建/轮换后明文只显示一次，并在 60 秒或离开页面时自动清除。</p></div><button id="refresh-key" class="secondary-btn">刷新状态</button></div>
+          <div id="key-status" class="key-status">等待登录后加载</div>
+          <form id="rotate-key-form" autocomplete="off"><label>可选指定新 Key<input id="custom-access-key" type="password" minlength="16" maxlength="8192" autocomplete="new-password" placeholder="留空由后端生成"></label><button class="danger-btn" type="submit">创建 / 轮换访问 Key</button></form>
+          <div id="revealed-key" class="revealed-key hidden"><span>仅显示一次</span><code id="revealed-key-value"></code><div class="row-actions"><button id="copy-key" class="secondary-btn">复制</button><button id="clear-key" class="ghost-btn">清除</button></div></div>
+        </div>
       </section>
 
       <section id="view-requests" class="view">
         <div class="panel">
-          <div class="panel-head"><div><h2>Metadata 请求日志</h2><p>不保存完整 Prompt、图片 Base64、Provider Key 或未脱敏业务结果。</p></div><button id="refresh-requests" class="secondary-btn">刷新</button></div>
-          <form id="request-filters" class="filters"><input id="filter-provider" placeholder="渠道"><input id="filter-profile" placeholder="Profile"><select id="filter-protocol"><option value="">全部协议</option><option value="openai">OpenAI</option><option value="claude">Claude</option></select><select id="filter-status"><option value="">全部状态</option><option value="success">成功</option><option value="error">错误</option><option value="cancelled">取消</option></select><button class="secondary-btn" type="submit">筛选</button></form>
-          <div class="table-wrap"><table><thead><tr><th>时间</th><th>渠道 / Profile</th><th>协议</th><th>模型</th><th>尝试</th><th>状态</th><th>耗时</th><th></th></tr></thead><tbody id="requests-body"></tbody></table></div><div id="request-pages" class="pager"></div>
+          <div class="panel-head"><div><h2>Metadata 请求日志</h2><p>只含脱敏索引、usage、耗时、stop reason 和错误；完整 request/response 在 Conversation 中查看。</p></div><button id="refresh-requests" class="secondary-btn">刷新</button></div>
+          <form id="request-filters" class="filters wide">
+            <input id="filter-conversation" placeholder="conversationId"><input id="filter-request" placeholder="requestId"><input id="filter-run" placeholder="runId"><input id="filter-provider" placeholder="渠道"><input id="filter-profile" placeholder="Profile"><input id="filter-model" placeholder="模型">
+            <select id="filter-protocol"><option value="">全部协议</option><option value="openai">OpenAI</option><option value="claude">Claude</option></select><select id="filter-status"><option value="">全部状态</option><option value="success">成功</option><option value="error">错误</option><option value="cancelled">取消</option></select><select id="filter-stream"><option value="">全部模式</option><option value="true">SSE</option><option value="false">非流式</option></select><input id="filter-error" placeholder="errorCode"><input id="filter-start" type="datetime-local" title="开始时间"><input id="filter-end" type="datetime-local" title="结束时间"><button class="secondary-btn" type="submit">筛选</button>
+          </form>
+          <div class="table-wrap"><table><thead><tr><th>时间 / ID</th><th>渠道 / Profile</th><th>模型 / 模式</th><th>状态</th><th>Usage / Stop</th><th>耗时</th><th></th></tr></thead><tbody id="requests-body"></tbody></table></div><div id="request-pages" class="pager"></div>
         </div>
       </section>
+
+      <section id="view-conversations" class="view">
+        <div class="panel">
+          <div class="panel-head"><div><h2>完整 Conversation 日志</h2><p>分页查看 request、response、tool-result、SSE 最终结果、错误和脱敏 trace。</p></div><button id="refresh-conversations" class="secondary-btn">刷新</button></div>
+          <form id="conversation-filters" class="filters wide"><input id="conversation-id-filter" placeholder="conversationId"><input id="conversation-request-filter" placeholder="requestId"><input id="conversation-run-filter" placeholder="runId"><input id="conversation-provider-filter" placeholder="渠道"><input id="conversation-model-filter" placeholder="模型"><select id="conversation-status-filter"><option value="">全部状态</option><option value="open">open</option><option value="completed">completed</option><option value="aborted">aborted</option></select><input id="conversation-start-filter" type="datetime-local" title="更新时间起"><input id="conversation-end-filter" type="datetime-local" title="更新时间止"><label class="inline-check">仅不完整<input id="conversation-incomplete-filter" type="checkbox"></label><button class="secondary-btn" type="submit">筛选</button></form>
+          <div class="table-wrap"><table><thead><tr><th>Conversation ID</th><th>开始</th><th>更新</th><th>状态</th><th>事件</th><th>大小</th><th></th></tr></thead><tbody id="conversations-body"></tbody></table></div><div id="conversation-pages" class="pager"></div>
+        </div>
+      </section>
+
+      <section id="view-audit" class="view"><div class="panel"><div class="panel-head"><div><h2>系统修改日志</h2><p>管理员登录、Provider/Model/Secret 变更和会话归档的脱敏审计。</p></div><button id="refresh-audit" class="secondary-btn">刷新</button></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>操作者</th><th>结果</th><th>详情</th></tr></thead><tbody id="audit-body"></tbody></table></div><div id="audit-pages" class="pager"></div></div></section>
     </main>
   </div>
 
-  <dialog id="detail-dialog"><div class="dialog-head"><h2 id="dialog-title">详情</h2><button id="dialog-close" class="ghost-btn">关闭</button></div><div id="dialog-body" class="dialog-body"></div></dialog>
+  <dialog id="detail-dialog"><div class="dialog-head"><h2 id="dialog-title">详情</h2><button id="dialog-close" class="ghost-btn">关闭</button></div><div id="dialog-body" class="dialog-body"></div><div id="dialog-pages" class="pager hidden"></div></dialog>
   <script src="./admin.js" defer></script>
 </body>
 </html>

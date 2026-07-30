@@ -5,6 +5,7 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
@@ -15,8 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .models import ApiProfileModel, ApiProfileWriteRequest, MIMO_MODELS
 
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_SECRET_REF = re.compile(r"^profile:[0-9a-f]{32}$")
-_PROFILE_STORE_SCHEMA_VERSION = "4"
+_SECRET_REF = re.compile(r"^(?:profile|gateway):[0-9a-f]{32}$")
+_PROFILE_STORE_SCHEMA_VERSION = "5"
 _KEYRING_SERVICE_NAME = "gxp.actiondesign.gateway.provider-profile.v1"
 _SECURE_KEYRING_BACKEND_PREFIXES = (
     "keyring.backends.windows.",
@@ -263,7 +264,7 @@ class _PersistedProviderProfile(BaseModel):
 class _PersistedProfileFile(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["4"] = Field(alias="schemaVersion")
+    schema_version: Literal["5"] = Field(alias="schemaVersion")
     profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
     environment_overrides: list["_EnvironmentProfileOverride"] = Field(
         default_factory=list,
@@ -289,6 +290,18 @@ class _PersistedProfileFileV3(BaseModel):
     profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
 
 
+class _PersistedProfileFileV4(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["4"] = Field(alias="schemaVersion")
+    profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
+    environment_overrides: list["_EnvironmentProfileOverride"] = Field(
+        default_factory=list,
+        alias="environmentOverrides",
+        max_length=16,
+    )
+
+
 class _EnvironmentProfileOverride(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
 
@@ -296,6 +309,7 @@ class _EnvironmentProfileOverride(BaseModel):
     priority: int = Field(default=100, ge=1, le=10_000)
     default_model: str = Field(min_length=1, max_length=256)
     models: list[ApiProfileModel] = Field(min_length=1, max_length=256)
+    deleted: bool = False
 
     @model_validator(mode="after")
     def _validate_models(self) -> "_EnvironmentProfileOverride":
@@ -352,6 +366,9 @@ class ProviderProfile:
             "displayName": self.display_name or self.provider,
             "protocol": self.protocol,
             "baseUrl": self.base_url,
+            "providerPath": (
+                "/v1/chat/completions" if self.protocol == "openai" else "/v1/messages"
+            ),
             "defaultModel": self.default_model,
             "models": [
                 model.model_dump(mode="json", by_alias=True)
@@ -365,6 +382,7 @@ class ProviderProfile:
             "priority": self.priority,
             "enabled": self.enabled,
             "keyConfigured": bool(self.api_key),
+            "secretMasked": f"****{self.api_key[-4:]}" if self.api_key else "",
             "source": self.source,
         }
 
@@ -385,6 +403,7 @@ class ApiProfileStore:
         self.path = Path(settings.profile_store_path)
         self._secret_store = secret_store or self._default_secret_store(settings)
         self._lock = threading.RLock()
+        self._health: dict[str, dict[str, Any]] = {}
         self._needs_migration = False
         self._environment_overrides: dict[str, _EnvironmentProfileOverride] = {}
         self._profiles = self._load()
@@ -398,6 +417,10 @@ class ApiProfileStore:
             return FileProfileSecretStore(Path(settings.profile_secret_store_path))
         return KeyringProfileSecretStore()
 
+    @property
+    def secret_backend(self) -> ProfileSecretStore:
+        return self._secret_store
+
     def list_public(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
@@ -407,6 +430,251 @@ class ApiProfileStore:
                     key=lambda item: (-item.priority, item.id),
                 )
             ]
+
+    def get_public(self, profile_id: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self._profiles.get(profile_id)
+            if profile is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "API_PROFILE_NOT_FOUND"},
+                )
+            return profile.public()
+
+    def get_profile(self, profile_id: str, *, require_ready: bool = False) -> ProviderProfile:
+        with self._lock:
+            profile = self._profiles.get(profile_id)
+            if profile is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "API_PROFILE_NOT_FOUND"},
+                )
+            if require_ready and not profile.enabled:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "API_PROFILE_UNAVAILABLE"},
+                )
+            if require_ready and not profile.api_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "API_PROFILE_KEY_MISSING"},
+                )
+            return profile
+
+    def list_models(self, profile_id: str) -> list[dict[str, Any]]:
+        profile = self.get_profile(profile_id)
+        return [
+            model.model_dump(mode="json", by_alias=True)
+            for model in profile.models
+        ]
+
+    def get_model(self, profile_id: str, model_id: str) -> dict[str, Any]:
+        profile = self.get_profile(profile_id)
+        model = next((item for item in profile.models if item.id == model_id), None)
+        if model is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "PROFILE_MODEL_UNAVAILABLE", "model": model_id},
+            )
+        return model.model_dump(mode="json", by_alias=True)
+
+    def upsert_model(self, profile_id: str, model: ApiProfileModel) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            models = [item for item in profile.models if item.id != model.id]
+            models.append(model)
+            self.upsert(self._write_request(profile, models=models))
+            return model.model_dump(mode="json", by_alias=True)
+
+    def delete_model(self, profile_id: str, model_id: str) -> bool:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            if model_id == profile.default_model:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "DEFAULT_MODEL_DELETE_FORBIDDEN"},
+                )
+            models = [item for item in profile.models if item.id != model_id]
+            if len(models) == len(profile.models):
+                return False
+            if not models:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "PROFILE_REQUIRES_MODEL"},
+                )
+            self.upsert(self._write_request(profile, models=models))
+            return True
+
+    def set_default_model(self, profile_id: str, model_id: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            if model_id not in {item.id for item in profile.models}:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "PROFILE_MODEL_UNAVAILABLE", "model": model_id},
+                )
+            self.upsert(self._write_request(profile, default_model=model_id))
+            return self.get_public(profile_id)
+
+    def secret_status(self, profile_id: str) -> dict[str, Any]:
+        profile = self.get_profile(profile_id)
+        return {
+            "profileId": profile.id,
+            "configured": bool(profile.api_key),
+            "masked": f"****{profile.api_key[-4:]}" if profile.api_key else "",
+            "source": profile.source,
+        }
+
+    def update_secret(self, profile_id: str, value: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            if profile.source != "managed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ENVIRONMENT_PROFILE_SECRET_IMMUTABLE"},
+                )
+            self.upsert(self._write_request(profile, api_key=value))
+            return self.secret_status(profile_id)
+
+    def rotate_secret(self, profile_id: str, value: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            if profile.source != "managed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ENVIRONMENT_PROFILE_SECRET_IMMUTABLE"},
+                )
+            previous_secret = profile.api_key
+            previous_ref = profile.secret_ref
+            new_ref = self._new_secret_ref()
+            self._set_secret(new_ref, value)
+            profile.api_key = value
+            profile.secret_ref = new_ref
+            try:
+                self._save()
+            except Exception as exc:
+                profile.api_key = previous_secret
+                profile.secret_ref = previous_ref
+                self._delete_secret(new_ref)
+                raise exc
+            if previous_ref:
+                try:
+                    self._delete_secret(previous_ref)
+                except Exception as exc:
+                    profile.api_key = previous_secret
+                    profile.secret_ref = previous_ref
+                    try:
+                        self._save()
+                        self._delete_secret(new_ref)
+                    except Exception as rollback_exc:
+                        raise RuntimeError(
+                            "profile Secret rotation failed and rollback also failed"
+                        ) from rollback_exc
+                    raise exc
+            self._health.pop(profile_id, None)
+            return self.secret_status(profile_id)
+
+    def revoke_secret(self, profile_id: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            if profile.source != "managed":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "ENVIRONMENT_PROFILE_SECRET_IMMUTABLE"},
+                )
+            previous_secret = profile.api_key
+            previous_ref = profile.secret_ref
+            if previous_ref:
+                self._delete_secret(previous_ref)
+            profile.api_key = ""
+            profile.secret_ref = None
+            try:
+                self._save()
+            except Exception as exc:
+                profile.api_key = previous_secret
+                profile.secret_ref = previous_ref
+                if previous_ref and previous_secret:
+                    self._restore_secret(previous_ref, previous_secret)
+                raise exc
+            self._health.pop(profile_id, None)
+            return self.secret_status(profile_id)
+
+    def health(self, profile_id: str) -> dict[str, Any]:
+        with self._lock:
+            profile = self.get_profile(profile_id)
+            observed = self._health.get(profile_id)
+            if not profile.enabled:
+                status = "disabled"
+            elif not profile.api_key:
+                status = "unconfigured"
+            elif observed is None:
+                status = "unknown"
+            else:
+                status = observed["status"]
+            return {
+                "profileId": profile_id,
+                "provider": profile.provider,
+                "status": status,
+                "checkedAt": str((observed or {}).get("checkedAt") or ""),
+                "latencyMs": int((observed or {}).get("latencyMs") or 0),
+                "errorCode": str((observed or {}).get("errorCode") or ""),
+                "message": str((observed or {}).get("message") or ""),
+            }
+
+    def list_health(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                self.health(profile_id)
+                for profile_id in sorted(self._profiles)
+            ]
+
+    def record_health(
+        self,
+        profile_id: str,
+        *,
+        success: bool,
+        latency_ms: int,
+        error_code: str = "",
+        message: str = "",
+    ) -> dict[str, Any]:
+        with self._lock:
+            self.get_profile(profile_id)
+            self._health[profile_id] = {
+                "status": "healthy" if success else "unhealthy",
+                "checkedAt": datetime.now(timezone.utc).isoformat(),
+                "latencyMs": max(0, latency_ms),
+                "errorCode": error_code[:128],
+                "message": message[:1000],
+            }
+            return self.health(profile_id)
+
+    @staticmethod
+    def _write_request(
+        profile: ProviderProfile,
+        *,
+        models: list[ApiProfileModel] | None = None,
+        default_model: str | None = None,
+        api_key: str = "",
+    ) -> ApiProfileWriteRequest:
+        return ApiProfileWriteRequest.model_validate(
+            {
+                "id": profile.id,
+                "provider": profile.provider,
+                "displayName": profile.display_name,
+                "protocol": profile.protocol,
+                "baseUrl": profile.base_url,
+                "apiKey": api_key,
+                "defaultModel": default_model or profile.default_model,
+                "models": [
+                    item.model_dump(mode="json", by_alias=True)
+                    for item in (models if models is not None else profile.models)
+                ],
+                "authMode": profile.auth_mode,
+                "timeoutSeconds": profile.timeout_seconds,
+                "priority": profile.priority,
+                "enabled": profile.enabled,
+            }
+        )
 
     def resolve(self, provider: str, profile_id: str = "") -> ProviderProfile:
         with self._lock:
@@ -585,7 +853,7 @@ class ApiProfileStore:
 
     def upsert(self, request: ApiProfileWriteRequest) -> dict[str, Any]:
         with self._lock:
-            self._validate(request.id, request.base_url)
+            self._validate(request.id, request.base_url, request.protocol)
             current = self._profiles.get(request.id)
             if current and current.source == "environment":
                 immutable_changed = any(
@@ -635,6 +903,7 @@ class ApiProfileStore:
                     else:
                         self._environment_overrides[current.id] = previous_override
                     raise
+                self._health.pop(profile.id, None)
                 return profile.public()
             if (
                 current
@@ -686,13 +955,35 @@ class ApiProfileStore:
                 if key_updated and secret_ref:
                     self._restore_secret(secret_ref, previous_secret)
                 raise exc
+            self._health.pop(profile.id, None)
             return profile.public()
 
     def delete(self, profile_id: str) -> bool:
         with self._lock:
             profile = self._profiles.get(profile_id)
-            if not profile or profile.source == "environment":
+            if not profile:
                 return False
+            if profile.source == "environment":
+                previous_override = self._environment_overrides.get(profile_id)
+                self._environment_overrides[profile_id] = _EnvironmentProfileOverride(
+                    id=profile.id,
+                    priority=profile.priority,
+                    default_model=profile.default_model,
+                    models=list(profile.models),
+                    deleted=True,
+                )
+                del self._profiles[profile_id]
+                try:
+                    self._save()
+                except Exception:
+                    self._profiles[profile_id] = profile
+                    if previous_override is None:
+                        self._environment_overrides.pop(profile_id, None)
+                    else:
+                        self._environment_overrides[profile_id] = previous_override
+                    raise
+                self._health.pop(profile_id, None)
+                return True
             if profile.secret_ref:
                 self._delete_secret(profile.secret_ref)
             del self._profiles[profile_id]
@@ -703,6 +994,7 @@ class ApiProfileStore:
                 if profile.secret_ref and profile.api_key:
                     self._restore_secret(profile.secret_ref, profile.api_key)
                 raise exc
+            self._health.pop(profile_id, None)
             return True
 
     def _seed_environment_profiles(self) -> None:
@@ -769,11 +1061,13 @@ class ApiProfileStore:
         for profile in defaults:
             override = self._environment_overrides.get(profile.id)
             if override is not None:
+                if override.deleted:
+                    continue
                 profile.priority = override.priority
                 profile.default_model = override.default_model
                 profile.models = list(override.models)
             try:
-                self._validate(profile.id, profile.base_url)
+                self._validate(profile.id, profile.base_url, profile.protocol)
             except HTTPException as exc:
                 code = str((exc.detail or {}).get("code") or "INVALID_PROFILE_URL")
                 raise ValueError(
@@ -781,7 +1075,12 @@ class ApiProfileStore:
                 ) from exc
             self._profiles.setdefault(profile.id, profile)
 
-    def _validate(self, profile_id: str, base_url: str) -> None:
+    def _validate(
+        self,
+        profile_id: str,
+        base_url: str,
+        protocol: Literal["openai", "claude"],
+    ) -> None:
         if not _PROFILE_ID.fullmatch(profile_id):
             raise HTTPException(status_code=400, detail={"code": "INVALID_PROFILE_ID"})
         parsed = urlsplit(base_url)
@@ -796,6 +1095,23 @@ class ApiProfileStore:
         allowed = {host.lower() for host in self.settings.profile_allowed_hosts}
         if allowed and parsed.hostname.lower() not in allowed:
             raise HTTPException(status_code=400, detail={"code": "PROFILE_HOST_NOT_ALLOWED"})
+        path = parsed.path.rstrip("/")
+        if protocol == "claude" and path.endswith("/messages") and not path.endswith(
+            "/v1/messages"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "PROVIDER_PATH_NOT_ALLOWED"},
+            )
+        if (
+            protocol == "openai"
+            and path.endswith("/chat/completions")
+            and not path.endswith("/v1/chat/completions")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "PROVIDER_PATH_NOT_ALLOWED"},
+            )
 
     def _load(self) -> dict[str, ProviderProfile]:
         if not self.path.exists():
@@ -811,6 +1127,13 @@ class ApiProfileStore:
                 legacy = _PersistedProfileFileV3.model_validate(raw)
                 payload_items = list(legacy.profiles)
                 self._needs_migration = True
+            elif schema_version == "4":
+                legacy = _PersistedProfileFileV4.model_validate(raw)
+                payload_items = list(legacy.profiles)
+                self._environment_overrides = {
+                    item.id: item for item in legacy.environment_overrides
+                }
+                self._needs_migration = True
             else:
                 payload = _PersistedProfileFile.model_validate(raw)
                 payload_items = list(payload.profiles)
@@ -819,7 +1142,7 @@ class ApiProfileStore:
                 }
             profiles: dict[str, ProviderProfile] = {}
             for item in payload_items:
-                self._validate(item.id, item.base_url)
+                self._validate(item.id, item.base_url, item.protocol)
                 api_key = ""
                 if item.secret_ref:
                     api_key = self._secret_store.get(item.secret_ref) or ""

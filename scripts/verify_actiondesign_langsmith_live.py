@@ -19,6 +19,12 @@ from typing import Any
 import httpx
 
 
+CONVERSATION_ID = "66666666-6666-4666-8666-666666666666"
+AGENT_RUN_ID = "run_77777777-7777-4777-8777-777777777777"
+REQUEST_ID = "88888888-8888-4888-8888-888888888888"
+CORRELATION_ID = "99999999-9999-4999-8999-999999999999"
+
+
 def _required_environment() -> dict[str, str]:
     values = {
         "api_key": os.getenv("LANGSMITH_API_KEY", "").strip(),
@@ -53,7 +59,7 @@ def _metadata(node_name: str, *, tool: bool = False) -> dict[str, Any]:
     sha = f"sha256:{'a' * 64}"
     return {
         "environment": "live-acceptance",
-        "conversationId": "langsmith_live_acceptance",
+        "conversationId": CONVERSATION_ID,
         "topicId": "",
         "checkpointId": "",
         "graphVersion": "2.0.0",
@@ -95,8 +101,9 @@ def _event(
         "traceId": trace_id,
         "traceRunId": run_id,
         "parentTraceRunId": parent_id,
-        "agentRunId": "langsmith_live_acceptance",
-        "requestId": "langsmith_live_acceptance",
+        "agentRunId": AGENT_RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "name": name,
         "runType": run_type,
         "event": event,
@@ -185,6 +192,14 @@ def main() -> int:
     service_token = os.getenv("ACTIONDESIGN_SERVICE_AUTH_TOKEN", "")
     if service_token:
         headers["X-ActionDesign-Service-Token"] = service_token
+    headers.update(
+        {
+            "X-Conversation-Id": CONVERSATION_ID,
+            "X-Agent-Run-Id": AGENT_RUN_ID,
+            "X-Request-Id": REQUEST_ID,
+            "X-Correlation-Id": CORRELATION_ID,
+        }
+    )
     langsmith_headers = {
         "x-api-key": config["api_key"],
         "X-Tenant-Id": config["workspace_id"],
@@ -200,6 +215,11 @@ def main() -> int:
                 f"{gateway}/telemetry/langsmith/runs/batch",
                 headers=headers,
                 json={
+                    "conversationId": CONVERSATION_ID,
+                    "runId": AGENT_RUN_ID,
+                    "requestId": REQUEST_ID,
+                    "correlationId": CORRELATION_ID,
+                    "sequence": 1,
                     "schemaVersion": "1.0",
                     "contentLevel": "sanitized",
                     "sentAt": _timestamp(),

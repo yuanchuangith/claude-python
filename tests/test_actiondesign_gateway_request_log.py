@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ from claude_agent_sdk.actiondesign_gateway.settings import Settings  # noqa: E40
 
 CONVERSATION_ID = "77777777-7777-4777-8777-777777777777"
 RUN_ID = "run_77777777-7777-4777-8777-777777777777"
+REQUEST_ID = "88888888-8888-4888-8888-888888888888"
+CORRELATION_ID = "99999999-9999-4999-8999-999999999999"
 
 
 def make_settings(tmp_path, **overrides):
@@ -44,6 +47,7 @@ def make_settings(tmp_path, **overrides):
         "profile_store_path": tmp_path / "profiles.json",
         "profile_admin_token": "admin-token",
         "admin_allow_remote": True,
+        "admin_require_https_remote": False,
         "profile_allowed_hosts": [
             "token-plan-cn.xiaomimimo.com",
             "api.anthropic.com",
@@ -69,6 +73,8 @@ def chat_payload(**overrides):
         "provider": "mimo",
         "conversationId": CONVERSATION_ID,
         "runId": RUN_ID,
+        "requestId": REQUEST_ID,
+        "correlationId": CORRELATION_ID,
         "agentMode": "normal",
         "systemPrompt": "System instructions",
         "prompt": "Private business prompt",
@@ -83,6 +89,8 @@ def identity_headers(payload):
     return {
         "X-Conversation-Id": payload["conversationId"],
         "X-Agent-Run-Id": payload["runId"],
+        "X-Request-Id": payload["requestId"],
+        "X-Correlation-Id": payload["correlationId"],
     }
 
 
@@ -91,6 +99,7 @@ def request_model(index: int) -> AgentChatRequest:
         chat_payload(
             conversationId=f"77777777-7777-4777-8777-{index:012x}",
             runId=f"run_77777777-7777-4777-8777-{index:012x}",
+            requestId=f"88888888-8888-4888-8888-{index:012x}",
             prompt=f"Private prompt {index}",
         )
     )
@@ -178,6 +187,51 @@ def test_request_log_persists_only_bounded_usage_and_error_fields(tmp_path):
     assert "upstream-secret" not in persisted
 
 
+def test_request_log_history_accepts_legacy_safe_identity_and_skips_unsafe_ids(
+    tmp_path,
+):
+    path = tmp_path / "request-logs.jsonl"
+    store = RequestLogStore(path)
+    store.record(
+        request_id="req_canonical",
+        request=request_model(3),
+        profile=provider_profile(),
+        started=time.monotonic(),
+        status="success",
+        response={"model": "mimo-v2.5", "content": "ok"},
+        stream=False,
+    )
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy.update(
+        {
+            "requestId": "req_legacy",
+            "conversationId": "legacy_conversation",
+            "runId": "legacy_run",
+        }
+    )
+    unsafe_entries = [
+        {**legacy, "requestId": "../escape"},
+        {**legacy, "conversationId": "../escape"},
+        {**legacy, "runId": "run\ncontrol"},
+        {**legacy, "requestId": "r" * 257},
+    ]
+    path.write_text(
+        "\n".join(
+            json.dumps(item, ensure_ascii=False)
+            for item in [legacy, *unsafe_entries]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items, total = store.list(limit=10, offset=0)
+
+    assert total == 1
+    assert items[0]["requestId"] == "req_legacy"
+    assert items[0]["conversationId"] == "legacy_conversation"
+    assert items[0]["runId"] == "legacy_run"
+
+
 def test_request_log_rotates_and_lists_newest_without_path_read_text(tmp_path, monkeypatch):
     path = tmp_path / "request-logs.jsonl"
     store = RequestLogStore(path, max_bytes=1, backup_count=2)
@@ -255,7 +309,7 @@ def test_request_log_admin_returns_sanitized_detail_and_not_found(tmp_path, monk
             },
         }
 
-    monkeypatch.setattr(gateway_app, "call_mimo", fake_call)
+    monkeypatch.setattr(gateway_app, "call_provider", fake_call)
     client = make_client(tmp_path)
     payload = chat_payload()
     chat = client.post(
@@ -297,3 +351,67 @@ def test_request_log_settings_have_bounded_rotation_defaults(tmp_path):
 
     assert settings.request_log_max_bytes == 10 * 1024 * 1024
     assert settings.request_log_backup_count == 5
+
+
+def test_request_log_admin_filters_identity_model_stream_error_and_time(tmp_path):
+    client = make_client(tmp_path)
+    store = client.app.state.request_logs
+    profile = provider_profile()
+    before = datetime.now(timezone.utc) - timedelta(seconds=1)
+    matching_request = request_model(20)
+    matching = store.record(
+        request_id="req_filter_match",
+        request=matching_request,
+        profile=profile,
+        started=time.monotonic(),
+        status="error",
+        error={"code": "PROVIDER_TIMEOUT", "message": "timeout"},
+        stream=True,
+    )
+    store.record(
+        request_id="req_filter_other",
+        request=request_model(21),
+        profile=profile,
+        started=time.monotonic(),
+        status="success",
+        response={"model": "other-model"},
+        stream=False,
+    )
+    after = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    response = client.get(
+        "/api/actiondesign-agent/admin/request-logs",
+        headers={"Authorization": "Bearer admin-token"},
+        params={
+            "conversationId": matching["conversationId"],
+            "requestId": matching["requestId"],
+            "runId": matching["runId"],
+            "model": matching["model"],
+            "stream": "true",
+            "errorCode": "PROVIDER_TIMEOUT",
+            "status": "error",
+            "startedAt": before.isoformat(),
+            "endedAt": after.isoformat(),
+        },
+    )
+    invalid_timezone = client.get(
+        "/api/actiondesign-agent/admin/request-logs",
+        headers={"Authorization": "Bearer admin-token"},
+        params={"startedAt": "2026-07-29T12:00:00"},
+    )
+    invalid_range = client.get(
+        "/api/actiondesign-agent/admin/request-logs",
+        headers={"Authorization": "Bearer admin-token"},
+        params={
+            "startedAt": after.isoformat(),
+            "endedAt": before.isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["requestId"] == "req_filter_match"
+    assert invalid_timezone.status_code == 422
+    assert invalid_timezone.json()["detail"]["code"] == "TIMEZONE_REQUIRED"
+    assert invalid_range.status_code == 422
+    assert invalid_range.json()["detail"]["code"] == "INVALID_TIME_RANGE"
