@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
+import httpcore
 import httpx
+from httpcore._backends.auto import AutoBackend
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError as JsonSchemaValidationError
 from mcp import ClientSession
@@ -59,6 +63,68 @@ class McpProxyError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+
+
+_IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+class _ValidatedDnsNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Resolve and pin each new MCP TCP connection to validated IP addresses."""
+
+    def __init__(
+        self,
+        *,
+        expected_host: str,
+        expected_port: int,
+        allow_private: bool,
+    ) -> None:
+        self._expected_host = _normalize_dns_host(expected_host)
+        self._expected_port = expected_port
+        self._allow_private = allow_private
+        self._backend = AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if (
+            _normalize_dns_host(host) != self._expected_host
+            or port != self._expected_port
+        ):
+            raise OSError("MCP transport attempted an unexpected network target")
+        addresses = await _resolve_host_addresses_async(host, port)
+        if not self._allow_private:
+            _require_global_addresses(addresses)
+        last_error: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    str(address),
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:  # pragma: no cover - exercised by httpcore retries
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("MCP transport DNS resolution returned no addresses")
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise OSError("MCP transport does not allow Unix sockets")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
 
 
 class _StrictModel(BaseModel):
@@ -167,6 +233,12 @@ class StreamableHttpTransportConfig(_StrictModel):
         parsed = urlsplit(value)
         if parsed.scheme != "https" or not parsed.hostname:
             raise ValueError("streamable HTTP MCP URL must use absolute HTTPS")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("streamable HTTP MCP URL port is invalid") from exc
+        if port is not None and not (1 <= port <= 65_535):
+            raise ValueError("streamable HTTP MCP URL port is invalid")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("streamable HTTP MCP URL must not contain credentials, query, or fragment")
         path = parsed.path or "/"
@@ -270,8 +342,7 @@ class McpProxy:
         secret_store: ManagedSecretStore,
         *,
         allowed_stdio_paths: Sequence[Path] = (),
-        allowed_http_hosts: Sequence[str] = (),
-        allowed_http_paths: Sequence[str] = (),
+        allowed_http_urls: Sequence[str] = (),
     ) -> None:
         parsed_servers = [McpServerConfig.model_validate(item) for item in servers]
         ids = [item.id for item in parsed_servers]
@@ -284,8 +355,7 @@ class McpProxy:
         self._allowed_stdio_roots = tuple(
             sorted({item.parent for item in self._allowed_stdio_executables})
         )
-        self._allowed_http_hosts = self._validate_http_hosts(allowed_http_hosts)
-        self._allowed_http_paths = self._validate_http_paths(allowed_http_paths)
+        self._allowed_http_urls = self._validate_http_urls(allowed_http_urls)
         self._servers = {item.id: item for item in parsed_servers}
         for server in parsed_servers:
             self._validate_server_allowlist(server)
@@ -350,8 +420,14 @@ class McpProxy:
                     422,
                 )
             result = await session.call_tool(tool_name, validated_arguments)
+            serialized_result = _model_to_json(result)
+            if (
+                isinstance(serialized_result, dict)
+                and serialized_result.get("_meta") is None
+            ):
+                serialized_result["_meta"] = {}
             raw_result = _validate_bounded_json(
-                _model_to_json(result),
+                serialized_result,
                 label="MCP tool result",
                 max_characters=_MAX_RESULT_CHARACTERS,
             )
@@ -465,19 +541,29 @@ class McpProxy:
             headers[binding.name] = f"{binding.value_prefix}{value}"
         return config.url, headers, tuple(secret_values)
 
-    @staticmethod
     def _create_http_client(
+        self,
         server: McpServerConfig,
         headers: dict[str, str],
     ) -> httpx.AsyncClient:
         config = server.streamable_http
         assert config is not None
+        parsed = urlsplit(config.url)
+        assert parsed.hostname is not None
+        transport = httpx.AsyncHTTPTransport(trust_env=False)
+        transport._pool._network_backend = _ValidatedDnsNetworkBackend(  # type: ignore[attr-defined]
+            expected_host=parsed.hostname,
+            expected_port=parsed.port or 443,
+            allow_private=_normalize_http_url(config.url) in self._allowed_http_urls,
+        )
         return httpx.AsyncClient(
             headers=headers,
             timeout=httpx.Timeout(
                 server.timeout_seconds,
                 read=config.sse_read_timeout_seconds,
             ),
+            transport=transport,
+            trust_env=False,
             follow_redirects=False,
         )
 
@@ -584,12 +670,13 @@ class McpProxy:
         config = server.streamable_http
         assert config is not None
         parsed = urlsplit(config.url)
-        authority = parsed.netloc.lower()
-        path = parsed.path or "/"
-        if authority not in self._allowed_http_hosts:
-            raise ValueError("streamable HTTP MCP host is not allowlisted")
-        if path not in self._allowed_http_paths:
-            raise ValueError("streamable HTTP MCP path is not allowlisted")
+        assert parsed.hostname is not None
+        addresses = _resolve_host_addresses_sync(
+            _normalize_dns_host(parsed.hostname),
+            parsed.port or 443,
+        )
+        if _normalize_http_url(config.url) not in self._allowed_http_urls:
+            _require_global_addresses(addresses)
 
     def _require_allowed_path(self, path: Path) -> None:
         resolved = path.resolve(strict=True)
@@ -609,44 +696,102 @@ class McpProxy:
         return value.resolve(strict=True)
 
     @staticmethod
-    def _validate_http_hosts(values: Sequence[str]) -> frozenset[str]:
+    def _validate_http_urls(values: Sequence[str]) -> frozenset[str]:
         result: set[str] = set()
         for value in values:
-            normalized = value.strip().lower()
-            if (
-                not normalized
-                or normalized != value
-                or "://" in normalized
-                or "/" in normalized
-                or "@" in normalized
-                or "?" in normalized
-                or "#" in normalized
-                or any(ord(character) < 33 or ord(character) == 127 for character in value)
-            ):
-                raise ValueError("streamable HTTP MCP host allowlist entry is invalid")
+            try:
+                StreamableHttpTransportConfig.model_validate({"url": value})
+                normalized = _normalize_http_url(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "streamable HTTP MCP exact URL allowlist entry is invalid"
+                ) from exc
+            if normalized in result:
+                raise ValueError(
+                    "streamable HTTP MCP exact URL allowlist entries must be unique"
+                )
             result.add(normalized)
-        return frozenset(result)
-
-    @staticmethod
-    def _validate_http_paths(values: Sequence[str]) -> frozenset[str]:
-        result: set[str] = set()
-        for value in values:
-            if (
-                not value.startswith("/")
-                or "\\" in value
-                or "%" in value
-                or "?" in value
-                or "#" in value
-                or any(ord(character) < 33 or ord(character) == 127 for character in value)
-                or any(part in {".", ".."} for part in value.split("/"))
-            ):
-                raise ValueError("streamable HTTP MCP path allowlist entry is invalid")
-            result.add(value)
         return frozenset(result)
 
     @staticmethod
     def _sanitize_response(value: Any, secret_values: Sequence[str]) -> Any:
         return _redact_secret_values(redact_value(value), secret_values)
+
+
+def _normalize_http_url(value: str) -> str:
+    parsed = urlsplit(value)
+    path = parsed.path or "/"
+    return urlunsplit(("https", parsed.netloc.lower(), path, "", ""))
+
+
+def _normalize_dns_host(value: str) -> str:
+    candidate = value.rstrip(".")
+    try:
+        return ipaddress.ip_address(candidate).compressed.lower()
+    except ValueError:
+        try:
+            return candidate.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError("MCP host name is invalid") from exc
+
+
+def _resolved_addresses(records: Sequence[Any]) -> tuple[_IpAddress, ...]:
+    addresses: list[_IpAddress] = []
+    seen: set[_IpAddress] = set()
+    for record in records:
+        raw = str(record[4][0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(raw)
+        except ValueError as exc:
+            raise ValueError("MCP DNS resolution returned an invalid address") from exc
+        if address not in seen:
+            seen.add(address)
+            addresses.append(address)
+    if not addresses:
+        raise ValueError("MCP DNS resolution returned no addresses")
+    return tuple(addresses)
+
+
+def _resolve_host_addresses_sync(host: str, port: int) -> tuple[_IpAddress, ...]:
+    try:
+        records = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise ValueError("MCP host DNS resolution failed") from exc
+    return _resolved_addresses(records)
+
+
+async def _resolve_host_addresses_async(host: str, port: int) -> tuple[_IpAddress, ...]:
+    try:
+        records = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise OSError("MCP host DNS resolution failed") from exc
+    return _resolved_addresses(records)
+
+
+def _require_global_addresses(addresses: Sequence[_IpAddress]) -> None:
+    for address in addresses:
+        mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+        if (
+            not address.is_global
+            or address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+            or (mapped is not None and not mapped.is_global)
+        ):
+            raise ValueError("public MCP host resolved to a non-global address")
 
 
 def _validate_bounded_json(

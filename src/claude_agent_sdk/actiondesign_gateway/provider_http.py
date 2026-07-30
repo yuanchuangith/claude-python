@@ -10,12 +10,14 @@ import httpx
 from fastapi import HTTPException
 from jsonschema import Draft202012Validator
 
-from .models import AgentChatResponse
+from .models import AgentChatResponse, DiscoveredProviderModel
 from .profile_store import ProviderProfile
 
 
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
+_MODEL_DISCOVERY_RESPONSE_MAX_BYTES = 1_048_576
+_MODEL_DISCOVERY_MAX_MODELS = 256
 
 
 def normalize_messages_url(value: str) -> str:
@@ -34,6 +36,25 @@ def normalize_chat_completions_url(value: str) -> str:
         resource_suffix="/chat/completions",
         provider_label="OpenAI-compatible",
     )
+
+
+def normalize_models_url(value: str, protocol: str) -> str:
+    if protocol == "openai":
+        endpoint = normalize_chat_completions_url(value)
+        resource_suffix = "/chat/completions"
+    else:
+        endpoint = normalize_messages_url(value)
+        resource_suffix = "/messages"
+    parsed = urlsplit(endpoint)
+    path = parsed.path
+    if not path.endswith(resource_suffix):
+        raise _upstream_error(
+            502,
+            "PROVIDER_ENDPOINT_INVALID",
+            "Provider endpoint cannot be normalized for model discovery",
+            retryable=False,
+        )
+    return urlunsplit(parsed._replace(path=f"{path[:-len(resource_suffix)]}/models"))
 
 
 def _normalize_fixed_provider_url(
@@ -620,6 +641,134 @@ async def probe_provider(profile: ProviderProfile, model: str) -> None:
             retryable=True,
             failover_scope="profile",
         ) from exc
+
+
+async def discover_provider_models(profile: ProviderProfile) -> dict[str, Any]:
+    url = normalize_models_url(profile.base_url, profile.protocol)
+    headers = (
+        openai_request_headers(profile)
+        if profile.protocol == "openai"
+        else request_headers(profile)
+    )
+    try:
+        async with _provider_http_client(profile) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if bool(getattr(response, "is_redirect", False)):
+                    raise _upstream_error(
+                        502,
+                        "PROVIDER_REDIRECT_FORBIDDEN",
+                        "Provider redirects are not allowed",
+                        retryable=False,
+                    )
+                if response.status_code in {404, 405}:
+                    raise _upstream_error(
+                        502,
+                        "PROVIDER_MODEL_DISCOVERY_UNSUPPORTED",
+                        "Provider does not expose the fixed /v1/models endpoint",
+                        retryable=False,
+                    )
+                if response.status_code >= 400:
+                    synthetic = httpx.Response(
+                        response.status_code,
+                        request=response.request,
+                        content=b"",
+                    )
+                    try:
+                        synthetic.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise _provider_http_error(exc) from exc
+                content_length = response.headers.get("content-length", "").strip()
+                if content_length:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = 0
+                    if declared_length > _MODEL_DISCOVERY_RESPONSE_MAX_BYTES:
+                        raise _upstream_error(
+                            502,
+                            "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+                            "Provider model discovery response is too large",
+                            retryable=False,
+                        )
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > _MODEL_DISCOVERY_RESPONSE_MAX_BYTES:
+                        raise _upstream_error(
+                            502,
+                            "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+                            "Provider model discovery response is too large",
+                            retryable=False,
+                        )
+    except httpx.TimeoutException as exc:
+        raise _upstream_error(
+            504,
+            "PROVIDER_TIMEOUT",
+            "Provider model discovery timed out",
+            retryable=False,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise _upstream_error(
+            502,
+            "PROVIDER_NETWORK_ERROR",
+            "Provider model discovery failed",
+            retryable=False,
+        ) from exc
+    try:
+        payload = json.loads(bytes(body))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _upstream_error(
+            502,
+            "PROVIDER_MODELS_RESPONSE_INVALID",
+            "Provider model discovery response is not valid JSON",
+            retryable=False,
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise _upstream_error(
+            502,
+            "PROVIDER_MODELS_RESPONSE_INVALID",
+            "Provider model discovery response must contain data[]",
+            retryable=False,
+        )
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    truncated = payload.get("has_more") is True
+    for item in payload["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            raise _upstream_error(
+                502,
+                "PROVIDER_MODELS_RESPONSE_INVALID",
+                "Provider model discovery data[] contains an invalid model",
+                retryable=False,
+            )
+        model_id = item["id"]
+        raw_name = item.get("display_name", item.get("name", model_id))
+        if not isinstance(raw_name, str):
+            raise _upstream_error(
+                502,
+                "PROVIDER_MODELS_RESPONSE_INVALID",
+                "Provider model discovery data[] contains an invalid model name",
+                retryable=False,
+            )
+        try:
+            model = DiscoveredProviderModel.model_validate(
+                {"id": model_id, "name": raw_name or model_id}
+            )
+        except ValueError as exc:
+            raise _upstream_error(
+                502,
+                "PROVIDER_MODELS_RESPONSE_INVALID",
+                "Provider model discovery data[] contains an invalid model",
+                retryable=False,
+            ) from exc
+        if model.id in seen:
+            continue
+        seen.add(model.id)
+        if len(models) >= _MODEL_DISCOVERY_MAX_MODELS:
+            truncated = True
+            continue
+        models.append(model.model_dump(mode="json"))
+    return {"models": models, "truncated": truncated}
 
 
 def stream_provider(req: Any, profile: ProviderProfile) -> AsyncIterator[dict[str, Any]]:

@@ -57,7 +57,7 @@
           <form id="provider-form" autocomplete="off">
             <div class="form-grid four">
               <label>Profile ID<input id="provider-id" required maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="team-openai"></label>
-              <label>路由分组<select id="provider-type" required><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="mimo">MiMo</option><option value="claude-code">Claude Code</option></select></label>
+              <label>路由分组<input id="provider-type" required maxlength="64" pattern="[A-Za-z0-9_-]+" list="provider-groups" placeholder="例如 team-claude" title="仅支持字母、数字、下划线和短横线"><datalist id="provider-groups"><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="mimo">MiMo</option><option value="claude-code">Claude Code</option></datalist></label>
               <label>渠道名称<input id="provider-name" required maxlength="256" placeholder="团队 OpenAI"></label>
               <label>优先级<input id="provider-priority" type="number" required min="1" max="10000" value="100"></label>
               <label>协议<select id="provider-protocol"><option value="openai">OpenAI</option><option value="claude">Claude</option></select></label>
@@ -68,8 +68,8 @@
             </div>
             <label>Base URL<input id="provider-url" type="url" required placeholder="https://api.example.com"></label>
             <div class="form-grid two">
-              <label>默认模型（必填）<input id="provider-default-model" required maxlength="256" placeholder="gpt-5.2"></label>
-              <div class="form-actions"><button class="primary-btn" type="submit">保存渠道</button><button id="save-test-provider" class="secondary-btn" type="submit">保存并测试</button><button id="reset-provider" class="ghost-btn" type="button">重置</button></div>
+              <label>默认模型（必填）<input id="provider-default-model" required maxlength="256" list="provider-model-options" placeholder="gpt-5.2"><datalist id="provider-model-options"></datalist></label>
+              <div class="form-actions"><button id="discover-provider-models" class="secondary-btn" type="button">获取模型</button><button class="primary-btn" type="submit">保存渠道</button><button id="save-test-provider" class="secondary-btn" type="submit">保存并测试</button><button id="reset-provider" class="ghost-btn" type="button">重置</button></div>
             </div>
           </form>
         </div>

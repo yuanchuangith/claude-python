@@ -65,6 +65,9 @@ function errorMessage(payload, response) {
     if (detail.code === "ADMIN_HTTPS_REQUIRED") {
       return "远程管理登录只允许通过 HTTPS，请使用服务器提供的 https:// 管理地址";
     }
+    if (detail.code === "PROFILE_HOST_NOT_ALLOWED") {
+      return "该 Base URL 主机未加入服务器 ACTIONDESIGN_PROFILE_ALLOWED_HOSTS";
+    }
     return sanitizeText(detail.message || detail.code || "请求失败");
   }
   return sanitizeText((payload && (payload.message || payload.error)) || `${response.status} ${response.statusText}`);
@@ -333,17 +336,22 @@ function populateProviderGroups(selected = "") {
     if (!groups.has(profile.provider)) groups.set(profile.provider, `${profile.provider}（现有分组）`);
   }
   if (selected && !groups.has(selected)) groups.set(selected, `${selected}（现有分组）`);
-  const select = $("provider-type");
-  select.replaceChildren(...Array.from(groups, ([value, label]) => {
+  const suggestions = $("provider-groups");
+  suggestions.replaceChildren(...Array.from(groups, ([value, label]) => {
     const option = element("option", "", label);
     option.value = value;
     return option;
   }));
-  select.value = selected || defaultProviderGroup($("provider-protocol").value);
+  $("provider-type").value = selected || defaultProviderGroup($("provider-protocol").value);
+}
+
+function clearProviderModelCandidates() {
+  $("provider-model-options").replaceChildren();
 }
 
 function openProviderEditor(profile = null) {
   state.editingProvider = profile;
+  clearProviderModelCandidates();
   $("provider-editor").classList.remove("hidden");
   $("provider-editor-title").textContent = profile ? `编辑 ${profile.id}` : "新增渠道";
   $("provider-id").value = profile ? profile.id : "";
@@ -359,16 +367,88 @@ function openProviderEditor(profile = null) {
   $("provider-enabled").checked = profile ? profile.enabled : true;
   $("provider-url").value = profile ? profile.baseUrl : "";
   $("provider-default-model").value = profile ? profile.defaultModel : "";
-  $("provider-default-model").disabled = Boolean(profile);
+  $("provider-default-model").disabled = false;
   $("provider-editor").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function closeProviderEditor() {
   state.editingProvider = null;
+  clearProviderModelCandidates();
   $("provider-form").reset();
   $("provider-id").disabled = false;
   $("provider-default-model").disabled = false;
   $("provider-editor").classList.add("hidden");
+}
+
+async function discoverProviderModels() {
+  const profileId = $("provider-id");
+  const baseUrl = $("provider-url");
+  const apiKey = $("provider-api-key");
+  const timeout = $("provider-timeout");
+  for (const input of [profileId, baseUrl, timeout]) {
+    if (!input.checkValidity()) {
+      input.reportValidity();
+      return;
+    }
+  }
+  apiKey.setCustomValidity("");
+  if (!state.editingProvider && !apiKey.value) {
+    apiKey.setCustomValidity("新建渠道获取模型前必须填写 API Key");
+    apiKey.reportValidity();
+    apiKey.setCustomValidity("");
+    return;
+  }
+  if (apiKey.value && !apiKey.checkValidity()) {
+    apiKey.reportValidity();
+    return;
+  }
+
+  const button = $("discover-provider-models");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "获取中…";
+  clearProviderModelCandidates();
+  try {
+    const result = await api(`/admin/providers/${encodeURIComponent(profileId.value.trim())}/models/discover`, {
+      method: "POST",
+      body: JSON.stringify({
+        protocol: $("provider-protocol").value,
+        baseUrl: baseUrl.value.trim(),
+        apiKey: apiKey.value,
+        authMode: $("provider-auth").value,
+        timeoutSeconds: Number(timeout.value),
+      }),
+    });
+    const models = Array.isArray(result.models)
+      ? result.models.filter((model) => model && typeof model.id === "string" && model.id.trim())
+      : [];
+    if (!models.length) {
+      showNotice("上游未返回可用模型，请手工填写默认模型", "error");
+      return;
+    }
+    $("provider-model-options").replaceChildren(...models.map((model) => {
+      const option = element("option");
+      option.value = model.id;
+      option.label = model.name && model.name !== model.id ? model.name : model.id;
+      return option;
+    }));
+    const current = $("provider-default-model").value.trim();
+    if (!current) $("provider-default-model").value = models[0].id;
+    const selected = $("provider-default-model").value.trim();
+    const selectedFound = models.some((model) => model.id === selected);
+    const suffix = result.truncated ? "；列表已截断" : "";
+    showNotice(
+      selectedFound
+        ? `已获取 ${models.length} 个模型${suffix}`
+        : `已获取 ${models.length} 个模型${suffix}；当前默认模型不在上游列表中，请确认或重新选择`,
+      selectedFound ? "success" : "error",
+    );
+  } catch (error) {
+    showError("模型获取失败", error);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
 }
 
 async function saveProvider(event) {
@@ -376,6 +456,8 @@ async function saveProvider(event) {
   const existing = state.editingProvider;
   const shouldTest = event.submitter && event.submitter.id === "save-test-provider";
   const defaultModelId = $("provider-default-model").value.trim();
+  const models = existing ? [...existing.models] : [];
+  if (!models.some((model) => model.id === defaultModelId)) models.push(defaultModel(defaultModelId));
   const request = {
     id: $("provider-id").value.trim(),
     provider: $("provider-type").value.trim(),
@@ -383,8 +465,8 @@ async function saveProvider(event) {
     protocol: $("provider-protocol").value,
     baseUrl: $("provider-url").value.trim(),
     apiKey: $("provider-api-key").value,
-    defaultModel: existing ? existing.defaultModel : defaultModelId,
-    models: existing ? existing.models : [defaultModel(defaultModelId)],
+    defaultModel: defaultModelId,
+    models,
     authMode: $("provider-auth").value,
     timeoutSeconds: Number($("provider-timeout").value),
     priority: Number($("provider-priority").value),
@@ -637,7 +719,7 @@ function renderManagedSecrets(auditMap) {
   tbody.replaceChildren(...state.managedSecrets.map((secret) => {
     const row = element("tr");
     const name = td(); name.append(element("strong", "", secret.displayName), element("div", "subtle mono", secret.id));
-    const status = td(); status.append(badge(secret.configured ? "已配置" : "已撤销", secret.configured ? "green" : "red"), document.createTextNode(" "), element("code", "mono", secret.masked || "—"));
+    const status = td(); status.append(badge(secret.configured ? "已配置" : "已撤销", secret.configured ? "green" : "red"));
     const audit = auditMap.get(secret.id);
     const actions = td(); const wrap = element("div", "row-actions");
     const edit = element("button", "link-btn", "更新"); edit.addEventListener("click", () => openManagedSecret(secret, "upsert"));
@@ -938,7 +1020,9 @@ function switchView(name) {
 document.addEventListener("DOMContentLoaded", () => {
   updateSessionUi(); loadHealth();
   $("login-form").addEventListener("submit", login); $("logout-btn").addEventListener("click", () => logout());
-  $("refresh-channels").addEventListener("click", loadChannels); $("new-provider").addEventListener("click", () => openProviderEditor()); $("cancel-provider").addEventListener("click", closeProviderEditor); $("reset-provider").addEventListener("click", () => openProviderEditor(state.editingProvider)); $("provider-form").addEventListener("submit", saveProvider); $("provider-protocol").addEventListener("change", () => { if (!state.editingProvider) populateProviderGroups(defaultProviderGroup($("provider-protocol").value)); });
+  $("refresh-channels").addEventListener("click", loadChannels); $("new-provider").addEventListener("click", () => openProviderEditor()); $("cancel-provider").addEventListener("click", closeProviderEditor); $("reset-provider").addEventListener("click", () => openProviderEditor(state.editingProvider)); $("provider-form").addEventListener("submit", saveProvider); $("discover-provider-models").addEventListener("click", discoverProviderModels); $("provider-protocol").addEventListener("change", () => { clearProviderModelCandidates(); if (!state.editingProvider) populateProviderGroups(defaultProviderGroup($("provider-protocol").value)); });
+  for (const id of ["provider-id", "provider-url", "provider-api-key"]) $(id).addEventListener("input", clearProviderModelCandidates);
+  $("provider-auth").addEventListener("change", clearProviderModelCandidates);
   $("refresh-models").addEventListener("click", loadChannels); $("new-model").addEventListener("click", () => openModelEditor()); $("cancel-model").addEventListener("click", closeModelEditor); $("reset-model").addEventListener("click", () => state.editingModel ? openModelEditor(state.profiles.find((item) => item.id === state.editingModel.profileId), state.profiles.find((item) => item.id === state.editingModel.profileId).models.find((item) => item.id === state.editingModel.modelId)) : openModelEditor()); $("model-form").addEventListener("submit", saveModel);
   $("refresh-secrets").addEventListener("click", loadSecrets); $("provider-secret-form").addEventListener("submit", saveProviderSecret); $("cancel-provider-secret").addEventListener("click", closeProviderSecret); $("new-secret").addEventListener("click", () => openManagedSecret()); $("managed-secret-form").addEventListener("submit", saveManagedSecret); $("cancel-managed-secret").addEventListener("click", closeManagedSecret);
   $("rotate-key-form").addEventListener("submit", rotateAccessKey); $("refresh-key").addEventListener("click", loadAccessKeyStatus); $("clear-key").addEventListener("click", clearOneTimeKey);

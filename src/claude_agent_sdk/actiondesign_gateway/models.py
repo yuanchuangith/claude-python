@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .identifiers import (
     validate_conversation_uuid4,
@@ -934,6 +934,51 @@ class ProviderConnectionTestRequest(_GatewayBaseModel):
         return value
 
 
+class ProviderModelDiscoveryRequest(_GatewayBaseModel):
+    protocol: Literal["openai", "claude"]
+    base_url: str = Field(alias="baseUrl")
+    api_key: SecretStr = Field(
+        default_factory=lambda: SecretStr(""),
+        alias="apiKey",
+    )
+    auth_mode: Literal["api-key", "bearer"] = Field(alias="authMode")
+    timeout_seconds: float = Field(alias="timeoutSeconds", ge=1.0, le=600.0)
+
+    @field_validator("base_url")
+    def _validate_base_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("baseUrl must be an absolute http(s) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("baseUrl must not contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("baseUrl must not contain query parameters or fragments")
+        return value.rstrip("/")
+
+    @field_validator("api_key")
+    def _validate_api_key(cls, value: SecretStr) -> SecretStr:
+        plaintext = value.get_secret_value()
+        if plaintext and (len(plaintext) < 8 or len(plaintext) > 8192):
+            raise ValueError("apiKey length is invalid")
+        return value
+
+
+class DiscoveredProviderModel(_GatewayBaseModel):
+    id: str
+    name: str = Field(min_length=1, max_length=256)
+
+    @field_validator("id")
+    def _validate_id(cls, value: str) -> str:
+        if not MODEL_NAME_RE.fullmatch(value):
+            raise ValueError("model id is invalid")
+        return value
+
+
+class ProviderModelDiscoveryResponse(_GatewayBaseModel):
+    models: list[DiscoveredProviderModel] = Field(default_factory=list, max_length=256)
+    truncated: bool = False
+
+
 class ProviderHealthResponse(_GatewayBaseModel):
     profile_id: str = Field(alias="profileId")
     provider: str
@@ -1173,7 +1218,6 @@ class RetryPolicyResponse(_GatewayBaseModel):
 
 class AdminRuntimePolicyResponse(_GatewayBaseModel):
     profile_allowed_hosts: list[str] = Field(alias="profileAllowedHosts", max_length=256)
-    mcp_allowed_hosts: list[str] = Field(alias="mcpAllowedHosts", max_length=256)
     provider_paths: dict[Literal["openai", "claude"], str] = Field(alias="providerPaths")
     retry_policy: RetryPolicyResponse = Field(alias="retryPolicy")
 

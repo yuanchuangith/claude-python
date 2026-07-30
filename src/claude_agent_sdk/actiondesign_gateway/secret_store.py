@@ -121,7 +121,6 @@ class SecretResponse(_StrictModel):
     kind: str
     display_name: str = Field(alias="displayName")
     configured: bool
-    masked: str = Field(default="", max_length=64)
     created_at: str = Field(alias="createdAt")
     updated_at: str = Field(alias="updatedAt")
     rotated_at: str = Field(default="", alias="rotatedAt")
@@ -146,15 +145,6 @@ class SecretResponse(_StrictModel):
     @classmethod
     def _timestamp_is_valid(cls, value: str) -> str:
         return _validate_timestamp(value)
-
-    @model_validator(mode="after")
-    def _configured_shape_is_consistent(self) -> "SecretResponse":
-        if self.configured and not self.masked:
-            raise ValueError("configured Secret response requires a masked value")
-        if not self.configured and self.masked:
-            raise ValueError("revoked Secret response must not expose a masked value")
-        return self
-
 
 class _SecretMetadata(_StrictModel):
     id: str
@@ -216,7 +206,6 @@ class _SecretMetadata(_StrictModel):
                 "kind": self.kind,
                 "displayName": self.display_name,
                 "configured": self.secret_ref is not None,
-                "masked": self.masked,
                 "createdAt": self.created_at,
                 "updatedAt": self.updated_at,
                 "rotatedAt": self.rotated_at,

@@ -66,6 +66,8 @@ from .models import (
     ProfileSecretWriteRequest,
     ProviderConnectionTestRequest,
     ProviderHealthResponse,
+    ProviderModelDiscoveryRequest,
+    ProviderModelDiscoveryResponse,
     RequestLogDetailResponse,
     RequestLogEntry,
     RequestLogListResponse,
@@ -84,7 +86,12 @@ from .profile_store import (
     ProviderProfile,
     RouteCandidate,
 )
-from .provider_http import call_provider, probe_provider, stream_provider
+from .provider_http import (
+    call_provider,
+    discover_provider_models,
+    probe_provider,
+    stream_provider,
+)
 from .request_log import RequestLogStore
 from .redaction import redact_secret_values, redact_value
 from .session_log import (
@@ -983,6 +990,53 @@ def create_app(
         )
         return {"success": success}
 
+    @app.post(
+        f"{API_PREFIX}/admin/providers/{{provider_id}}/models/discover",
+        response_model=ProviderModelDiscoveryResponse,
+    )
+    async def discover_models_for_provider(
+        provider_id: ProfileIdPath,
+        req: ProviderModelDiscoveryRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        request_id = _audit_request_id(request)
+        submitted_secret = req.api_key.get_secret_value()
+        try:
+            profile = profile_store.build_model_discovery_profile(provider_id, req)
+            result = await discover_provider_models(profile)
+        except Exception as exc:
+            safe_exc = _sanitized_provider_exception(
+                exc,
+                (*_settings_secret_values(gateway_settings), submitted_secret),
+            )
+            detail = _error_detail(safe_exc)
+            audit_logs.record(
+                action="provider_models_discover",
+                success=False,
+                actor=_audit_actor(request),
+                request_id=request_id,
+                details={
+                    "providerId": provider_id,
+                    "protocol": req.protocol,
+                    "errorCode": detail["code"],
+                },
+            )
+            raise safe_exc
+        audit_logs.record(
+            action="provider_models_discover",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=request_id,
+            details={
+                "providerId": provider_id,
+                "protocol": req.protocol,
+                "modelCount": len(result["models"]),
+                "truncated": result["truncated"],
+            },
+        )
+        return result
+
     @app.get(
         f"{API_PREFIX}/admin/profiles/{{profile_id}}/models",
         response_model=list[ApiProfileModel],
@@ -1241,7 +1295,6 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         return {
             "profileAllowedHosts": sorted(set(gateway_settings.profile_allowed_hosts)),
-            "mcpAllowedHosts": sorted(set(gateway_settings.mcp_allowed_hosts)),
             "providerPaths": {
                 "openai": "/v1/chat/completions",
                 "claude": "/v1/messages",
@@ -2678,8 +2731,7 @@ def _build_mcp_proxy(
             FilePath(path).resolve()
             for path in settings.mcp_allowed_executable_paths
         },
-        allowed_http_hosts=settings.mcp_allowed_hosts,
-        allowed_http_paths=settings.mcp_allowed_http_paths,
+        allowed_http_urls=settings.mcp_allowed_http_urls,
     )
 
 

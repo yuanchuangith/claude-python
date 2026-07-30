@@ -396,11 +396,14 @@ class Settings(BaseModel):
     mcp_allowed_hosts: list[str] = Field(
         default_factory=lambda: _csv(
             "ACTIONDESIGN_MCP_ALLOWED_HOSTS",
-            ["localhost", "127.0.0.1", "::1"],
+            [],
         )
     )
     mcp_allowed_http_paths: list[str] = Field(
         default_factory=lambda: _csv("ACTIONDESIGN_MCP_ALLOWED_HTTP_PATHS", [])
+    )
+    mcp_allowed_http_urls: list[str] = Field(
+        default_factory=lambda: _csv("ACTIONDESIGN_MCP_ALLOWED_HTTP_URLS", [])
     )
     mcp_allowed_executable_paths: list[str] = Field(
         default_factory=lambda: _csv(
@@ -427,6 +430,7 @@ class Settings(BaseModel):
         "profile_allowed_hosts",
         "mcp_allowed_hosts",
         "mcp_allowed_http_paths",
+        "mcp_allowed_http_urls",
         "mcp_allowed_executable_paths",
         mode="before",
     )
@@ -465,10 +469,18 @@ class Settings(BaseModel):
             raise ValueError("value is too long")
         return value
 
-    @field_validator("profile_allowed_hosts", "mcp_allowed_hosts")
-    def _validate_allowed_hosts(cls, value: list[str]) -> list[str]:
+    @field_validator("profile_allowed_hosts")
+    def _validate_profile_allowed_hosts(cls, value: list[str]) -> list[str]:
         if not value:
-            raise ValueError("allowed host lists must not be empty")
+            raise ValueError("profile allowed host list must not be empty")
+        return cls._validate_host_entries(value)
+
+    @field_validator("mcp_allowed_hosts")
+    def _validate_legacy_mcp_allowed_hosts(cls, value: list[str]) -> list[str]:
+        return cls._validate_host_entries(value)
+
+    @staticmethod
+    def _validate_host_entries(value: list[str]) -> list[str]:
         for host in value:
             if "://" in host or "/" in host or "@" in host:
                 raise ValueError("allowed host entries must be host names only")
@@ -479,6 +491,39 @@ class Settings(BaseModel):
         for path in value:
             if not path.startswith("/") or "?" in path or "#" in path:
                 raise ValueError("MCP allowed HTTP paths must be absolute URL paths")
+        return value
+
+    @field_validator("mcp_allowed_http_urls")
+    def _validate_mcp_urls(cls, value: list[str]) -> list[str]:
+        normalized: set[str] = set()
+        for url in value:
+            parsed = urlsplit(url)
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError("MCP allowed HTTP URLs contain an invalid port") from exc
+            path = parsed.path or "/"
+            if (
+                url != url.strip()
+                or parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or port is not None and not (1 <= port <= 65_535)
+                or not path.startswith("/")
+                or "\\" in path
+                or "%" in path
+                or any(part in {".", ".."} for part in path.split("/"))
+            ):
+                raise ValueError(
+                    "MCP allowed HTTP URLs must be exact absolute HTTPS authority and path values"
+                )
+            canonical = f"https://{parsed.netloc.lower()}{path}"
+            if canonical in normalized:
+                raise ValueError("MCP allowed HTTP URLs must be unique")
+            normalized.add(canonical)
         return value
 
     @field_validator(
@@ -508,6 +553,12 @@ class Settings(BaseModel):
         if self.langsmith_enabled and not self.langsmith_api_key:
             raise ValueError("LANGSMITH_API_KEY is required when LangSmith forwarding is enabled")
         if self.mcp_proxy_enabled:
+            if self.mcp_allowed_hosts or self.mcp_allowed_http_paths:
+                raise ValueError(
+                    "ACTIONDESIGN_MCP_ALLOWED_HOSTS and "
+                    "ACTIONDESIGN_MCP_ALLOWED_HTTP_PATHS are legacy ignored settings; "
+                    "use ACTIONDESIGN_MCP_ALLOWED_HTTP_URLS for exact private MCP URLs"
+                )
             if self.service_auth_mode != "required":
                 raise ValueError(
                     "ACTIONDESIGN_SERVICE_AUTH_MODE must be required when MCP proxy is enabled"
@@ -520,8 +571,6 @@ class Settings(BaseModel):
             ids = [server.id for server in self.mcp_servers]
             if len(ids) != len(set(ids)):
                 raise ValueError("MCP server ids must be unique")
-            allowed_hosts = {host.lower() for host in self.mcp_allowed_hosts}
-            allowed_paths = set(self.mcp_allowed_http_paths)
             try:
                 allowed_executables = {
                     Path(path).resolve(strict=True)
@@ -531,11 +580,7 @@ class Settings(BaseModel):
                 raise ValueError("MCP executable allowlist contains an invalid path") from exc
             for server in enabled_servers:
                 if server.transport == "streamable_http":
-                    parsed = urlsplit(server.url)
-                    if parsed.netloc.lower() not in allowed_hosts:
-                        raise ValueError("MCP server host is not allowlisted")
-                    if parsed.path not in allowed_paths:
-                        raise ValueError("MCP server path is not allowlisted")
+                    continue
                 else:
                     try:
                         executable = Path(server.executable_path).resolve(strict=True)

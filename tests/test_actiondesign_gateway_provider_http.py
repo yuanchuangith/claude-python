@@ -175,6 +175,126 @@ def test_provider_http_client_explicitly_disables_redirects(monkeypatch):
     assert all(item["follow_redirects"] is False for item in captured)
 
 
+@pytest.mark.parametrize(
+    ("protocol", "base_url", "expected"),
+    [
+        ("openai", "https://example.test", "https://example.test/v1/models"),
+        (
+            "openai",
+            "https://example.test/tenant/v1/chat/completions",
+            "https://example.test/tenant/v1/models",
+        ),
+        ("claude", "https://example.test", "https://example.test/v1/models"),
+        (
+            "claude",
+            "https://example.test/tenant/v1/messages",
+            "https://example.test/tenant/v1/models",
+        ),
+    ],
+)
+def test_model_discovery_url_uses_fixed_v1_models(protocol, base_url, expected):
+    assert provider_http.normalize_models_url(base_url, protocol) == expected
+
+
+@pytest.mark.parametrize(
+    ("profile_factory", "expected_auth_header", "expected_name"),
+    [
+        (openai_profile, "Bearer secret", "GPT 5.1"),
+        (profile, None, "Claude Test"),
+    ],
+)
+def test_discover_provider_models_uses_protocol_auth_and_strict_data(
+    monkeypatch,
+    profile_factory,
+    expected_auth_header,
+    expected_name,
+):
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("authorization")
+        captured["x_api_key"] = request.headers.get("x-api-key")
+        name_key = "name" if profile_factory is openai_profile else "display_name"
+        return provider_http.httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "model-1", name_key: expected_name},
+                    {"id": "model-1", name_key: "Duplicate"},
+                ]
+            },
+        )
+
+    transport = provider_http.httpx.MockTransport(handler)
+
+    def client(_profile):
+        return provider_http.httpx.AsyncClient(transport=transport, follow_redirects=False)
+
+    monkeypatch.setattr(provider_http, "_provider_http_client", client)
+    result = anyio.run(provider_http.discover_provider_models, profile_factory())
+
+    assert captured["url"].endswith("/v1/models")
+    assert captured["authorization"] == expected_auth_header
+    assert captured["x_api_key"] == (None if expected_auth_header else "secret")
+    assert result == {
+        "models": [{"id": "model-1", "name": expected_name}],
+        "truncated": False,
+    }
+
+
+def test_discover_provider_models_truncates_at_256(monkeypatch):
+    payload = {"data": [{"id": f"model-{index}"} for index in range(257)]}
+    transport = provider_http.httpx.MockTransport(
+        lambda _request: provider_http.httpx.Response(200, json=payload)
+    )
+    monkeypatch.setattr(
+        provider_http,
+        "_provider_http_client",
+        lambda _profile: provider_http.httpx.AsyncClient(transport=transport),
+    )
+
+    result = anyio.run(provider_http.discover_provider_models, openai_profile())
+
+    assert len(result["models"]) == 256
+    assert result["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_code"),
+    [
+        (provider_http.httpx.Response(404), "PROVIDER_MODEL_DISCOVERY_UNSUPPORTED"),
+        (
+            provider_http.httpx.Response(200, json={"data": [{"name": "missing id"}]}),
+            "PROVIDER_MODELS_RESPONSE_INVALID",
+        ),
+        (
+            provider_http.httpx.Response(
+                200,
+                content=b"x" * (provider_http._MODEL_DISCOVERY_RESPONSE_MAX_BYTES + 1),
+            ),
+            "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+        ),
+    ],
+)
+def test_discover_provider_models_maps_unsafe_upstream_responses(
+    monkeypatch,
+    response,
+    expected_code,
+):
+    transport = provider_http.httpx.MockTransport(lambda _request: response)
+    monkeypatch.setattr(
+        provider_http,
+        "_provider_http_client",
+        lambda _profile: provider_http.httpx.AsyncClient(transport=transport),
+    )
+
+    with pytest.raises(provider_http.HTTPException) as raised:
+        anyio.run(provider_http.discover_provider_models, openai_profile())
+
+    assert raised.value.detail["code"] == expected_code
+
+
 def test_request_body_forwards_native_tool_choice():
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,

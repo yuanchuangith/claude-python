@@ -13,7 +13,12 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from .models import ApiProfileModel, ApiProfileWriteRequest, MIMO_MODELS
+from .models import (
+    ApiProfileModel,
+    ApiProfileWriteRequest,
+    MIMO_MODELS,
+    ProviderModelDiscoveryRequest,
+)
 
 _PROFILE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SECRET_REF = re.compile(r"^(?:profile|gateway):[0-9a-f]{32}$")
@@ -460,6 +465,59 @@ class ApiProfileStore:
                     detail={"code": "API_PROFILE_KEY_MISSING"},
                 )
             return profile
+
+    def build_model_discovery_profile(
+        self,
+        profile_id: str,
+        request: ProviderModelDiscoveryRequest,
+    ) -> ProviderProfile:
+        with self._lock:
+            self._validate(profile_id, request.base_url, request.protocol)
+            current = self._profiles.get(profile_id)
+            submitted_key = request.api_key.get_secret_value()
+            if current is None:
+                if not submitted_key:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "API_PROFILE_KEY_MISSING"},
+                    )
+                provider = profile_id
+            else:
+                route_changed = any(
+                    (
+                        request.protocol != current.protocol,
+                        request.base_url.rstrip("/") != current.base_url,
+                        request.auth_mode != current.auth_mode,
+                    )
+                )
+                if route_changed and not submitted_key:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "PROFILE_KEY_REQUIRED_FOR_ROUTE_CHANGE"},
+                    )
+                provider = current.provider
+                if not submitted_key:
+                    submitted_key = current.api_key
+            if not submitted_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "API_PROFILE_KEY_MISSING"},
+                )
+            return ProviderProfile(
+                id=profile_id,
+                provider=provider,
+                display_name=(current.display_name if current is not None else profile_id),
+                protocol=request.protocol,
+                base_url=request.base_url.rstrip("/"),
+                api_key=submitted_key,
+                default_model="",
+                models=[],
+                auth_mode=request.auth_mode,
+                timeout_seconds=request.timeout_seconds,
+                priority=(current.priority if current is not None else 100),
+                enabled=True,
+                source="ephemeral",
+            )
 
     def list_models(self, profile_id: str) -> list[dict[str, Any]]:
         profile = self.get_profile(profile_id)

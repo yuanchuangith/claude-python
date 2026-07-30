@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +14,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from claude_agent_sdk.actiondesign_gateway import mcp_proxy as mcp_proxy_module  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.app import create_app  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.mcp_proxy import McpProxy  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.mcp_server_store import (  # noqa: E402
@@ -29,6 +31,15 @@ ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 SERVICE_TOKEN = "service-token-" + ("x" * 32)
 REQUEST_ID = "88888888-8888-4888-8888-888888888888"
 CORRELATION_ID = "99999999-9999-4999-8999-999999999999"
+
+
+@pytest.fixture(autouse=True)
+def _stable_private_mcp_dns(monkeypatch):
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_sync",
+        lambda _host, _port: (ipaddress.ip_address("10.20.30.40"),),
+    )
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
@@ -55,8 +66,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         "claude_code_api_key": "",
         "mcp_proxy_enabled": True,
         "mcp_servers": [],
-        "mcp_allowed_hosts": ["mcp.example.test"],
-        "mcp_allowed_http_paths": ["/mcp"],
+        "mcp_allowed_http_urls": ["https://mcp.example.test/mcp"],
         "mcp_allowed_executable_paths": [],
     }
     values.update(overrides)
@@ -141,6 +151,16 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
         },
     )
     assert secret.status_code == 200
+    assert set(secret.json()) == {
+        "id",
+        "kind",
+        "displayName",
+        "configured",
+        "createdAt",
+        "updatedAt",
+        "rotatedAt",
+        "revokedAt",
+    }
 
     created = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
@@ -150,9 +170,26 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
     assert created.status_code == 200, created.text
     assert created.json()["source"] == "managed"
     assert created.json()["proxyEnabled"] is True
+    assert created.json()["browserConfigurable"] is True
     assert created.json()["secretBindingStatus"] == [
         {"secretId": "mcp.primary", "configured": True}
     ]
+    assert set(created.json()) == {
+        "id",
+        "displayName",
+        "transport",
+        "expectedServerName",
+        "timeoutSeconds",
+        "enabled",
+        "source",
+        "proxyEnabled",
+        "browserConfigurable",
+        "secretBindingStatus",
+    }
+    assert all(
+        key not in created.json()
+        for key in ("stdio", "streamableHttp", "url", "headers", "command", "cwd", "args")
+    )
     active_proxy = client.app.state.mcp_proxy
     assert active_proxy is not initial_proxy
     persisted = settings.mcp_server_store_path.read_text(encoding="utf-8")
@@ -254,6 +291,9 @@ def test_environment_mcp_servers_are_read_only_and_managed_ids_use_full_contract
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == "environment.server-1"
     assert listed.json()[0]["source"] == "environment"
+    assert listed.json()[0]["browserConfigurable"] is False
+    assert "streamableHttp" not in listed.json()[0]
+    assert "url" not in listed.text
 
     replacement = managed_http_server("environment.server-1")
     for response in (
@@ -290,6 +330,15 @@ def test_mcp_proxy_can_start_enabled_without_preconfigured_servers(tmp_path):
     ).json() == []
 
 
+def test_legacy_host_and_path_allowlists_are_rejected_when_proxy_is_enabled(tmp_path):
+    with pytest.raises(ValueError, match="legacy ignored settings"):
+        make_settings(
+            tmp_path,
+            mcp_allowed_hosts=["mcp.example.test"],
+            mcp_allowed_http_paths=["/mcp"],
+        )
+
+
 def test_managed_mcp_server_rejects_non_allowlisted_transport_without_persisting(
     tmp_path,
 ):
@@ -307,6 +356,36 @@ def test_managed_mcp_server_rejects_non_allowlisted_transport_without_persisting
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "MCP_SERVER_CONFIGURATION_INVALID"
     assert not settings.mcp_server_store_path.exists()
+
+
+def test_public_https_mcp_server_does_not_require_static_url_allowlist(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_sync",
+        lambda _host, _port: (
+            ipaddress.ip_address("8.8.8.8"),
+            ipaddress.ip_address("2606:4700:4700::1111"),
+        ),
+    )
+    settings = make_settings(tmp_path, mcp_allowed_http_urls=[])
+    client = TestClient(
+        create_app(settings, profile_secret_store=MemoryProfileSecretStore())
+    )
+    payload = managed_http_server()
+    payload["streamableHttp"]["url"] = "https://public.example.test/mcp"
+
+    created = client.put(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
+        headers=ADMIN_HEADERS,
+        json=payload,
+    )
+
+    assert created.status_code == 200, created.text
+    assert "streamableHttp" not in created.json()
+    assert "public.example.test" not in created.text
 
 
 def test_mcp_server_admin_requires_bearer_and_strict_128_character_id(tmp_path):
@@ -393,7 +472,7 @@ def test_corrupt_managed_mcp_server_store_fails_closed(tmp_path):
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
 
 
-def test_environment_http_allowlist_uses_exact_authority_including_port(tmp_path):
+def test_environment_http_allowlist_uses_exact_authority_and_path(tmp_path):
     server = {
         "id": "environment.server-port",
         "transport": "streamable_http",
@@ -402,7 +481,7 @@ def test_environment_http_allowlist_uses_exact_authority_including_port(tmp_path
     settings = make_settings(
         tmp_path,
         mcp_servers=[server],
-        mcp_allowed_hosts=["mcp.example.test:8443"],
+        mcp_allowed_http_urls=["https://mcp.example.test:8443/mcp"],
     )
     client = TestClient(
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
@@ -412,11 +491,21 @@ def test_environment_http_allowlist_uses_exact_authority_including_port(tmp_path
         headers=ADMIN_HEADERS,
     ).json()[0]["id"] == "environment.server-port"
 
-    with pytest.raises(ValueError, match="MCP server host is not allowlisted"):
-        make_settings(
-            tmp_path,
-            mcp_servers=[server],
-            mcp_allowed_hosts=["mcp.example.test"],
+    crossed = {
+        **server,
+        "url": "https://mcp.example.test:8443/other",
+    }
+    with pytest.raises(ValueError, match="non-global"):
+        create_app(
+            make_settings(
+                tmp_path,
+                mcp_servers=[crossed],
+                mcp_allowed_http_urls=[
+                    "https://mcp.example.test:8443/mcp",
+                    "https://other.example.test:8443/other",
+                ],
+            ),
+            profile_secret_store=MemoryProfileSecretStore(),
         )
 
 

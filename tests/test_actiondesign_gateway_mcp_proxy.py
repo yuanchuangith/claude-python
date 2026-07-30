@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +9,12 @@ import anyio
 import pytest
 from pydantic import ValidationError
 
+from claude_agent_sdk.actiondesign_gateway import mcp_proxy as mcp_proxy_module
 from claude_agent_sdk.actiondesign_gateway.mcp_proxy import (
     McpProxy,
     McpProxyError,
     McpServerConfig,
+    _ValidatedDnsNetworkBackend,
 )
 from claude_agent_sdk.actiondesign_gateway.secret_store import ManagedSecretStore
 
@@ -28,6 +31,15 @@ class DictSecretBackend:
 
     def delete(self, secret_ref: str) -> None:
         self.values.pop(secret_ref, None)
+
+
+@pytest.fixture(autouse=True)
+def _stable_private_mcp_dns(monkeypatch):
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_sync",
+        lambda _host, _port: (ipaddress.ip_address("10.20.30.40"),),
+    )
 
 
 class FakeResult:
@@ -127,13 +139,12 @@ def make_proxy(tmp_path):
         [stdio_config(command, server_script), http_config()],
         secret_store,
         allowed_stdio_paths=[command],
-        allowed_http_hosts=["mcp.example.test"],
-        allowed_http_paths=["/mcp"],
+        allowed_http_urls=["https://mcp.example.test/mcp"],
     )
     return proxy, secret_store, backend
 
 
-def test_preconfigured_transports_enforce_https_host_path_and_absolute_path_allowlists(
+def test_preconfigured_transports_enforce_https_exact_url_and_absolute_path_allowlists(
     tmp_path,
 ):
     secret_store, _ = make_secret_store(tmp_path)
@@ -143,8 +154,7 @@ def test_preconfigured_transports_enforce_https_host_path_and_absolute_path_allo
         [stdio_config(command, server_script), http_config()],
         secret_store,
         allowed_stdio_paths=[command],
-        allowed_http_hosts=["mcp.example.test"],
-        allowed_http_paths=["/mcp"],
+        allowed_http_urls=["https://mcp.example.test/mcp"],
     )
     assert proxy.list_servers() == [
         {
@@ -171,19 +181,22 @@ def test_preconfigured_transports_enforce_https_host_path_and_absolute_path_allo
     with pytest.raises(ValidationError):
         McpServerConfig.model_validate(query_http)
 
-    with pytest.raises(ValueError, match="host is not allowlisted"):
+    crossed_http = http_config()
+    crossed_http["streamableHttp"]["url"] = "https://mcp.example.test/other"
+    with pytest.raises(ValueError, match="non-global"):
         McpProxy(
-            [http_config()],
+            [crossed_http],
             secret_store,
-            allowed_http_hosts=["other.example.test"],
-            allowed_http_paths=["/mcp"],
+            allowed_http_urls=[
+                "https://mcp.example.test/mcp",
+                "https://other.example.test/other",
+            ],
         )
-    with pytest.raises(ValueError, match="path is not allowlisted"):
+    with pytest.raises(ValueError, match="non-global"):
         McpProxy(
             [http_config()],
             secret_store,
-            allowed_http_hosts=["mcp.example.test"],
-            allowed_http_paths=["/other"],
+            allowed_http_urls=["https://other.example.test/mcp"],
         )
 
     outside = tmp_path / "outside.exe"
@@ -221,8 +234,109 @@ def test_secret_injection_is_transport_scoped_and_http_redirects_are_disabled(
     client = proxy._create_http_client(http_server, headers)
     try:
         assert client.follow_redirects is False
+        assert client._trust_env is False
     finally:
         anyio.run(client.aclose)
+
+
+def test_public_https_dns_must_resolve_only_global_addresses(tmp_path, monkeypatch):
+    secret_store, _ = make_secret_store(tmp_path)
+    public = http_config()
+    public["streamableHttp"]["url"] = "https://public.example.test/mcp"
+
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_sync",
+        lambda _host, _port: (
+            ipaddress.ip_address("8.8.8.8"),
+            ipaddress.ip_address("2606:4700:4700::1111"),
+        ),
+    )
+    proxy = McpProxy([public], secret_store)
+    assert proxy.list_servers()[0]["id"] == "remote-mcp"
+
+    rejected_sets = [
+        ("8.8.8.8", "10.0.0.1"),
+        ("127.0.0.1",),
+        ("169.254.10.20",),
+        ("224.0.0.1",),
+        ("0.0.0.0",),
+        ("::ffff:10.0.0.1",),
+    ]
+    for raw_addresses in rejected_sets:
+        monkeypatch.setattr(
+            mcp_proxy_module,
+            "_resolve_host_addresses_sync",
+            lambda _host, _port, values=raw_addresses: tuple(
+                ipaddress.ip_address(value) for value in values
+            ),
+        )
+        with pytest.raises(ValueError, match="non-global"):
+            McpProxy([public], secret_store)
+
+
+def test_network_backend_re_resolves_and_connects_only_validated_ip(monkeypatch):
+    resolutions = [
+        (ipaddress.ip_address("8.8.8.8"),),
+        (ipaddress.ip_address("1.1.1.1"),),
+    ]
+    resolve_calls: list[tuple[str, int]] = []
+
+    async def resolve(host, port):
+        resolve_calls.append((host, port))
+        return resolutions[len(resolve_calls) - 1]
+
+    class FakeBackend:
+        def __init__(self):
+            self.connections = []
+
+        async def connect_tcp(self, host, port, **kwargs):
+            self.connections.append((host, port, kwargs))
+            return SimpleNamespace()
+
+        async def sleep(self, _seconds):
+            return None
+
+    monkeypatch.setattr(mcp_proxy_module, "_resolve_host_addresses_async", resolve)
+    backend = _ValidatedDnsNetworkBackend(
+        expected_host="public.example.test",
+        expected_port=443,
+        allow_private=False,
+    )
+    fake = FakeBackend()
+    backend._backend = fake
+
+    async def connect_twice():
+        await backend.connect_tcp("public.example.test", 443)
+        await backend.connect_tcp("public.example.test", 443)
+
+    anyio.run(connect_twice)
+    assert resolve_calls == [
+        ("public.example.test", 443),
+        ("public.example.test", 443),
+    ]
+    assert [item[0] for item in fake.connections] == ["8.8.8.8", "1.1.1.1"]
+
+    async def resolve_private(_host, _port):
+        return (ipaddress.ip_address("192.168.1.2"),)
+
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_async",
+        resolve_private,
+    )
+    with pytest.raises(ValueError, match="non-global"):
+        anyio.run(backend.connect_tcp, "public.example.test", 443)
+
+    private_backend = _ValidatedDnsNetworkBackend(
+        expected_host="private.example.test",
+        expected_port=443,
+        allow_private=True,
+    )
+    private_fake = FakeBackend()
+    private_backend._backend = private_fake
+    anyio.run(private_backend.connect_tcp, "private.example.test", 443)
+    assert private_fake.connections[0][0] == "192.168.1.2"
 
 
 def test_static_secret_headers_and_cross_transport_bindings_are_rejected():
@@ -304,6 +418,7 @@ def test_call_tool_uses_caller_choice_validates_arguments_and_does_not_interpret
         ],
         "structuredContent": {"arbitrary": [1, 2, 3]},
         "isError": False,
+        "_meta": None,
     }
     session = FakeSession([tool], FakeResult(raw_result))
 
@@ -325,6 +440,7 @@ def test_call_tool_uses_caller_choice_validates_arguments_and_does_not_interpret
     assert session.calls == [("search", {"query": "hello"})]
     assert response["result"]["structuredContent"] == {"arbitrary": [1, 2, 3]}
     assert response["result"]["isError"] is False
+    assert response["result"]["_meta"] == {}
     assert "mcp-secret-value" not in str(response)
     assert "[REDACTED]" in response["result"]["content"][0]["text"]
     assert "success" not in response

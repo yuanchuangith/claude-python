@@ -48,7 +48,7 @@ def test_upsert_persists_only_strict_metadata_and_never_returns_plaintext(tmp_pa
 
     assert created == fetched == listed[0]
     assert created["configured"] is True
-    assert created["masked"] == "****alue"
+    assert "masked" not in created
     assert "value" not in created
     assert plaintext not in json.dumps(created, ensure_ascii=False)
     persisted = path.read_text(encoding="utf-8")
@@ -101,14 +101,14 @@ def test_update_rotate_and_revoke_keep_plaintext_out_of_metadata(tmp_path):
 
     rotated = store.rotate("provider.team-primary", {"value": new_value})
     assert rotated["configured"] is True
-    assert rotated["masked"] == "****cret"
+    assert "masked" not in rotated
     assert rotated["rotatedAt"]
     assert "value" not in rotated
     assert store.resolve_value("provider.team-primary") == new_value
 
     revoked = store.revoke("provider.team-primary")
     assert revoked["configured"] is False
-    assert revoked["masked"] == ""
+    assert "masked" not in revoked
     assert revoked["revokedAt"]
     assert backend.values == {}
     with pytest.raises(KeyError):
@@ -186,4 +186,3 @@ def test_failed_create_removes_new_backend_value_and_corrupt_metadata_fails_clos
     with pytest.raises(ManagedSecretStoreError) as exc_info:
         ManagedSecretStore(path, backend)
     assert "must-never-be-accepted" not in str(exc_info.value)
-

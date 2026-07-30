@@ -224,7 +224,17 @@ def test_generic_secret_api_never_returns_plaintext(tmp_path):
         },
     )
     assert created.status_code == 200
-    assert created.json()["masked"] == "****1234"
+    expected_keys = {
+        "id",
+        "kind",
+        "displayName",
+        "configured",
+        "createdAt",
+        "updatedAt",
+        "rotatedAt",
+        "revokedAt",
+    }
+    assert set(created.json()) == expected_keys
     assert first not in created.text
 
     listed = client.get(
@@ -244,8 +254,15 @@ def test_generic_secret_api_never_returns_plaintext(tmp_path):
         "/api/actiondesign-agent/admin/secrets/mcp-main",
         headers=ADMIN_HEADERS,
     )
-    assert listed.status_code == fetched.status_code == rotated.status_code == revoked.status_code == 200
-    assert rotated.json()["masked"] == "****5678"
+    assert (
+        listed.status_code
+        == fetched.status_code
+        == rotated.status_code
+        == revoked.status_code
+        == 200
+    )
+    assert all(set(item) == expected_keys for item in listed.json())
+    assert set(fetched.json()) == set(rotated.json()) == set(revoked.json()) == expected_keys
     assert revoked.json()["configured"] is False
     public_text = listed.text + fetched.text + rotated.text + revoked.text
     assert first not in public_text

@@ -4,7 +4,11 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from claude_agent_sdk.actiondesign_gateway.models import ApiProfileWriteRequest, ToolResultRequest
+from claude_agent_sdk.actiondesign_gateway.models import (
+    ApiProfileWriteRequest,
+    ProviderModelDiscoveryRequest,
+    ToolResultRequest,
+)
 from claude_agent_sdk.actiondesign_gateway.profile_store import (
     ApiProfileStore,
     MemoryProfileSecretStore,
@@ -36,6 +40,23 @@ def request(api_key="managed-secret", base_url="https://api.example.test/provide
     )
 
 
+def discovery_request(
+    *,
+    api_key="",
+    base_url="https://api.example.test/provider",
+    protocol="claude",
+    auth_mode="api-key",
+    timeout_seconds=30,
+):
+    return ProviderModelDiscoveryRequest(
+        protocol=protocol,
+        baseUrl=base_url,
+        apiKey=api_key,
+        authMode=auth_mode,
+        timeoutSeconds=timeout_seconds,
+    )
+
+
 def test_managed_profile_persists_only_secret_reference_and_never_plaintext(tmp_path):
     secrets = MemoryProfileSecretStore()
     store = ApiProfileStore(settings(tmp_path), secrets)
@@ -59,6 +80,56 @@ def test_blank_key_preserves_existing_managed_secret(tmp_path):
     store.upsert(request(api_key=""))
 
     assert store.resolve("mimo", "managed").api_key == "managed-secret"
+
+
+def test_model_discovery_profile_reuses_secret_without_persisting(tmp_path):
+    secrets = MemoryProfileSecretStore()
+    store = ApiProfileStore(settings(tmp_path), secrets)
+    store.upsert(request())
+    persisted_before = (tmp_path / "profiles.json").read_bytes()
+
+    discovery = store.build_model_discovery_profile(
+        "managed",
+        discovery_request(timeout_seconds=45),
+    )
+
+    assert discovery.api_key == "managed-secret"
+    assert discovery.timeout_seconds == 45
+    assert discovery.source == "ephemeral"
+    assert (tmp_path / "profiles.json").read_bytes() == persisted_before
+
+
+def test_model_discovery_requires_key_for_new_or_changed_route(tmp_path):
+    store = ApiProfileStore(settings(tmp_path), MemoryProfileSecretStore())
+
+    with pytest.raises(HTTPException) as missing:
+        store.build_model_discovery_profile("unsaved", discovery_request())
+    assert missing.value.detail["code"] == "API_PROFILE_KEY_MISSING"
+
+    store.upsert(request())
+    with pytest.raises(HTTPException) as changed:
+        store.build_model_discovery_profile(
+            "managed",
+            discovery_request(
+                base_url="https://token-plan-cn.xiaomimimo.com/anthropic",
+            ),
+        )
+    assert changed.value.detail["code"] == "PROFILE_KEY_REQUIRED_FOR_ROUTE_CHANGE"
+
+
+def test_model_discovery_keeps_profile_host_allowlist(tmp_path):
+    store = ApiProfileStore(settings(tmp_path), MemoryProfileSecretStore())
+
+    with pytest.raises(HTTPException) as blocked:
+        store.build_model_discovery_profile(
+            "unsaved",
+            discovery_request(
+                api_key="submitted-secret",
+                base_url="https://attacker.example/v1",
+            ),
+        )
+
+    assert blocked.value.detail["code"] == "PROFILE_HOST_NOT_ALLOWED"
 
 
 def test_dynamic_provider_uses_its_real_ready_default_profile(tmp_path):

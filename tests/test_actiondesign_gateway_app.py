@@ -1154,6 +1154,129 @@ def test_profile_admin_never_echoes_secret(tmp_path):
     assert "managed-secret" not in audit_text
 
 
+def test_provider_model_discovery_requires_admin_and_never_persists_or_echoes_key(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_discover(profile):
+        captured["profile"] = profile
+        return {
+            "models": [{"id": "deepseek-chat", "name": "DeepSeek Chat"}],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(gateway_app, "discover_provider_models", fake_discover)
+    client = make_client(
+        tmp_path,
+        profile_allowed_hosts=[
+            "token-plan-cn.xiaomimimo.com",
+            "api.anthropic.com",
+            "api.deepseek.com",
+        ],
+    )
+    payload = {
+        "protocol": "openai",
+        "baseUrl": "https://api.deepseek.com",
+        "apiKey": "submitted-secret",
+        "authMode": "bearer",
+        "timeoutSeconds": 60,
+    }
+
+    unauthorized = client.post(
+        "/api/actiondesign-agent/admin/providers/deepseek/models/discover",
+        json=payload,
+    )
+    response = client.post(
+        "/api/actiondesign-agent/admin/providers/deepseek/models/discover",
+        headers={"Authorization": "Bearer admin-token"},
+        json=payload,
+    )
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "models": [{"id": "deepseek-chat", "name": "DeepSeek Chat"}],
+        "truncated": False,
+    }
+    assert captured["profile"].api_key == "submitted-secret"
+    assert captured["profile"].source == "ephemeral"
+    assert not (tmp_path / "profiles.json").exists()
+    assert "submitted-secret" not in response.text
+    audit_text = (tmp_path / "audit" / "system" / "admin-audit.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "submitted-secret" not in audit_text
+    assert "api.deepseek.com" not in audit_text
+    assert "provider_models_discover" in audit_text
+
+
+def test_provider_model_discovery_reuses_existing_secret_only_for_same_route(
+    tmp_path,
+    monkeypatch,
+):
+    captured = []
+
+    async def fake_discover(profile):
+        captured.append(profile)
+        return {"models": [{"id": "model-1", "name": "Model 1"}], "truncated": False}
+
+    monkeypatch.setattr(gateway_app, "discover_provider_models", fake_discover)
+    client = make_client(tmp_path)
+    headers = {"Authorization": "Bearer admin-token"}
+    created = client.put(
+        "/api/actiondesign-agent/admin/providers/team-openai",
+        headers=headers,
+        json={
+            "id": "team-openai",
+            "provider": "team-openai",
+            "displayName": "Team OpenAI",
+            "protocol": "openai",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "apiKey": "stored-secret",
+            "defaultModel": "model-1",
+            "models": [{"id": "model-1"}],
+            "authMode": "bearer",
+            "timeoutSeconds": 60,
+            "priority": 100,
+            "enabled": True,
+        },
+    )
+    assert created.status_code == 200
+
+    discovered = client.post(
+        "/api/actiondesign-agent/admin/providers/team-openai/models/discover",
+        headers=headers,
+        json={
+            "protocol": "openai",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "apiKey": "",
+            "authMode": "bearer",
+            "timeoutSeconds": 45,
+        },
+    )
+    changed = client.post(
+        "/api/actiondesign-agent/admin/providers/team-openai/models/discover",
+        headers=headers,
+        json={
+            "protocol": "claude",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "apiKey": "",
+            "authMode": "api-key",
+            "timeoutSeconds": 45,
+        },
+    )
+
+    assert discovered.status_code == 200
+    assert captured[0].api_key == "stored-secret"
+    assert captured[0].timeout_seconds == 45
+    assert changed.status_code == 400
+    assert changed.json()["detail"]["code"] == "PROFILE_KEY_REQUIRED_FOR_ROUTE_CHANGE"
+    assert len(captured) == 1
+    assert "stored-secret" not in changed.text
+
+
 @pytest.mark.parametrize("unsafe_request_id", ["../escape", "r" * 257])
 def test_admin_mutation_rejects_unsafe_audit_request_header(
     tmp_path,

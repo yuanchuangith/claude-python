@@ -41,9 +41,20 @@ class McpSecretBindingStatus(_StrictModel):
     configured: bool
 
 
-class McpServerResponse(McpServerConfig):
+class McpServerResponse(_StrictModel):
+    id: str
+    display_name: str = Field(alias="displayName", min_length=1, max_length=256)
+    transport: Literal["stdio", "streamable_http"]
+    expected_server_name: str = Field(
+        default="",
+        alias="expectedServerName",
+        max_length=128,
+    )
+    timeout_seconds: float = Field(alias="timeoutSeconds", ge=1.0, le=600.0)
+    enabled: bool
     source: Literal["environment", "managed"]
     proxy_enabled: bool = Field(alias="proxyEnabled")
+    browser_configurable: bool = Field(alias="browserConfigurable")
     secret_binding_status: list[McpSecretBindingStatus] = Field(
         default_factory=list,
         alias="secretBindingStatus",
@@ -318,9 +329,15 @@ class McpServerStore:
             )
         return McpServerResponse.model_validate(
             {
-                **server.model_dump(mode="python", by_alias=True),
+                "id": server.id,
+                "displayName": server.display_name,
+                "transport": server.transport,
+                "expectedServerName": server.expected_server_name,
+                "timeoutSeconds": server.timeout_seconds,
+                "enabled": server.enabled,
                 "source": source,
                 "proxyEnabled": proxy_enabled,
+                "browserConfigurable": source == "managed",
                 "secretBindingStatus": binding_status,
             }
         ).model_dump(mode="json", by_alias=True)

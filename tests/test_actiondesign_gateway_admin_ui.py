@@ -54,6 +54,7 @@ def test_admin_ui_is_served_without_bundled_credentials(tmp_path):
     assert "/admin/channels/health" in script.text
     assert "/admin/runtime-policy" in script.text
     assert "/admin/secrets" in script.text
+    assert "secret.masked" not in script.text
     assert "/admin/audit-logs" in script.text
     assert "/admin/conversations" in script.text
     assert "/admin/request-logs" in script.text
@@ -67,14 +68,30 @@ def test_admin_ui_is_served_without_bundled_credentials(tmp_path):
     assert "禁止公网管理登录" in script.text
     assert "body:not(.authenticated) .sidebar" in stylesheet.text
     assert "body:not(.authenticated) .view" in stylesheet.text
-    assert '<select id="provider-type" required>' in page.text
-    assert '<input id="provider-type"' not in page.text
+    assert '<input id="provider-type" required maxlength="64"' in page.text
+    assert 'pattern="[A-Za-z0-9_-]+"' in page.text
+    assert 'list="provider-groups"' in page.text
+    assert '<datalist id="provider-groups">' in page.text
+    assert '<select id="provider-type"' not in page.text
     assert '<input id="provider-api-key" type="password" required' in page.text
+    assert 'list="provider-model-options"' in page.text
+    assert '<datalist id="provider-model-options"></datalist>' in page.text
+    assert 'id="discover-provider-models"' in page.text
+    assert 'type="button">获取模型</button>' in page.text
     assert 'id="save-test-provider"' in page.text
     assert 'event.submitter.id === "save-test-provider"' in script.text
     assert 'apiKey: $("provider-api-key").value' in script.text
+    assert '/models/discover' in script.text
+    assert '新建渠道获取模型前必须填写 API Key' in script.text
+    assert 'button.textContent = "获取中…"' in script.text
+    assert 'clearProviderModelCandidates' in script.text
+    assert 'defaultModel: defaultModelId' in script.text
+    assert 'models.some((model) => model.id === defaultModelId)' in script.text
+    assert 'PROFILE_HOST_NOT_ALLOWED' in script.text
+    assert 'ACTIONDESIGN_PROFILE_ALLOWED_HOSTS' in script.text
     assert "已保存，但连接测试失败" in script.text
     assert 'const PROVIDER_GROUPS = [' in script.text
+    assert 'const suggestions = $("provider-groups")' in script.text
     assert 'populateProviderGroups(defaultProviderGroup($("provider-protocol").value))' in script.text
     assert 'profile.source === "environment"' in script.text
     assert "持久化隐藏该环境渠道" in script.text
@@ -161,7 +178,6 @@ def test_admin_runtime_policy_requires_bearer_and_exposes_only_boundary_metadata
             "api.example.test",
             "token-plan-cn.xiaomimimo.com",
         ],
-        "mcpAllowedHosts": ["mcp.example.test"],
         "providerPaths": {
             "openai": "/v1/chat/completions",
             "claude": "/v1/messages",
