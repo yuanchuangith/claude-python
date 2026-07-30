@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
 import ipaddress
+import json
 import secrets
 import time
 from collections.abc import AsyncIterator
@@ -12,13 +12,29 @@ from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Annotated, Any, overload
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
+from .admin_security import AdminSessionStore, BrowserApiKeyStore
+from .audit_log import AuditLogStore
+from .client_api_key_store import (
+    ClientApiKeyCreateRequest,
+    ClientApiKeyStore,
+    ClientApiKeyStoreError,
+)
 from .identifiers import (
     CONVERSATION_ID_PATTERN,
     HISTORY_CONVERSATION_ID_PATTERN,
@@ -26,8 +42,10 @@ from .identifiers import (
     validate_safe_request_id,
 )
 from .langsmith_forwarder import forward_trace_batch
-from .mcp_proxy import McpProxy, McpProxyError, McpServerConfig
+from .mcp_proxy import McpProxy, McpProxyError, McpSecretResolver, McpServerConfig
 from .mcp_server_store import (
+    McpRuntimeConfigResponse,
+    McpServerCandidateStaleError,
     McpServerConnectionTestResponse,
     McpServerDeleteResponse,
     McpServerEnabledRequest,
@@ -39,26 +57,27 @@ from .models import (
     AccessKeyRotateRequest,
     AccessKeyRotateResponse,
     AccessKeyStatusResponse,
-    AdminRuntimePolicyResponse,
     AdminLoginRequest,
     AdminLoginResponse,
-    AgentChatRequest,
+    AdminRuntimePolicyResponse,
     AgentChatHttpResponse,
+    AgentChatRequest,
+    AgentChatResponse,
     AgentModelsResponse,
+    ApiProfileModel,
     ApiProfileResponse,
     ApiProfileWriteRequest,
     AuditLogListResponse,
     ConversationEventsResponse,
     ConversationListResponse,
-    ConversationTranscriptResponse,
     ConversationSealRequest,
     ConversationSealResponse,
+    ConversationTranscriptResponse,
     DefaultModelUpdateRequest,
     DeleteModelResponse,
     DeleteProfileResponse,
     GatewayEventEnvelope,
     HealthResponse,
-    ApiProfileModel,
     McpToolCallRequest,
     McpToolCallResponse,
     McpToolListResponse,
@@ -68,23 +87,34 @@ from .models import (
     ProviderHealthResponse,
     ProviderModelDiscoveryRequest,
     ProviderModelDiscoveryResponse,
-    RequestLogDetailResponse,
-    RequestLogEntry,
-    RequestLogListResponse,
     RequestCorrelationIdentity,
     RequestIdentity,
+    RequestLogDetailResponse,
+    RequestLogListResponse,
     ToolResultRequest,
     ToolResultResponse,
     TraceBatchRequest,
     TraceBatchResponse,
 )
-from .admin_security import AdminSessionStore, BrowserApiKeyStore
-from .audit_log import AuditLogStore
 from .profile_store import (
     ApiProfileStore,
     ProfileSecretStore,
     ProviderProfile,
     RouteCandidate,
+)
+from .protocol_compat import (
+    AnthropicMessagesRequest,
+    OpenAIChatCompletionRequest,
+    ProtocolCompatibilityError,
+    anthropic_error_response,
+    anthropic_message_response,
+    anthropic_stream_response,
+    anthropic_to_agent_request,
+    openai_chat_completion_response,
+    openai_error_response,
+    openai_models_response,
+    openai_stream_response,
+    openai_to_agent_request,
 )
 from .provider_http import (
     call_provider,
@@ -92,14 +122,21 @@ from .provider_http import (
     probe_provider,
     stream_provider,
 )
-from .request_log import RequestLogStore
 from .redaction import redact_secret_values, redact_value
+from .request_log import RequestLogStore
+from .secret_store import (
+    ManagedSecretStore,
+    ManagedSecretStoreError,
+    SecretResponse,
+    SecretRotateRequest,
+    SecretUpsertRequest,
+)
 from .session_log import (
     ToolResultStore,
     append_conversation_event,
     append_log,
-    model_to_dict,
     list_conversations,
+    model_to_dict,
     read_conversation,
     reconstruct_conversation_transcript,
     resolve_correlation_identity,
@@ -108,13 +145,6 @@ from .session_log import (
     store_conversation_artifact,
 )
 from .settings import Settings
-from .secret_store import (
-    ManagedSecretStore,
-    ManagedSecretStoreError,
-    SecretResponse,
-    SecretRotateRequest,
-    SecretUpsertRequest,
-)
 
 PROTOCOL_VERSION = "1.0"
 API_PREFIX = "/api/actiondesign-agent"
@@ -164,6 +194,10 @@ McpServerIdPath = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
     ),
 ]
+ClientApiKeyIdPath = Annotated[
+    str,
+    Path(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$"),
+]
 
 
 def create_app(
@@ -185,9 +219,12 @@ def create_app(
             for server in gateway_settings.mcp_servers
         ],
     )
+    initial_mcp_configs = (
+        mcp_server_store.list_configs() if gateway_settings.mcp_proxy_enabled else []
+    )
     mcp_proxy = _build_mcp_proxy(
-        mcp_server_store.list_configs() if gateway_settings.mcp_proxy_enabled else [],
-        managed_secrets,
+        initial_mcp_configs,
+        _snapshot_mcp_secrets(managed_secrets, initial_mcp_configs),
         gateway_settings,
     )
     request_logs = RequestLogStore(
@@ -202,6 +239,7 @@ def create_app(
     browser_api_keys = BrowserApiKeyStore(
         gateway_settings.browser_api_key_store_path
     )
+    client_api_keys = ClientApiKeyStore(gateway_settings.client_api_key_store_path)
     audit_root = FilePath(
         gateway_settings.log_root or gateway_settings.profile_store_path.parent
     )
@@ -216,13 +254,43 @@ def create_app(
     app.state.request_logs = request_logs
     app.state.admin_sessions = admin_sessions
     app.state.browser_api_keys = browser_api_keys
+    app.state.client_api_keys = client_api_keys
     app.state.audit_logs = audit_logs
 
-    def _managed_mcp_runtime(configs: list[McpServerConfig]) -> McpProxy:
-        return _build_mcp_proxy(configs, managed_secrets, gateway_settings)
+    def _managed_mcp_runtime(
+        configs: list[McpServerConfig],
+        secret_overrides: dict[str, str] | None = None,
+    ) -> McpProxy:
+        return _build_mcp_proxy(
+            configs,
+            _snapshot_mcp_secrets(
+                managed_secrets,
+                configs,
+                overrides=secret_overrides,
+            ),
+            gateway_settings,
+        )
 
-    def _publish_managed_mcp_runtime(runtime: McpProxy) -> None:
+    def _publish_managed_mcp_runtime(runtime: McpProxy) -> McpProxy:
+        previous: McpProxy = app.state.mcp_proxy
         app.state.mcp_proxy = runtime
+        return previous
+
+    async def _connection_test_mcp_candidate(
+        candidate: Any,
+        *,
+        secret_overrides: dict[str, str] | None = None,
+    ) -> McpProxy:
+        runtime = _managed_mcp_runtime(
+            list(candidate.configs),
+            secret_overrides=secret_overrides,
+        )
+        for server_id in candidate.server_ids:
+            server = candidate.config(server_id)
+            if server is None or not server.enabled:
+                continue
+            await runtime.list_tools(server_id)
+        return runtime
 
     @app.middleware("http")
     async def admin_ui_security_headers(
@@ -267,13 +335,6 @@ def create_app(
         for name, value in (exc.headers or {}).items():
             response.headers[name] = value
         return response
-
-    admin_static_root = FilePath(__file__).with_name("static") / "admin"
-    app.mount(
-        "/admin",
-        StaticFiles(directory=str(admin_static_root), html=True),
-        name="actiondesign-admin",
-    )
 
     @app.exception_handler(RequestValidationError)
     async def sanitized_request_validation_error(
@@ -387,6 +448,135 @@ def create_app(
                 for index, candidate in enumerate(routing_order, start=1)
             ],
         }
+
+    @app.get("/v1/models")
+    async def compatible_models(request: Request) -> Response:
+        try:
+            _require_client_api_key(request)
+        except HTTPException as exc:
+            body, status_code = openai_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        return JSONResponse(
+            content=openai_models_response(await models(), created=int(time.time()))
+        )
+
+    @app.post("/v1/chat/completions")
+    async def openai_chat_completions(request: Request) -> Response:
+        try:
+            _require_client_api_key(request)
+        except HTTPException as exc:
+            body, status_code = openai_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        try:
+            payload = OpenAIChatCompletionRequest.model_validate(await request.json())
+            agent_request = openai_to_agent_request(payload)
+        except (ProtocolCompatibilityError, ValidationError, ValueError) as exc:
+            body, status_code = openai_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        internal_request = _compatible_internal_request(request, agent_request)
+        if payload.stream:
+            try:
+                gateway_response = _chat_stream(
+                    agent_request,
+                    internal_request,
+                    None,
+                    gateway_settings,
+                    profile_store,
+                )
+            except Exception as exc:
+                body, status_code = openai_error_response(exc)
+                return JSONResponse(status_code=status_code, content=body)
+            routes = _routes_for_request(agent_request, None, profile_store)
+            return StreamingResponse(
+                openai_stream_response(
+                    gateway_response.body_iterator,
+                    model=routes[0].model.id,
+                    include_usage=bool(
+                        payload.stream_options and payload.stream_options.include_usage
+                    ),
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-store"},
+            )
+        gateway_headers = Response()
+        try:
+            result = await _chat(
+                agent_request,
+                internal_request,
+                None,
+                gateway_settings,
+                profile_store,
+                gateway_headers,
+            )
+        except Exception as exc:
+            body, status_code = openai_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        return JSONResponse(
+            content=openai_chat_completion_response(_agent_response_payload(result)),
+            headers=_selected_response_headers(gateway_headers),
+        )
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request) -> Response:
+        try:
+            _require_client_api_key(request)
+        except HTTPException as exc:
+            body, status_code = anthropic_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        if request.headers.get("anthropic-version", "") != "2023-06-01":
+            body, status_code = anthropic_error_response(
+                ProtocolCompatibilityError(
+                    "invalid_anthropic_version",
+                    "anthropic-version must be 2023-06-01",
+                    param="anthropic-version",
+                )
+            )
+            return JSONResponse(status_code=status_code, content=body)
+        try:
+            payload = AnthropicMessagesRequest.model_validate(await request.json())
+            agent_request = anthropic_to_agent_request(payload)
+        except (ProtocolCompatibilityError, ValidationError, ValueError) as exc:
+            body, status_code = anthropic_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        internal_request = _compatible_internal_request(request, agent_request)
+        if payload.stream:
+            try:
+                gateway_response = _chat_stream(
+                    agent_request,
+                    internal_request,
+                    None,
+                    gateway_settings,
+                    profile_store,
+                )
+            except Exception as exc:
+                body, status_code = anthropic_error_response(exc)
+                return JSONResponse(status_code=status_code, content=body)
+            routes = _routes_for_request(agent_request, None, profile_store)
+            return StreamingResponse(
+                anthropic_stream_response(
+                    gateway_response.body_iterator,
+                    model=routes[0].model.id,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-store"},
+            )
+        gateway_headers = Response()
+        try:
+            result = await _chat(
+                agent_request,
+                internal_request,
+                None,
+                gateway_settings,
+                profile_store,
+                gateway_headers,
+            )
+        except Exception as exc:
+            body, status_code = anthropic_error_response(exc)
+            return JSONResponse(status_code=status_code, content=body)
+        return JSONResponse(
+            content=anthropic_message_response(_agent_response_payload(result)),
+            headers=_selected_response_headers(gateway_headers),
+        )
 
     @app.post(
         f"{API_PREFIX}/chat",
@@ -532,6 +722,44 @@ def create_app(
                 status_code=exc.status_code,
                 detail={"code": exc.code, "message": str(exc)},
             ) from exc
+
+    @app.get(
+        f"{API_PREFIX}/mcp/{{server_id}}/config",
+        response_model=McpRuntimeConfigResponse,
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def mcp_runtime_config(
+        server_id: McpServerIdPath,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        identity = resolve_correlation_identity(request, header_only=True)
+        _apply_correlation_headers(response, identity)
+        _require_mcp_origin(request, gateway_settings)
+        public = mcp_server_store.get_public(
+            server_id,
+            managed_secrets,
+            proxy_enabled=gateway_settings.mcp_proxy_enabled,
+        )
+        if public is None:
+            raise HTTPException(
+                status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"}
+            )
+        return {
+            key: public[key]
+            for key in (
+                "id",
+                "transport",
+                "executionMode",
+                "authMode",
+                "browserDirectUrl",
+                "enabled",
+                "proxyEnabled",
+                "configVersion",
+                "activeVersion",
+                "connectionStatus",
+            )
+        }
 
     @app.post(
         f"{API_PREFIX}/mcp/{{server_id}}/call",
@@ -738,6 +966,69 @@ def create_app(
             details={"masked": result["masked"]},
         )
         return result
+
+    @app.get(f"{API_PREFIX}/admin/client-api-keys")
+    @app.get("/admin/client-api-keys")
+    async def list_client_api_keys(request: Request) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        return {"items": client_api_keys.list_public()}
+
+    @app.post(f"{API_PREFIX}/admin/client-api-keys", status_code=201)
+    @app.post("/admin/client-api-keys", status_code=201)
+    async def create_client_api_key(
+        req: ClientApiKeyCreateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        request_id = _audit_request_id(request)
+        try:
+            result = client_api_keys.create(req)
+        except (ValueError, ClientApiKeyStoreError) as exc:
+            raise HTTPException(
+                status_code=503 if isinstance(exc, ClientApiKeyStoreError) else 422,
+                detail={"code": "CLIENT_API_KEY_CREATE_FAILED"},
+            ) from exc
+        audit_logs.record(
+            action="client_api_key_create",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=request_id,
+            details={
+                "keyId": result["id"],
+                "name": result["name"],
+                "prefix": result["prefix"],
+            },
+        )
+        return result
+
+    @app.delete(f"{API_PREFIX}/admin/client-api-keys/{{key_id}}")
+    @app.delete("/admin/client-api-keys/{key_id}")
+    async def delete_client_api_key(
+        key_id: ClientApiKeyIdPath,
+        request: Request,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        request_id = _audit_request_id(request)
+        try:
+            client_api_keys.delete(key_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "CLIENT_API_KEY_NOT_FOUND"},
+            ) from exc
+        except ClientApiKeyStoreError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "CLIENT_API_KEY_STORE_UNAVAILABLE"},
+            ) from exc
+        audit_logs.record(
+            action="client_api_key_delete",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=request_id,
+            details={"keyId": key_id},
+        )
+        return {"keyId": key_id, "deleted": True}
 
     @app.get(
         f"{API_PREFIX}/admin/audit-logs",
@@ -1350,11 +1641,16 @@ def create_app(
         if server_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "MCP_SERVER_ID_MISMATCH"})
         try:
-            saved, _ = mcp_server_store.upsert(
-                req,
-                _managed_mcp_runtime,
+            candidate = mcp_server_store.create_upsert_candidate(req)
+            runtime = await _connection_test_mcp_candidate(candidate)
+            mcp_server_store.commit_candidate(
+                candidate,
+                runtime,
                 _publish_managed_mcp_runtime,
+                connection_status="healthy",
             )
+            saved = candidate.config(server_id)
+            assert saved is not None
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
         audit_logs.record(
@@ -1390,12 +1686,16 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
-            saved, _ = mcp_server_store.set_enabled(
-                server_id,
-                req.enabled,
-                _managed_mcp_runtime,
+            candidate = mcp_server_store.create_enabled_candidate(server_id, req.enabled)
+            runtime = await _connection_test_mcp_candidate(candidate)
+            mcp_server_store.commit_candidate(
+                candidate,
+                runtime,
                 _publish_managed_mcp_runtime,
+                connection_status="healthy" if req.enabled else "disconnected",
             )
+            saved = candidate.config(server_id)
+            assert saved is not None
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
         audit_logs.record(
@@ -1424,10 +1724,13 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
-            mcp_server_store.delete(
-                server_id,
-                _managed_mcp_runtime,
+            candidate = mcp_server_store.create_delete_candidate(server_id)
+            runtime = _managed_mcp_runtime(list(candidate.configs))
+            mcp_server_store.commit_candidate(
+                candidate,
+                runtime,
                 _publish_managed_mcp_runtime,
+                connection_status="disconnected",
             )
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
@@ -1461,12 +1764,17 @@ def create_app(
             try:
                 listed = await request.app.state.mcp_proxy.list_tools(server_id)
                 result = _mcp_connection_result(server_id, started, listed=listed)
+                mcp_server_store.set_connection_status(server_id, "healthy")
             except McpProxyError as exc:
                 result = _mcp_connection_result(
                     server_id,
                     started,
                     error_code=exc.code,
                 )
+                try:
+                    mcp_server_store.set_connection_status(server_id, "unhealthy")
+                except KeyError:
+                    pass
         audit_logs.record(
             action="mcp_server_connection_test",
             success=result["status"] == "healthy",
@@ -1517,8 +1825,36 @@ def create_app(
         if secret_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "SECRET_ID_MISMATCH"})
         try:
+            candidate = None
+            runtime = None
+            if req.value:
+                candidate = mcp_server_store.create_secret_candidate([secret_id])
+                if candidate.server_ids:
+                    runtime = await _connection_test_mcp_candidate(
+                        candidate,
+                        secret_overrides={secret_id: req.value},
+                    )
+            rollback_snapshot = (
+                managed_secrets.snapshot_for_rollback(secret_id)
+                if runtime is not None
+                else None
+            )
             result = managed_secrets.upsert(req)
+            if candidate is not None and runtime is not None:
+                try:
+                    mcp_server_store.commit_candidate(
+                        candidate,
+                        runtime,
+                        _publish_managed_mcp_runtime,
+                        connection_status="healthy",
+                    )
+                except Exception:
+                    assert rollback_snapshot is not None
+                    managed_secrets.restore_snapshot(rollback_snapshot)
+                    raise
         except Exception as exc:
+            if isinstance(exc, (McpProxyError, McpServerStoreError)):
+                raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
         audit_logs.record(
             action="secret_upsert",
@@ -1541,8 +1877,34 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
+            candidate = mcp_server_store.create_secret_candidate([secret_id])
+            runtime = None
+            if candidate.server_ids:
+                runtime = await _connection_test_mcp_candidate(
+                    candidate,
+                    secret_overrides={secret_id: req.value},
+                )
+            rollback_snapshot = (
+                managed_secrets.snapshot_for_rollback(secret_id)
+                if runtime is not None
+                else None
+            )
             result = managed_secrets.rotate(secret_id, req)
+            if runtime is not None:
+                try:
+                    mcp_server_store.commit_candidate(
+                        candidate,
+                        runtime,
+                        _publish_managed_mcp_runtime,
+                        connection_status="healthy",
+                    )
+                except Exception:
+                    assert rollback_snapshot is not None
+                    managed_secrets.restore_snapshot(rollback_snapshot)
+                    raise
         except Exception as exc:
+            if isinstance(exc, (McpProxyError, McpServerStoreError)):
+                raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
         audit_logs.record(
             action="secret_rotate",
@@ -1564,8 +1926,29 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
+            candidate = mcp_server_store.create_secret_candidate([secret_id])
+            rollback_snapshot = (
+                managed_secrets.snapshot_for_rollback(secret_id)
+                if candidate.server_ids
+                else None
+            )
             result = managed_secrets.revoke(secret_id)
+            if candidate.server_ids:
+                runtime = _managed_mcp_runtime(list(candidate.configs))
+                try:
+                    mcp_server_store.commit_candidate(
+                        candidate,
+                        runtime,
+                        _publish_managed_mcp_runtime,
+                        connection_status="disconnected",
+                    )
+                except Exception:
+                    assert rollback_snapshot is not None
+                    managed_secrets.restore_snapshot(rollback_snapshot)
+                    raise
         except Exception as exc:
+            if isinstance(exc, McpServerStoreError):
+                raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
         audit_logs.record(
             action="secret_revoke",
@@ -1685,6 +2068,14 @@ def create_app(
         )
         return {"success": success}
 
+    # Keep the static mount last so exact /admin/* JSON routes registered above
+    # are not swallowed by StaticFiles.
+    admin_static_root = FilePath(__file__).with_name("static") / "admin"
+    app.mount(
+        "/admin",
+        StaticFiles(directory=str(admin_static_root), html=True),
+        name="actiondesign-admin",
+    )
     return app
 
 
@@ -1701,6 +2092,78 @@ def _validated_header_identity(request: Request) -> RequestCorrelationIdentity |
         return RequestCorrelationIdentity.model_validate(payload)
     except ValidationError:
         return None
+
+
+def _compatible_internal_request(
+    request: Request,
+    body: AgentChatRequest,
+) -> Request:
+    scope = dict(request.scope)
+    removed = {
+        b"authorization",
+        b"x-api-key",
+        BROWSER_API_KEY_HEADER.lower().encode("ascii"),
+        b"x-conversation-id",
+        b"x-agent-run-id",
+        b"x-request-id",
+        b"x-correlation-id",
+        b"x-retry-of",
+        b"x-parent-request-id",
+    }
+    headers = [
+        (name, value)
+        for name, value in scope.get("headers", [])
+        if name.lower() not in removed
+    ]
+    headers.extend(
+        [
+            (b"x-conversation-id", body.conversation_id.encode("utf-8")),
+            (b"x-agent-run-id", body.run_id.encode("utf-8")),
+            (b"x-request-id", body.request_id.encode("utf-8")),
+            (b"x-correlation-id", body.correlation_id.encode("utf-8")),
+        ]
+    )
+    if body.retry_of:
+        headers.append((b"x-retry-of", body.retry_of.encode("utf-8")))
+    if body.parent_request_id:
+        headers.append(
+            (b"x-parent-request-id", body.parent_request_id.encode("utf-8"))
+        )
+    scope["headers"] = headers
+    return Request(scope, request.receive)
+
+
+def _agent_response_payload(result: dict[str, Any]) -> AgentChatResponse:
+    return AgentChatResponse.model_validate(
+        {
+            "provider": result.get("provider", ""),
+            "model": result.get("model", ""),
+            "content": result.get("content", ""),
+            "tool_calls": result.get("toolCalls", result.get("tool_calls", [])),
+            "success": result.get("success", True),
+            "error": result.get("error"),
+            "code": result.get("code"),
+            "duration_ms": result.get("durationMs", result.get("duration_ms", 0)),
+            "usage": result.get("usage", {}),
+        }
+    )
+
+
+def _selected_response_headers(response: Response) -> dict[str, str]:
+    allowed = {
+        "x-route-attempts",
+        "x-actual-profile",
+        "x-actual-model",
+        "x-request-id",
+        "x-correlation-id",
+    }
+    return {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() in allowed
+    }
+
+
 def _validated_runtime_header_identity(request: Request) -> RequestIdentity | None:
     payload = {
         "conversationId": request.headers.get("X-Conversation-Id", "").strip(),
@@ -2523,15 +2986,51 @@ def _require_service_auth(
     if browser_api_key:
         sessions: AdminSessionStore = request.app.state.admin_sessions
         api_keys: BrowserApiKeyStore = request.app.state.browser_api_keys
-        if sessions.verify(browser_api_key) or api_keys.verify(browser_api_key):
+        client_api_keys: ClientApiKeyStore = request.app.state.client_api_keys
+        if (
+            sessions.verify(browser_api_key)
+            or api_keys.verify(browser_api_key)
+            or client_api_keys.verify(browser_api_key) is not None
+        ):
             return
     api_keys = request.app.state.browser_api_keys
-    if settings.service_auth_mode == "disabled" and not api_keys.public()["configured"]:
+    if (
+        settings.service_auth_mode == "disabled"
+        and not api_keys.public()["configured"]
+    ):
         return
     raise HTTPException(
         status_code=401,
         detail={"code": "GATEWAY_SERVICE_AUTH_REQUIRED"},
     )
+
+
+def _require_client_api_key(request: Request) -> dict[str, Any]:
+    authorization = request.headers.get("Authorization", "")
+    bearer = authorization.removeprefix("Bearer ").strip() if authorization.startswith("Bearer ") else ""
+    candidates = [
+        value
+        for value in (
+            bearer,
+            request.headers.get("x-api-key", "").strip(),
+            request.headers.get(BROWSER_API_KEY_HEADER, "").strip(),
+        )
+        if value
+    ]
+    if not candidates or any(value != candidates[0] for value in candidates[1:]):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "CLIENT_API_KEY_REQUIRED"},
+        )
+    store: ClientApiKeyStore = request.app.state.client_api_keys
+    result = store.verify(candidates[0])
+    if result is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "CLIENT_API_KEY_INVALID"},
+        )
+    request.state.client_api_key_id = result["id"]
+    return result
 
 
 def _audit_actor(request: Request) -> str:
@@ -2721,7 +3220,7 @@ def _log_mcp_tools(
 
 def _build_mcp_proxy(
     servers: list[McpServerConfig],
-    managed_secrets: ManagedSecretStore,
+    managed_secrets: McpSecretResolver,
     settings: Settings,
 ) -> McpProxy:
     return McpProxy(
@@ -2733,6 +3232,25 @@ def _build_mcp_proxy(
         },
         allowed_http_urls=settings.mcp_allowed_http_urls,
     )
+
+
+def _snapshot_mcp_secrets(
+    store: ManagedSecretStore,
+    servers: list[McpServerConfig] | tuple[McpServerConfig, ...],
+    *,
+    overrides: dict[str, str] | None = None,
+) -> McpSecretResolver:
+    candidate_values = dict(overrides or {})
+    for server in servers:
+        for secret_id in _mcp_server_secret_ids(server):
+            if secret_id in candidate_values:
+                continue
+            try:
+                candidate_values[secret_id] = store.resolve_value(secret_id)
+            except (KeyError, ManagedSecretStoreError):
+                # Preserve the existing fail-closed behavior for unconfigured bindings.
+                continue
+    return store.candidate_overlay(candidate_values)
 
 
 def _mcp_server_secret_ids(server: McpServerConfig) -> list[str]:
@@ -2824,10 +3342,20 @@ def _managed_secret_http_error(exc: Exception) -> HTTPException:
 
 
 def _mcp_server_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, McpProxyError):
+        return HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        )
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=409, detail={"code": "MCP_SERVER_READ_ONLY"})
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+    if isinstance(exc, McpServerCandidateStaleError):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "MCP_SERVER_CANDIDATE_STALE"},
+        )
     if isinstance(exc, McpServerStoreError):
         return HTTPException(
             status_code=503,

@@ -10,22 +10,21 @@ import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import httpcore
 import httpx
 from httpcore._backends.auto import AutoBackend
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError as JsonSchemaValidationError
+from jsonschema.exceptions import SchemaError
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .redaction import redact_value
-from .secret_store import ManagedSecretStore, ManagedSecretStoreError
-
+from .secret_store import ManagedSecretStoreError
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,127}$")
@@ -56,6 +55,8 @@ _MAX_ARGUMENT_CHARACTERS = 2_000_000
 _MAX_RESULT_CHARACTERS = 2_000_000
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 50_000
+McpExecutionMode = Literal["auto", "browser_direct", "gateway_proxy"]
+McpAuthMode = Literal["none", "backend_secret"]
 
 
 class McpProxyError(RuntimeError):
@@ -134,6 +135,12 @@ class _StrictModel(BaseModel):
         strict=True,
         validate_default=True,
     )
+
+
+class McpSecretResolver(Protocol):
+    """Minimal Secret surface required by the transport-only MCP proxy."""
+
+    def resolve_value(self, secret_id: str) -> str: ...
 
 
 class McpSecretBinding(_StrictModel):
@@ -297,6 +304,15 @@ class McpServerConfig(_StrictModel):
         alias="expectedServerName",
         max_length=128,
     )
+    execution_mode: McpExecutionMode = Field(
+        default="gateway_proxy",
+        alias="executionMode",
+    )
+    auth_mode: McpAuthMode = Field(
+        default="none",
+        alias="authMode",
+    )
+    config_version: int = Field(default=1, alias="configVersion", ge=1)
     timeout_seconds: float = Field(
         default=30.0,
         alias="timeoutSeconds",
@@ -304,6 +320,32 @@ class McpServerConfig(_StrictModel):
         le=600.0,
     )
     enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_defaults_are_safe(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        payload = dict(value)
+        if "executionMode" not in payload and "execution_mode" not in payload:
+            payload["executionMode"] = "gateway_proxy"
+        if "authMode" not in payload and "auth_mode" not in payload:
+            transport = payload.get("transport")
+            transport_config = (
+                payload.get("stdio")
+                if transport == "stdio"
+                else payload.get("streamableHttp", payload.get("streamable_http"))
+            )
+            bindings = (
+                transport_config.get(
+                    "secretBindings",
+                    transport_config.get("secret_bindings", []),
+                )
+                if isinstance(transport_config, Mapping)
+                else []
+            )
+            payload["authMode"] = "backend_secret" if bindings else "none"
+        return payload
 
     @field_validator("id", "expected_server_name")
     @classmethod
@@ -330,6 +372,34 @@ class McpServerConfig(_StrictModel):
             raise ValueError(
                 "streamable_http MCP server requires only streamableHttp configuration"
             )
+        if self.transport == "stdio":
+            assert self.stdio is not None
+            has_secret_bindings = bool(self.stdio.secret_bindings)
+        else:
+            assert self.streamable_http is not None
+            has_secret_bindings = bool(self.streamable_http.secret_bindings)
+        if self.auth_mode == "backend_secret" and not has_secret_bindings:
+            raise ValueError(
+                "backend_secret MCP authentication requires a Secret binding"
+            )
+        if self.auth_mode == "none" and has_secret_bindings:
+            raise ValueError("MCP Secret bindings require backend_secret authentication")
+        if self.transport == "stdio" and self.execution_mode != "gateway_proxy":
+            raise ValueError("stdio MCP servers must use gateway_proxy execution")
+        if self.auth_mode == "backend_secret" and self.execution_mode != "gateway_proxy":
+            raise ValueError(
+                "backend_secret MCP servers must use gateway_proxy execution"
+            )
+        if (
+            self.transport == "streamable_http"
+            and self.streamable_http is not None
+            and self.streamable_http.headers
+            and self.execution_mode != "gateway_proxy"
+        ):
+            raise ValueError(
+                "streamable HTTP MCP servers with static headers must use "
+                "gateway_proxy execution"
+            )
         return self
 
 
@@ -339,7 +409,7 @@ class McpProxy:
     def __init__(
         self,
         servers: list[McpServerConfig | dict[str, Any]],
-        secret_store: ManagedSecretStore,
+        secret_store: McpSecretResolver,
         *,
         allowed_stdio_paths: Sequence[Path] = (),
         allowed_http_urls: Sequence[str] = (),
@@ -880,9 +950,12 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 __all__ = [
+    "McpAuthMode",
+    "McpExecutionMode",
     "McpProxy",
     "McpProxyError",
     "McpSecretBinding",
+    "McpSecretResolver",
     "McpServerConfig",
     "StdioTransportConfig",
     "StreamableHttpTransportConfig",

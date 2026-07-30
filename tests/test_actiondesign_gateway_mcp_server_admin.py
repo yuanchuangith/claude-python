@@ -14,7 +14,9 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from claude_agent_sdk.actiondesign_gateway import mcp_proxy as mcp_proxy_module  # noqa: E402
+from claude_agent_sdk.actiondesign_gateway import (
+    mcp_proxy as mcp_proxy_module,  # noqa: E402
+)
 from claude_agent_sdk.actiondesign_gateway.app import create_app  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.mcp_proxy import McpProxy  # noqa: E402
 from claude_agent_sdk.actiondesign_gateway.mcp_server_store import (  # noqa: E402
@@ -25,7 +27,6 @@ from claude_agent_sdk.actiondesign_gateway.profile_store import (  # noqa: E402
     MemoryProfileSecretStore,
 )
 from claude_agent_sdk.actiondesign_gateway.settings import Settings  # noqa: E402
-
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 SERVICE_TOKEN = "service-token-" + ("x" * 32)
@@ -184,6 +185,12 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
         "source",
         "proxyEnabled",
         "browserConfigurable",
+        "executionMode",
+        "authMode",
+        "browserDirectUrl",
+        "configVersion",
+        "activeVersion",
+        "connectionStatus",
         "secretBindingStatus",
     }
     assert all(
@@ -374,6 +381,16 @@ def test_public_https_mcp_server_does_not_require_static_url_allowlist(
     client = TestClient(
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
     )
+
+    async def fake_list_tools(_self, server_id):
+        return {
+            "serverId": server_id,
+            "serverName": "public-server",
+            "serverVersion": "1.0.0",
+            "tools": [],
+        }
+
+    monkeypatch.setattr(McpProxy, "list_tools", fake_list_tools)
     payload = managed_http_server()
     payload["streamableHttp"]["url"] = "https://public.example.test/mcp"
 
@@ -411,17 +428,19 @@ def test_mcp_server_admin_requires_bearer_and_strict_128_character_id(tmp_path):
         assert path in schema["paths"]
 
 
-def test_missing_bound_secret_is_visible_as_status_and_fails_runtime_before_transport(
+def test_missing_bound_secret_can_be_saved_disabled_but_cannot_be_activated(
     tmp_path,
 ):
     settings = make_settings(tmp_path)
     client = TestClient(
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
     )
+    payload = managed_http_server()
+    payload["enabled"] = False
     created = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
         headers=ADMIN_HEADERS,
-        json=managed_http_server(),
+        json=payload,
     )
     assert created.status_code == 200
     assert created.json()["secretBindingStatus"] == [
@@ -434,6 +453,162 @@ def test_missing_bound_secret_is_visible_as_status_and_fails_runtime_before_tran
         "/api/actiondesign-agent/admin/mcp-servers",
         headers=ADMIN_HEADERS,
     ).json()[0]["id"] == "managed.server-1"
+    active_proxy = client.app.state.mcp_proxy
+    enabled = client.put(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1/enabled",
+        headers=ADMIN_HEADERS,
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 503
+    assert enabled.json()["detail"]["code"] == "MCP_SECRET_UNAVAILABLE"
+    assert "mcp.primary" not in enabled.text
+    assert client.app.state.mcp_proxy is active_proxy
+    assert client.get(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
+        headers=ADMIN_HEADERS,
+    ).json()["enabled"] is False
+
+
+@pytest.mark.parametrize("operation", ["upsert", "rotate", "revoke"])
+def test_secret_candidate_publish_failure_restores_old_secret_via_api(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    settings = make_settings(tmp_path)
+    client = TestClient(
+        create_app(settings, profile_secret_store=MemoryProfileSecretStore())
+    )
+
+    @asynccontextmanager
+    async def fake_session(_self, server):
+        class FakeSession:
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+        yield FakeSession(), {
+            "serverName": server.expected_server_name,
+            "serverVersion": "1.0.0",
+        }, ()
+
+    monkeypatch.setattr(McpProxy, "_session", fake_session)
+    original_value = "old-managed-secret"
+    created_secret = client.put(
+        "/api/actiondesign-agent/admin/secrets/mcp.primary",
+        headers=ADMIN_HEADERS,
+        json={
+            "id": "mcp.primary",
+            "kind": "mcp_key",
+            "displayName": "Primary MCP key",
+            "value": original_value,
+        },
+    )
+    assert created_secret.status_code == 200
+    created_server = client.put(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
+        headers=ADMIN_HEADERS,
+        json=managed_http_server(),
+    )
+    assert created_server.status_code == 200, created_server.text
+    old_proxy = client.app.state.mcp_proxy
+    old_metadata = client.app.state.managed_secrets.get("mcp.primary")
+
+    def fail_commit(*_args, **_kwargs):
+        raise RuntimeError("simulated candidate publish failure")
+
+    monkeypatch.setattr(
+        client.app.state.mcp_server_store,
+        "commit_candidate",
+        fail_commit,
+    )
+    if operation == "rotate":
+        failed = client.post(
+            "/api/actiondesign-agent/admin/secrets/mcp.primary/rotate",
+            headers=ADMIN_HEADERS,
+            json={"value": "new-managed-secret"},
+        )
+    elif operation == "upsert":
+        failed = client.put(
+            "/api/actiondesign-agent/admin/secrets/mcp.primary",
+            headers=ADMIN_HEADERS,
+            json={
+                "id": "mcp.primary",
+                "kind": "mcp_key",
+                "displayName": "Candidate MCP key",
+                "value": "new-managed-secret",
+            },
+        )
+    else:
+        failed = client.delete(
+            "/api/actiondesign-agent/admin/secrets/mcp.primary",
+            headers=ADMIN_HEADERS,
+        )
+
+    assert failed.status_code == 500
+    assert client.app.state.mcp_proxy is old_proxy
+    assert client.app.state.managed_secrets.get("mcp.primary") == old_metadata
+    assert (
+        client.app.state.managed_secrets.resolve_value("mcp.primary")
+        == original_value
+    )
+    persisted = settings.managed_secret_store_path.read_text(encoding="utf-8")
+    assert "Candidate MCP key" not in persisted
+    assert "new-managed-secret" not in persisted
+
+
+def test_secret_revoke_swaps_to_fail_closed_proxy_and_old_proxy_can_drain(
+    tmp_path,
+    monkeypatch,
+):
+    settings = make_settings(tmp_path)
+    client = TestClient(
+        create_app(settings, profile_secret_store=MemoryProfileSecretStore())
+    )
+    original_session = McpProxy._session
+
+    @asynccontextmanager
+    async def fake_session(_self, server):
+        class FakeSession:
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+        yield FakeSession(), {
+            "serverName": server.expected_server_name,
+            "serverVersion": "1.0.0",
+        }, ()
+
+    monkeypatch.setattr(McpProxy, "_session", fake_session)
+    old_value = "old-managed-secret"
+    assert client.put(
+        "/api/actiondesign-agent/admin/secrets/mcp.primary",
+        headers=ADMIN_HEADERS,
+        json={
+            "id": "mcp.primary",
+            "kind": "mcp_key",
+            "displayName": "Primary MCP key",
+            "value": old_value,
+        },
+    ).status_code == 200
+    assert client.put(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
+        headers=ADMIN_HEADERS,
+        json=managed_http_server(),
+    ).status_code == 200
+    old_proxy = client.app.state.mcp_proxy
+    monkeypatch.setattr(McpProxy, "_session", original_session)
+
+    revoked = client.delete(
+        "/api/actiondesign-agent/admin/secrets/mcp.primary",
+        headers=ADMIN_HEADERS,
+    )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["configured"] is False
+    new_proxy = client.app.state.mcp_proxy
+    assert new_proxy is not old_proxy
+    assert old_proxy._secret_store.resolve_value("mcp.primary") == old_value
+    with pytest.raises(KeyError):
+        new_proxy._secret_store.resolve_value("mcp.primary")
+
     runtime = client.get(
         "/api/actiondesign-agent/mcp/managed.server-1/tools",
         headers={
@@ -444,7 +619,6 @@ def test_missing_bound_secret_is_visible_as_status_and_fails_runtime_before_tran
     )
     assert runtime.status_code == 503
     assert runtime.json()["detail"]["code"] == "MCP_SECRET_UNAVAILABLE"
-    assert "mcp.primary" not in runtime.text
 
 
 def test_corrupt_managed_mcp_server_store_fails_closed(tmp_path):

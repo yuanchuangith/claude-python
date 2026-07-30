@@ -4,14 +4,22 @@ import json
 import re
 import threading
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .profile_store import ProfileSecretStore, ProfileSecretStoreError
-
 
 _SECRET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SECRET_KIND_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
@@ -229,6 +237,21 @@ class _SecretMetadataFile(_StrictModel):
         return self
 
 
+@dataclass(frozen=True, repr=False)
+class ManagedSecretRollbackSnapshot:
+    """Opaque pre-mutation Secret state used only for failure rollback."""
+
+    secret_id: str
+    metadata: _SecretMetadata | None
+    value: str
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(secret_id={self.secret_id!r}, "
+            "metadata=<redacted>, value=<redacted>)"
+        )
+
+
 class ManagedSecretStore:
     """Metadata-only registry backed by an existing secure Secret backend."""
 
@@ -261,6 +284,78 @@ class ManagedSecretStore:
             if not value:
                 raise ManagedSecretStoreError("configured Secret value is unavailable")
             return value
+
+    def candidate_overlay(
+        self,
+        values: Mapping[str, str],
+    ) -> ManagedSecretCandidateOverlay:
+        """Create a memory-only Secret view for connection testing.
+
+        Candidate values are validated but never written to the metadata file or
+        secure backend.  Dropping the overlay drops the only additional references.
+        """
+
+        return ManagedSecretCandidateOverlay(self, values)
+
+    def snapshot_for_rollback(
+        self,
+        secret_id: str,
+    ) -> ManagedSecretRollbackSnapshot:
+        """Capture the current Secret state without exposing it publicly."""
+
+        safe_id = _validate_secret_id(secret_id)
+        with self._lock:
+            current = self._secrets.get(safe_id)
+            value = ""
+            if current is not None and current.secret_ref is not None:
+                value = self._backend_get(current.secret_ref) or ""
+                if not value:
+                    raise ManagedSecretStoreError(
+                        "configured Secret value is unavailable"
+                    )
+            return ManagedSecretRollbackSnapshot(
+                secret_id=safe_id,
+                metadata=(
+                    current.model_copy(deep=True) if current is not None else None
+                ),
+                value=value,
+            )
+
+    def restore_snapshot(
+        self,
+        snapshot: ManagedSecretRollbackSnapshot,
+    ) -> dict[str, Any] | None:
+        """Restore metadata and secure storage after a later publish failure."""
+
+        safe_id = _validate_secret_id(snapshot.secret_id)
+        with self._lock:
+            current = self._secrets.get(safe_id)
+            current_ref = current.secret_ref if current is not None else None
+            previous = snapshot.metadata
+            previous_ref = previous.secret_ref if previous is not None else None
+            if previous_ref is not None:
+                if not snapshot.value:
+                    raise ManagedSecretStoreError(
+                        "Secret rollback snapshot is incomplete"
+                    )
+                self._backend_set(previous_ref, snapshot.value)
+            if previous is None:
+                self._secrets.pop(safe_id, None)
+            else:
+                self._secrets[safe_id] = previous.model_copy(deep=True)
+            try:
+                self._save()
+            except Exception:
+                if current is None:
+                    self._secrets.pop(safe_id, None)
+                else:
+                    self._secrets[safe_id] = current
+                if previous_ref is not None and previous_ref != current_ref:
+                    self._restore_backend(previous_ref, "")
+                raise
+            if current_ref is not None and current_ref != previous_ref:
+                self._backend_delete(current_ref)
+            return previous.public() if previous is not None else None
 
     def upsert(self, request: SecretUpsertRequest | dict[str, Any]) -> dict[str, Any]:
         payload = SecretUpsertRequest.model_validate(request)
@@ -506,7 +601,48 @@ class ManagedSecretStore:
         return datetime.now(timezone.utc).isoformat()
 
 
+class ManagedSecretCandidateOverlay:
+    """Read-through Secret resolver with redacted, memory-only candidate values."""
+
+    def __init__(
+        self,
+        base_store: ManagedSecretStore,
+        values: Mapping[str, str],
+    ) -> None:
+        self._base_store = base_store
+        self._values = {
+            _validate_secret_id(secret_id): SecretRotateRequest.model_validate(
+                {"value": value}
+            ).value
+            for secret_id, value in values.items()
+        }
+
+    @property
+    def secret_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._values))
+
+    def get(self, secret_id: str) -> dict[str, Any] | None:
+        safe_id = _validate_secret_id(secret_id)
+        if safe_id in self._values:
+            return {"id": safe_id, "configured": True}
+        return self._base_store.get(safe_id)
+
+    def resolve_value(self, secret_id: str) -> str:
+        safe_id = _validate_secret_id(secret_id)
+        if safe_id in self._values:
+            return self._values[safe_id]
+        return self._base_store.resolve_value(safe_id)
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(secret_ids={self.secret_ids!r}, "
+            "values=<redacted>)"
+        )
+
+
 __all__ = [
+    "ManagedSecretCandidateOverlay",
+    "ManagedSecretRollbackSnapshot",
     "ManagedSecretStore",
     "ManagedSecretStoreError",
     "SecretResponse",

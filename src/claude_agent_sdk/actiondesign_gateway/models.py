@@ -12,7 +12,14 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from .identifiers import (
     validate_conversation_uuid4,
@@ -22,6 +29,7 @@ from .identifiers import (
     validate_safe_request_id,
     validate_uuid4_id,
 )
+
 MIMO_MODELS: dict[str, dict[str, Any]] = {
     "mimo-v2.5": {
         "name": "MiMo v2.5",
@@ -259,6 +267,55 @@ class RequestCorrelationIdentity(RequestCorrelation):
         return validate_uuid4_id(value, label="requestId")
 
 
+class AgentChatMessage(_GatewayBaseModel):
+    """Provider-neutral conversation history used by compatibility adapters.
+
+    This model deliberately represents native tool calls structurally.  It is
+    not a backend tool registry and it never parses text as a tool protocol.
+    """
+
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(default="", max_length=MAX_PROMPT_CHARS)
+    tool_calls: list["NativeToolCall"] = Field(
+        default_factory=list,
+        alias="toolCalls",
+        max_length=128,
+    )
+    tool_call_id: str = Field(default="", alias="toolCallId", max_length=256)
+    is_error: bool = Field(default=False, alias="isError")
+    name: str = Field(default="", max_length=128)
+
+    @field_validator("tool_call_id")
+    def _validate_tool_call_id(cls, value: str) -> str:
+        if value and not IDENTIFIER_RE.fullmatch(value):
+            raise ValueError("message toolCallId is invalid")
+        return value
+
+    @field_validator("name")
+    def _validate_name(cls, value: str) -> str:
+        if value and not TOOL_NAME_RE.fullmatch(value):
+            raise ValueError("message name is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_role_shape(self) -> "AgentChatMessage":
+        if self.role == "assistant":
+            if self.tool_call_id:
+                raise ValueError("assistant messages cannot set toolCallId")
+            if not self.content.strip() and not self.tool_calls:
+                raise ValueError("assistant messages require content or toolCalls")
+        elif self.role == "tool":
+            if not self.tool_call_id:
+                raise ValueError("tool messages require toolCallId")
+            if self.tool_calls:
+                raise ValueError("tool messages cannot contain toolCalls")
+        elif self.tool_calls or self.tool_call_id or self.is_error:
+            raise ValueError("user messages cannot contain tool call metadata")
+        if self.role == "assistant" and self.is_error:
+            raise ValueError("assistant messages cannot be tool errors")
+        return self
+
+
 class AgentChatRequest(RequestCorrelationIdentity):
     provider: str = "auto"
     profile_id: str = Field(default="", alias="profileId")
@@ -273,6 +330,7 @@ class AgentChatRequest(RequestCorrelationIdentity):
     )
     system_prompt: str = Field(alias="systemPrompt", min_length=1, max_length=500_000)
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    messages: list[AgentChatMessage] = Field(default_factory=list, max_length=10_000)
     stream: bool = False
     tools: list[NativeToolDefinition] = Field(default_factory=list)
     tool_choice: NativeToolChoice | None = Field(default=None, alias="toolChoice")
@@ -377,6 +435,15 @@ class AgentChatRequest(RequestCorrelationIdentity):
             raise ValueError(f"at most {MAX_IMAGES} images are allowed")
         return value
 
+    @field_validator("messages")
+    def _validate_messages(cls, value: list[AgentChatMessage]) -> list[AgentChatMessage]:
+        _validate_bounded_json(
+            [message.model_dump(mode="json", by_alias=True) for message in value],
+            label="canonical message history",
+            max_chars=MAX_PROMPT_CHARS,
+        )
+        return value
+
     @model_validator(mode="after")
     def _validate_tool_choice(self) -> "AgentChatRequest":
         choice = self.tool_choice
@@ -411,6 +478,12 @@ class NativeToolCall(_GatewayBaseModel):
             label="native tool call arguments",
             max_chars=MAX_TOOL_ARGUMENTS_JSON_CHARS,
         )
+
+
+# Resolve the intentionally forward-declared tool call type after both
+# canonical request models have been defined.
+AgentChatMessage.model_rebuild()
+AgentChatRequest.model_rebuild()
 
 
 class AgentChatResponse(_GatewayBaseModel):

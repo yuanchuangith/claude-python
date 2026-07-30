@@ -120,6 +120,13 @@
         </div>
 
         <div class="panel narrow">
+          <div class="panel-head"><div><h2>Client API Key</h2><p>用于 OpenAI、Anthropic 兼容接口和 MCP 代理；完整值仅在创建成功时显示一次。</p></div><button id="refresh-client-keys" class="secondary-btn">刷新</button></div>
+          <div class="table-wrap"><table><thead><tr><th>名称</th><th>前缀</th><th>创建时间</th><th>最后使用</th><th></th></tr></thead><tbody id="client-keys-body"></tbody></table></div>
+          <form id="create-client-key-form" autocomplete="off"><div class="form-grid two"><label>Key 名称<input id="client-key-name" required minlength="1" maxlength="128" autocomplete="off" placeholder="例如 ActionDesign Browser"></label><div class="form-actions"><button class="primary-btn" type="submit">创建 Client API Key</button></div></div></form>
+          <div id="revealed-client-key" class="revealed-key hidden"><span>完整 Key 仅显示一次</span><code id="revealed-client-key-value"></code><div class="row-actions"><button id="copy-client-key" class="secondary-btn">复制</button><button id="clear-client-key" class="ghost-btn">清除</button></div></div>
+        </div>
+
+        <div class="panel narrow">
           <div class="panel-head"><div><h2>Browser API Key</h2><p>管理员创建/轮换后明文只显示一次，并在 60 秒或离开页面时自动清除。</p></div><button id="refresh-key" class="secondary-btn">刷新状态</button></div>
           <div id="key-status" class="key-status">等待登录后加载</div>
           <form id="rotate-key-form" autocomplete="off"><label>可选指定新 Key<input id="custom-access-key" type="password" minlength="16" maxlength="8192" autocomplete="new-password" placeholder="留空由后端生成"></label><button class="danger-btn" type="submit">创建 / 轮换访问 Key</button></form>

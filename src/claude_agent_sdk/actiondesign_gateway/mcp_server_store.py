@@ -3,24 +3,60 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from collections.abc import Callable
-from pathlib import Path
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, TypeVar
+from pathlib import Path
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .mcp_proxy import McpServerConfig
+from .mcp_proxy import McpAuthMode, McpExecutionMode, McpServerConfig
 from .models import McpToolDefinition
-from .secret_store import ManagedSecretStore
-
+from .secret_store import ManagedSecretCandidateOverlay, ManagedSecretStore
 
 _SCHEMA_VERSION = "1"
 _RuntimeT = TypeVar("_RuntimeT")
+McpConnectionStatus = Literal[
+    "disconnected",
+    "connecting",
+    "healthy",
+    "unhealthy",
+    "draining",
+]
+McpCandidateOperation = Literal["upsert", "set_enabled", "delete", "secret_overlay"]
 
 
 class McpServerStoreError(RuntimeError):
     """Raised when managed MCP Server metadata cannot be loaded or saved."""
+
+
+class McpServerCandidateStaleError(McpServerStoreError):
+    """Raised when a tested candidate no longer matches the active store revision."""
+
+
+@dataclass(frozen=True)
+class McpServerCandidate:
+    """Immutable MCP configuration snapshot to build and connection-test."""
+
+    base_revision: int
+    operation: McpCandidateOperation
+    server_ids: tuple[str, ...]
+    configs: tuple[McpServerConfig, ...]
+    managed_configs: tuple[McpServerConfig, ...]
+    active_versions: tuple[tuple[str, int], ...]
+
+    def config(self, server_id: str) -> McpServerConfig | None:
+        return next((item for item in self.configs if item.id == server_id), None)
+
+
+@dataclass(frozen=True)
+class McpRuntimeTransition(Generic[_RuntimeT]):
+    """Published runtime plus the previous runtime retained for draining calls."""
+
+    candidate: McpServerCandidate
+    active_runtime: _RuntimeT
+    draining_runtime: _RuntimeT | None
 
 
 class _StrictModel(BaseModel):
@@ -55,11 +91,32 @@ class McpServerResponse(_StrictModel):
     source: Literal["environment", "managed"]
     proxy_enabled: bool = Field(alias="proxyEnabled")
     browser_configurable: bool = Field(alias="browserConfigurable")
+    execution_mode: McpExecutionMode = Field(alias="executionMode")
+    auth_mode: McpAuthMode = Field(alias="authMode")
+    browser_direct_url: str = Field(default="", alias="browserDirectUrl")
+    config_version: int = Field(alias="configVersion", ge=1)
+    active_version: int = Field(alias="activeVersion", ge=0)
+    connection_status: McpConnectionStatus = Field(alias="connectionStatus")
     secret_binding_status: list[McpSecretBindingStatus] = Field(
         default_factory=list,
         alias="secretBindingStatus",
         max_length=32,
     )
+
+
+class McpRuntimeConfigResponse(_StrictModel):
+    """Minimal safe MCP configuration exposed to the browser runtime."""
+
+    id: str
+    transport: Literal["stdio", "streamable_http"]
+    execution_mode: McpExecutionMode = Field(alias="executionMode")
+    auth_mode: McpAuthMode = Field(alias="authMode")
+    browser_direct_url: str = Field(default="", alias="browserDirectUrl")
+    enabled: bool
+    proxy_enabled: bool = Field(alias="proxyEnabled")
+    config_version: int = Field(alias="configVersion", ge=1)
+    active_version: int = Field(alias="activeVersion", ge=0)
+    connection_status: McpConnectionStatus = Field(alias="connectionStatus")
 
 
 class McpServerConnectionTestResponse(_StrictModel):
@@ -111,6 +168,7 @@ class McpServerStore:
     ) -> None:
         self.path = Path(path)
         self._lock = threading.RLock()
+        self._revision = 0
         parsed_environment = [
             McpServerConfig.model_validate(server) for server in environment_servers
         ]
@@ -125,6 +183,13 @@ class McpServerStore:
                 "managed MCP Server ids conflict with read-only environment Servers: "
                 + ", ".join(conflicts)
             )
+        configs = self._merged_configs(self._managed)
+        self._active_versions = {
+            server.id: server.config_version for server in configs
+        }
+        self._connection_statuses: dict[str, McpConnectionStatus] = {
+            server.id: "disconnected" for server in configs
+        }
 
     def list_configs(self) -> list[McpServerConfig]:
         with self._lock:
@@ -143,6 +208,10 @@ class McpServerStore:
                     "environment" if server.id in self._environment else "managed",
                     secret_store,
                     proxy_enabled=proxy_enabled,
+                    active_version=self._active_versions.get(server.id, 0),
+                    connection_status=self._connection_statuses.get(
+                        server.id, "disconnected"
+                    ),
                 )
                 for server in self._merged_configs(self._managed)
             ]
@@ -158,44 +227,33 @@ class McpServerStore:
             server = self._environment.get(server_id) or self._managed.get(server_id)
             if server is None:
                 return None
-            source = "environment" if server_id in self._environment else "managed"
+            source: Literal["environment", "managed"] = (
+                "environment" if server_id in self._environment else "managed"
+            )
             return self._public(
                 server,
                 source,
                 secret_store,
                 proxy_enabled=proxy_enabled,
+                active_version=self._active_versions.get(server.id, 0),
+                connection_status=self._connection_statuses.get(
+                    server.id, "disconnected"
+                ),
             )
 
-    def upsert(
+    def create_upsert_candidate(
         self,
         server: McpServerConfig | dict[str, Any],
-        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
-        publish_runtime: Callable[[_RuntimeT], None],
-    ) -> tuple[McpServerConfig, _RuntimeT]:
+    ) -> McpServerCandidate:
         parsed = McpServerConfig.model_validate(server)
         with self._lock:
-            if parsed.id in self._environment:
-                raise PermissionError("environment MCP Servers are read-only")
-            candidate = dict(self._managed)
-            candidate[parsed.id] = parsed
-            runtime = build_runtime(self._merged_configs(candidate))
-            previous = self._managed
-            self._managed = candidate
-            try:
-                self._save()
-            except Exception:
-                self._managed = previous
-                raise
-            publish_runtime(runtime)
-            return parsed, runtime
+            return self._create_upsert_candidate(parsed)
 
-    def set_enabled(
+    def create_enabled_candidate(
         self,
         server_id: str,
         enabled: bool,
-        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
-        publish_runtime: Callable[[_RuntimeT], None],
-    ) -> tuple[McpServerConfig, _RuntimeT]:
+    ) -> McpServerCandidate:
         with self._lock:
             if server_id in self._environment:
                 raise PermissionError("environment MCP Servers are read-only")
@@ -208,42 +266,277 @@ class McpServerStore:
                     "enabled": enabled,
                 }
             )
-            candidate = dict(self._managed)
-            candidate[server_id] = updated
-            runtime = build_runtime(self._merged_configs(candidate))
-            previous = self._managed
-            self._managed = candidate
-            try:
-                self._save()
-            except Exception:
-                self._managed = previous
-                raise
-            publish_runtime(runtime)
-            return updated, runtime
+            return self._create_upsert_candidate(
+                updated,
+                operation="set_enabled",
+            )
 
-    def delete(
-        self,
-        server_id: str,
-        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
-        publish_runtime: Callable[[_RuntimeT], None],
-    ) -> _RuntimeT:
+    def create_delete_candidate(self, server_id: str) -> McpServerCandidate:
         with self._lock:
             if server_id in self._environment:
                 raise PermissionError("environment MCP Servers are read-only")
             if server_id not in self._managed:
                 raise KeyError(server_id)
-            candidate = dict(self._managed)
-            del candidate[server_id]
-            runtime = build_runtime(self._merged_configs(candidate))
-            previous = self._managed
-            self._managed = candidate
+            managed = dict(self._managed)
+            del managed[server_id]
+            return self._candidate(
+                operation="delete",
+                server_ids=(server_id,),
+                managed=managed,
+                active_versions={server_id: self._next_active_version(server_id)},
+            )
+
+    def create_secret_candidate(
+        self,
+        secret_ids: Collection[str],
+    ) -> McpServerCandidate:
+        """Snapshot configs affected by candidate Secret values.
+
+        The values themselves belong in ``ManagedSecretCandidateOverlay`` and are
+        intentionally absent from this serializable configuration snapshot.
+        """
+
+        with self._lock:
+            affected = self.affected_server_ids(
+                self._merged_configs(self._managed),
+                secret_ids,
+            )
+            managed = dict(self._managed)
+            active_versions = {
+                server_id: self._next_active_version(server_id)
+                for server_id in affected
+            }
+            for server_id, next_version in active_versions.items():
+                current = managed.get(server_id)
+                if current is None:
+                    continue
+                managed[server_id] = McpServerConfig.model_validate(
+                    current.model_copy(
+                        update={"config_version": next_version}
+                    ).model_dump(mode="python")
+                )
+            return self._candidate(
+                operation="secret_overlay",
+                server_ids=affected,
+                managed=managed,
+                active_versions=active_versions,
+            )
+
+    def commit_candidate(
+        self,
+        candidate: McpServerCandidate,
+        runtime: _RuntimeT,
+        publish_runtime: Callable[[_RuntimeT], _RuntimeT | None],
+        *,
+        previous_runtime: _RuntimeT | None = None,
+        connection_status: McpConnectionStatus = "healthy",
+    ) -> McpRuntimeTransition[_RuntimeT]:
+        """Atomically publish a successfully tested candidate.
+
+        Candidate build or connection-test failures never call this method and
+        therefore cannot change active metadata or runtime.  The publish callback
+        may return the old runtime so callers can retain it while in-flight
+        requests drain naturally.
+        """
+
+        if connection_status not in {
+            "disconnected",
+            "connecting",
+            "healthy",
+            "unhealthy",
+            "draining",
+        }:
+            raise ValueError("MCP connection status is invalid")
+        with self._lock:
+            if candidate.base_revision != self._revision:
+                raise McpServerCandidateStaleError(
+                    "MCP Server candidate is stale and must be rebuilt"
+                )
+            previous_managed = self._managed
+            previous_versions = dict(self._active_versions)
+            previous_statuses = dict(self._connection_statuses)
+            next_managed = {server.id: server for server in candidate.managed_configs}
+            next_configs = {
+                server.id: server for server in candidate.configs
+            }
+            self._managed = next_managed
+            self._active_versions = {
+                server_id: version
+                for server_id, version in self._active_versions.items()
+                if server_id in next_configs
+            }
+            self._connection_statuses = {
+                server_id: status
+                for server_id, status in self._connection_statuses.items()
+                if server_id in next_configs
+            }
+            for server_id, version in candidate.active_versions:
+                if server_id not in next_configs:
+                    continue
+                self._active_versions[server_id] = version
+                server = next_configs[server_id]
+                self._connection_statuses[server_id] = (
+                    connection_status if server.enabled else "disconnected"
+                )
+            for server_id, server in next_configs.items():
+                self._active_versions.setdefault(server_id, server.config_version)
+                self._connection_statuses.setdefault(server_id, "disconnected")
+            metadata_changed = next_managed != previous_managed
+            metadata_saved = False
             try:
-                self._save()
+                if metadata_changed:
+                    self._save()
+                    metadata_saved = True
+                draining_runtime = publish_runtime(runtime)
             except Exception:
-                self._managed = previous
+                self._managed = previous_managed
+                self._active_versions = previous_versions
+                self._connection_statuses = previous_statuses
+                if metadata_saved:
+                    self._save()
                 raise
-            publish_runtime(runtime)
+            self._revision += 1
+            return McpRuntimeTransition(
+                candidate=candidate,
+                active_runtime=runtime,
+                draining_runtime=(
+                    draining_runtime
+                    if draining_runtime is not None
+                    else previous_runtime
+                ),
+            )
+
+    def set_connection_status(
+        self,
+        server_id: str,
+        status: McpConnectionStatus,
+    ) -> None:
+        if status not in {
+            "disconnected",
+            "connecting",
+            "healthy",
+            "unhealthy",
+            "draining",
+        }:
+            raise ValueError("MCP connection status is invalid")
+        with self._lock:
+            if server_id not in self._environment and server_id not in self._managed:
+                raise KeyError(server_id)
+            self._connection_statuses[server_id] = status
+
+    @classmethod
+    def affected_server_ids(
+        cls,
+        configs: Collection[McpServerConfig],
+        secret_ids: Collection[str],
+    ) -> tuple[str, ...]:
+        requested = set(secret_ids)
+        return tuple(
+            sorted(
+                server.id
+                for server in configs
+                if requested.intersection(cls._secret_ids(server))
+            )
+        )
+
+    def upsert(
+        self,
+        server: McpServerConfig | dict[str, Any],
+        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
+        publish_runtime: Callable[[_RuntimeT], _RuntimeT | None],
+    ) -> tuple[McpServerConfig, _RuntimeT]:
+        parsed = McpServerConfig.model_validate(server)
+        with self._lock:
+            candidate = self._create_upsert_candidate(parsed)
+            runtime = build_runtime(list(candidate.configs))
+            self.commit_candidate(
+                candidate,
+                runtime,
+                publish_runtime,
+                connection_status="disconnected",
+            )
+            saved = candidate.config(parsed.id)
+            assert saved is not None
+            return saved, runtime
+
+    def set_enabled(
+        self,
+        server_id: str,
+        enabled: bool,
+        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
+        publish_runtime: Callable[[_RuntimeT], _RuntimeT | None],
+    ) -> tuple[McpServerConfig, _RuntimeT]:
+        with self._lock:
+            candidate = self.create_enabled_candidate(server_id, enabled)
+            runtime = build_runtime(list(candidate.configs))
+            self.commit_candidate(
+                candidate,
+                runtime,
+                publish_runtime,
+                connection_status="disconnected",
+            )
+            saved = candidate.config(server_id)
+            assert saved is not None
+            return saved, runtime
+
+    def delete(
+        self,
+        server_id: str,
+        build_runtime: Callable[[list[McpServerConfig]], _RuntimeT],
+        publish_runtime: Callable[[_RuntimeT], _RuntimeT | None],
+    ) -> _RuntimeT:
+        with self._lock:
+            candidate = self.create_delete_candidate(server_id)
+            runtime = build_runtime(list(candidate.configs))
+            self.commit_candidate(
+                candidate,
+                runtime,
+                publish_runtime,
+                connection_status="disconnected",
+            )
             return runtime
+
+    def _create_upsert_candidate(
+        self,
+        parsed: McpServerConfig,
+        *,
+        operation: Literal["upsert", "set_enabled"] = "upsert",
+    ) -> McpServerCandidate:
+        if parsed.id in self._environment:
+            raise PermissionError("environment MCP Servers are read-only")
+        next_version = self._next_active_version(parsed.id)
+        versioned = parsed.model_copy(update={"config_version": next_version})
+        versioned = McpServerConfig.model_validate(versioned.model_dump(mode="python"))
+        managed = dict(self._managed)
+        managed[versioned.id] = versioned
+        return self._candidate(
+            operation=operation,
+            server_ids=(versioned.id,),
+            managed=managed,
+            active_versions={versioned.id: next_version},
+        )
+
+    def _candidate(
+        self,
+        *,
+        operation: McpCandidateOperation,
+        server_ids: tuple[str, ...],
+        managed: dict[str, McpServerConfig],
+        active_versions: Mapping[str, int],
+    ) -> McpServerCandidate:
+        return McpServerCandidate(
+            base_revision=self._revision,
+            operation=operation,
+            server_ids=tuple(sorted(server_ids)),
+            configs=tuple(self._merged_configs(managed)),
+            managed_configs=tuple(managed[item] for item in sorted(managed)),
+            active_versions=tuple(sorted(active_versions.items())),
+        )
+
+    def _next_active_version(self, server_id: str) -> int:
+        current = self._environment.get(server_id) or self._managed.get(server_id)
+        config_version = current.config_version if current is not None else 0
+        return max(config_version, self._active_versions.get(server_id, 0)) + 1
 
     def _load(self) -> dict[str, McpServerConfig]:
         if not self.path.exists():
@@ -314,9 +607,11 @@ class McpServerStore:
         cls,
         server: McpServerConfig,
         source: Literal["environment", "managed"],
-        secret_store: ManagedSecretStore,
+        secret_store: ManagedSecretStore | ManagedSecretCandidateOverlay,
         *,
         proxy_enabled: bool,
+        active_version: int,
+        connection_status: McpConnectionStatus,
     ) -> dict[str, Any]:
         binding_status = []
         for secret_id in cls._secret_ids(server):
@@ -327,6 +622,14 @@ class McpServerStore:
                     "configured": bool(secret and secret.get("configured")),
                 }
             )
+        browser_direct_url = ""
+        if (
+            server.transport == "streamable_http"
+            and server.auth_mode == "none"
+            and server.execution_mode in {"auto", "browser_direct"}
+        ):
+            assert server.streamable_http is not None
+            browser_direct_url = server.streamable_http.url
         return McpServerResponse.model_validate(
             {
                 "id": server.id,
@@ -338,12 +641,23 @@ class McpServerStore:
                 "source": source,
                 "proxyEnabled": proxy_enabled,
                 "browserConfigurable": source == "managed",
+                "executionMode": server.execution_mode,
+                "authMode": server.auth_mode,
+                "browserDirectUrl": browser_direct_url,
+                "configVersion": server.config_version,
+                "activeVersion": active_version,
+                "connectionStatus": connection_status,
                 "secretBindingStatus": binding_status,
             }
         ).model_dump(mode="json", by_alias=True)
 
 
 __all__ = [
+    "McpConnectionStatus",
+    "McpRuntimeConfigResponse",
+    "McpRuntimeTransition",
+    "McpServerCandidate",
+    "McpServerCandidateStaleError",
     "McpServerConnectionTestResponse",
     "McpServerDeleteResponse",
     "McpServerEnabledRequest",

@@ -19,6 +19,7 @@ const state = {
   health: new Map(),
   policy: null,
   managedSecrets: [],
+  clientApiKeys: [],
   editingProvider: null,
   editingModel: null,
   auditPage: 1,
@@ -165,10 +166,17 @@ function clearOneTimeKey() {
   $("revealed-key").classList.add("hidden");
 }
 
+function clearOneTimeClientKey() {
+  clearTimeout(clearOneTimeClientKey.timer);
+  $("revealed-client-key-value").textContent = "";
+  $("revealed-client-key").classList.add("hidden");
+}
+
 function clearSensitiveUi() {
   document.querySelectorAll("input[type='password']").forEach((input) => { input.value = ""; });
   document.querySelectorAll("tbody").forEach((body) => body.replaceChildren());
   clearOneTimeKey();
+  clearOneTimeClientKey();
   $("key-status").textContent = "等待登录后加载";
   $("dialog-body").replaceChildren();
   $("dialog-pages").replaceChildren();
@@ -188,6 +196,7 @@ function logout(notify = true) {
   state.health = new Map();
   state.policy = null;
   state.managedSecrets = [];
+  state.clientApiKeys = [];
   state.editingProvider = null;
   state.editingModel = null;
   state.conversationDetail = null;
@@ -638,8 +647,8 @@ function latestSecretAudit(items) {
 
 async function loadSecrets() {
   if (!state.sessionToken) return;
-  const [profilesResult, secretsResult, auditResult, keyResult] = await Promise.allSettled([
-    api("/admin/providers"), api("/admin/secrets"), api("/admin/audit-logs?limit=500&offset=0"), api("/admin/access-key"),
+  const [profilesResult, secretsResult, auditResult, keyResult, clientKeysResult] = await Promise.allSettled([
+    api("/admin/providers"), api("/admin/secrets"), api("/admin/audit-logs?limit=500&offset=0"), api("/admin/access-key"), api("/admin/client-api-keys"),
   ]);
   if (profilesResult.status === "fulfilled") state.profiles = profilesResult.value;
   if (secretsResult.status === "fulfilled") state.managedSecrets = secretsResult.value;
@@ -647,10 +656,62 @@ async function loadSecrets() {
   renderProviderSecrets(audit.provider);
   renderManagedSecrets(audit.managed);
   if (keyResult.status === "fulfilled") renderAccessKeyStatus(keyResult.value);
+  if (clientKeysResult.status === "fulfilled") {
+    state.clientApiKeys = clientKeysResult.value.items;
+    renderClientApiKeys();
+  }
   if (profilesResult.status === "rejected") showError("Provider Secret 状态加载失败", profilesResult.reason);
   if (secretsResult.status === "rejected") showError("Secret 列表加载失败", secretsResult.reason);
   if (auditResult.status === "rejected") showError("Secret 修改人加载失败", auditResult.reason);
   if (keyResult.status === "rejected") showError("访问 Key 状态加载失败", keyResult.reason);
+  if (clientKeysResult.status === "rejected") showError("Client API Key 加载失败", clientKeysResult.reason);
+}
+
+function renderClientApiKeys() {
+  const tbody = $("client-keys-body");
+  if (!state.clientApiKeys.length) return emptyRow(tbody, 5, "暂无 Client API Key");
+  tbody.replaceChildren(...state.clientApiKeys.map((item) => {
+    const row = element("tr");
+    const actions = td();
+    const remove = element("button", "link-btn danger", "删除");
+    remove.addEventListener("click", () => deleteClientApiKey(item));
+    actions.append(remove);
+    row.append(td(item.name), td(item.prefix, "mono"), td(formatTime(item.createdAt)), td(formatTime(item.lastUsedAt)), actions);
+    return row;
+  }));
+}
+
+async function loadClientApiKeys() {
+  try {
+    const result = await api("/admin/client-api-keys");
+    state.clientApiKeys = result.items;
+    renderClientApiKeys();
+  } catch (error) { showError("Client API Key 加载失败", error); }
+}
+
+async function createClientApiKey(event) {
+  event.preventDefault();
+  const nameInput = $("client-key-name");
+  try {
+    const result = await api("/admin/client-api-keys", { method: "POST", body: JSON.stringify({ name: nameInput.value.trim() }) });
+    $("revealed-client-key-value").textContent = result.key;
+    $("revealed-client-key").classList.remove("hidden");
+    clearTimeout(clearOneTimeClientKey.timer);
+    clearOneTimeClientKey.timer = setTimeout(clearOneTimeClientKey, 60000);
+    nameInput.value = "";
+    showNotice("Client API Key 已创建；完整值将在 60 秒后清除");
+    await loadClientApiKeys();
+  } catch (error) { showError("Client API Key 创建失败", error); }
+  finally { nameInput.value = ""; }
+}
+
+async function deleteClientApiKey(item) {
+  if (!confirm(`删除 Client API Key ${item.name} 后，新请求将立即返回 401，是否继续？`)) return;
+  try {
+    await api(`/admin/client-api-keys/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    showNotice(`Client API Key ${item.name} 已删除`);
+    await loadClientApiKeys();
+  } catch (error) { showError("Client API Key 删除失败", error); }
 }
 
 function renderProviderSecrets(auditMap) {
@@ -1000,7 +1061,7 @@ function switchView(name) {
   const titles = {
     channels: ["渠道", "配置 Provider、固定请求路径、路由优先级和连接健康"],
     models: ["模型", "管理模型能力、参数限制、默认模型和可用状态"],
-    secrets: ["Secret", "管理 Provider API Key、MCP Key、OAuth/Token 引用和 Browser Key"],
+    secrets: ["Secret", "管理 Provider、MCP、Client API Key 和其他 Secret"],
     requests: ["请求日志", "按标识、渠道、模型、状态和时间筛选脱敏 metadata"],
     conversations: ["完整会话", "分页查看 request/response、tool-result、SSE 最终结果和脱敏 trace"],
     audit: ["系统审计", "查看管理员登录及配置和 Secret 生命周期操作"],
@@ -1027,10 +1088,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh-secrets").addEventListener("click", loadSecrets); $("provider-secret-form").addEventListener("submit", saveProviderSecret); $("cancel-provider-secret").addEventListener("click", closeProviderSecret); $("new-secret").addEventListener("click", () => openManagedSecret()); $("managed-secret-form").addEventListener("submit", saveManagedSecret); $("cancel-managed-secret").addEventListener("click", closeManagedSecret);
   $("rotate-key-form").addEventListener("submit", rotateAccessKey); $("refresh-key").addEventListener("click", loadAccessKeyStatus); $("clear-key").addEventListener("click", clearOneTimeKey);
   $("copy-key").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("revealed-key-value").textContent); showNotice("访问 Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
+  $("create-client-key-form").addEventListener("submit", createClientApiKey); $("refresh-client-keys").addEventListener("click", loadClientApiKeys); $("clear-client-key").addEventListener("click", clearOneTimeClientKey);
+  $("copy-client-key").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("revealed-client-key-value").textContent); showNotice("Client API Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
   $("refresh-audit").addEventListener("click", () => loadAudit()); $("refresh-conversations").addEventListener("click", () => loadConversations()); $("refresh-requests").addEventListener("click", () => loadRequests());
   $("request-filters").addEventListener("submit", (event) => { event.preventDefault(); state.requestPage = 1; loadRequests(1); });
   $("conversation-filters").addEventListener("submit", (event) => { event.preventDefault(); state.conversationPage = 1; loadConversations(1); });
   $("dialog-close").addEventListener("click", () => { state.conversationDetail = null; $("dialog-body").replaceChildren(); $("detail-dialog").close(); });
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
-  window.addEventListener("pagehide", clearSensitiveUi); document.addEventListener("visibilitychange", () => { if (document.hidden) clearOneTimeKey(); });
+  window.addEventListener("pagehide", clearSensitiveUi); document.addEventListener("visibilitychange", () => { if (document.hidden) { clearOneTimeKey(); clearOneTimeClientKey(); } });
 });

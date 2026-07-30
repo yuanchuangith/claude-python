@@ -13,7 +13,6 @@ from jsonschema import Draft202012Validator
 from .models import AgentChatResponse, DiscoveredProviderModel
 from .profile_store import ProviderProfile
 
-
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
 _MODEL_DISCOVERY_RESPONSE_MAX_BYTES = 1_048_576
@@ -121,6 +120,21 @@ def openai_request_headers(profile: ProviderProfile) -> dict[str, str]:
 
 
 def request_body(req: Any, profile: ProviderProfile, stream: bool) -> dict[str, Any]:
+    history = list(getattr(req, "messages", None) or [])
+    if history:
+        messages = _anthropic_history_messages(req, history)
+        body: dict[str, Any] = {
+            "model": req.model or profile.default_model,
+            "max_tokens": req.max_tokens,
+            "stream": stream,
+            "messages": messages,
+        }
+        system_prompt = str(getattr(req, "system_prompt", "") or "")
+        if system_prompt:
+            body["system"] = system_prompt
+        _apply_anthropic_tools(body, req)
+        return body
+
     content: str | list[dict[str, Any]] = req.prompt
     if req.images:
         blocks: list[dict[str, Any]] = [{"type": "text", "text": req.prompt}]
@@ -139,27 +153,27 @@ def request_body(req: Any, profile: ProviderProfile, stream: bool) -> dict[str, 
     system_prompt = str(getattr(req, "system_prompt", "") or "")
     if system_prompt:
         body["system"] = system_prompt
-    if req.tools:
-        body["tools"] = [
-            {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
-            for tool in req.tools
-        ]
-    tool_choice = getattr(req, "tool_choice", None)
-    if tool_choice is not None:
-        body["tool_choice"] = {
-            "type": tool_choice.type,
-            **({"name": tool_choice.name} if tool_choice.type == "tool" else {}),
-        }
-    thinking = getattr(req, "thinking", None)
-    if thinking is not None and thinking.type == "enabled":
-        body["thinking"] = {
-            "type": "enabled",
-            "budget_tokens": thinking.budget_tokens,
-        }
+    _apply_anthropic_tools(body, req)
     return body
 
 
 def openai_request_body(req: Any, profile: ProviderProfile, stream: bool) -> dict[str, Any]:
+    history = list(getattr(req, "messages", None) or [])
+    if history:
+        messages: list[dict[str, Any]] = []
+        system_prompt = str(getattr(req, "system_prompt", "") or "")
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(_openai_history_messages(req, history))
+        body: dict[str, Any] = {
+            "model": req.model or profile.default_model,
+            "max_tokens": req.max_tokens,
+            "stream": stream,
+            "messages": messages,
+        }
+        _apply_openai_tools(body, req)
+        return body
+
     user_content: str | list[dict[str, Any]] = req.prompt
     if req.images:
         content_blocks: list[dict[str, Any]] = [
@@ -185,6 +199,35 @@ def openai_request_body(req: Any, profile: ProviderProfile, stream: bool) -> dic
         "stream": stream,
         "messages": messages,
     }
+    _apply_openai_tools(body, req)
+    return body
+
+
+def _apply_anthropic_tools(body: dict[str, Any], req: Any) -> None:
+    if req.tools:
+        body["tools"] = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            }
+            for tool in req.tools
+        ]
+    tool_choice = getattr(req, "tool_choice", None)
+    if tool_choice is not None:
+        body["tool_choice"] = {
+            "type": tool_choice.type,
+            **({"name": tool_choice.name} if tool_choice.type == "tool" else {}),
+        }
+    thinking = getattr(req, "thinking", None)
+    if thinking is not None and thinking.type == "enabled":
+        body["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": thinking.budget_tokens,
+        }
+
+
+def _apply_openai_tools(body: dict[str, Any], req: Any) -> None:
     if req.tools:
         body["tools"] = [
             {
@@ -213,7 +256,141 @@ def openai_request_body(req: Any, profile: ProviderProfile, stream: bool) -> dic
         body["reasoning_effort"] = _openai_reasoning_effort(
             int(thinking.budget_tokens or 0)
         )
-    return body
+
+
+def _anthropic_history_messages(req: Any, history: list[Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    last_user_index = max(
+        (index for index, message in enumerate(history) if message.role == "user"),
+        default=-1,
+    )
+    for index, message in enumerate(history):
+        if message.role == "assistant":
+            blocks: list[dict[str, Any]] = []
+            if message.content:
+                blocks.append({"type": "text", "text": message.content})
+            blocks.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.id or f"call_{index}_{call_index}",
+                    "name": call.name,
+                    "input": call.arguments,
+                }
+                for call_index, call in enumerate(message.tool_calls)
+            )
+            _append_anthropic_message(messages, "assistant", blocks)
+            continue
+        if message.role == "tool":
+            block: dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id,
+                "content": message.content,
+            }
+            if message.is_error:
+                block["is_error"] = True
+            _append_anthropic_message(messages, "user", [block])
+            continue
+        blocks = []
+        if message.content:
+            blocks.append({"type": "text", "text": message.content})
+        if index == last_user_index:
+            blocks.extend(_anthropic_image_blocks(req))
+        _append_anthropic_message(messages, "user", blocks)
+    return messages
+
+
+def _append_anthropic_message(
+    messages: list[dict[str, Any]],
+    role: str,
+    blocks: list[dict[str, Any]],
+) -> None:
+    if not blocks:
+        return
+    if messages and messages[-1]["role"] == role:
+        messages[-1]["content"].extend(blocks)
+        return
+    messages.append({"role": role, "content": blocks})
+
+
+def _anthropic_image_blocks(req: Any) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for image in req.images:
+        if image.data:
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type,
+                        "data": image.data,
+                    },
+                }
+            )
+        elif image.url:
+            blocks.append(
+                {"type": "image", "source": {"type": "url", "url": image.url}}
+            )
+    return blocks
+
+
+def _openai_history_messages(req: Any, history: list[Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    last_user_index = max(
+        (index for index, message in enumerate(history) if message.role == "user"),
+        default=-1,
+    )
+    for index, message in enumerate(history):
+        if message.role == "assistant":
+            item: dict[str, Any] = {
+                "role": "assistant",
+                "content": message.content or None,
+            }
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": call.id or f"call_{index}_{call_index}",
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(
+                                call.arguments,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                    for call_index, call in enumerate(message.tool_calls)
+                ]
+            messages.append(item)
+            continue
+        if message.role == "tool":
+            item = {
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": message.content,
+            }
+            if message.name:
+                item["name"] = message.name
+            messages.append(item)
+            continue
+        content: str | list[dict[str, Any]] = message.content
+        if index == last_user_index and req.images:
+            content_blocks: list[dict[str, Any]] = []
+            if message.content:
+                content_blocks.append({"type": "text", "text": message.content})
+            for image in req.images:
+                image_url = image.url
+                if image.data:
+                    image_url = f"data:{image.media_type};base64,{image.data}"
+                content_blocks.append(
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                )
+            content = content_blocks
+        item = {"role": "user", "content": content}
+        if message.name:
+            item["name"] = message.name
+        messages.append(item)
+    return messages
 
 
 def _openai_reasoning_effort(budget_tokens: int) -> str:

@@ -373,6 +373,14 @@ class Settings(BaseModel):
             )
         )
     )
+    client_api_key_store_path: Path = Field(
+        default_factory=lambda: Path(
+            _env(
+                "ACTIONDESIGN_CLIENT_API_KEY_STORE_PATH",
+                default="config/actiondesign-client-api-keys.json",
+            )
+        )
+    )
     profile_allowed_hosts: list[str] = Field(
         default_factory=lambda: _csv(
             "ACTIONDESIGN_PROFILE_ALLOWED_HOSTS",
