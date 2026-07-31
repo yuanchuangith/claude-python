@@ -531,6 +531,13 @@ async function testConnection(profile) {
 function renderModels() {
   const tbody = $("models-body");
   if (!tbody) return;
+  const routes = state.models && state.models.routingOrder ? state.models.routingOrder : [];
+  const defaultRoute = routes.length ? routes[0] : null;
+  const defaultProfile = defaultRoute ? state.profiles.find((profile) => profile.id === defaultRoute.profileId) : null;
+  $("model-metric-default-provider").textContent = defaultRoute ? (defaultProfile ? defaultProfile.displayName : defaultRoute.provider) : "—";
+  $("model-metric-default-profile").textContent = defaultRoute ? `${defaultRoute.profileId} · 路由 #${defaultRoute.position}` : "当前没有可用路由";
+  $("model-metric-default-model").textContent = defaultRoute ? defaultRoute.model : "—";
+  $("model-metric-route-count").textContent = routes.length;
   const rows = state.profiles.flatMap((profile) => (profile.models || []).map((model) => ({ profile, model })));
   if (!rows.length) return emptyRow(tbody, 7, "暂无模型");
   tbody.replaceChildren(...rows.map(({ profile, model }) => {
@@ -544,8 +551,11 @@ function renderModels() {
     if (model.supportsThinking) capabilities.append(badge("thinking", "orange"));
     const limits = td(); limits.append(element("div", "", `${model.contextWindowTokens} ctx`), element("div", "subtle", `${model.maxOutputTokens} max output`));
     const available = profile.enabled && profile.keyConfigured;
+    const route = routes.find((item) => item.profileId === profile.id && item.model === model.id);
     const status = td(); status.append(badge(available ? "可路由" : "不可用", available ? "green" : "red"), document.createTextNode(" "));
-    if (profile.defaultModel === model.id) status.append(badge("默认", "blue"));
+    if (profile.defaultModel === model.id) status.append(badge("渠道默认", "blue"), document.createTextNode(" "));
+    if (route && route.position === 1) status.append(badge("全局默认路由", "green"));
+    else if (route) status.append(badge(`路由 #${route.position}`, ""));
     const actions = td(); const wrap = element("div", "row-actions");
     const edit = element("button", "link-btn", "编辑"); edit.addEventListener("click", () => openModelEditor(profile, model));
     wrap.append(edit);

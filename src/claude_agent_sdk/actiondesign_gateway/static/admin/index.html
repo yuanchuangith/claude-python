@@ -76,8 +76,13 @@
       </section>
 
       <section id="view-models" class="view">
+        <div class="metrics">
+          <article><span>当前请求默认渠道</span><strong id="model-metric-default-provider">—</strong><small id="model-metric-default-profile">按实际路由顺序第 1 项</small></article>
+          <article><span>当前请求默认模型</span><strong id="model-metric-default-model">—</strong><small>前端未显式指定模型时使用</small></article>
+          <article><span>可用路由候选</span><strong id="model-metric-route-count">—</strong><small>发生可重试错误时按顺序降级</small></article>
+        </div>
         <div class="panel">
-          <div class="panel-head"><div><h2>模型能力</h2><p>模型 CRUD、默认模型和参数上限独立于 Provider Secret。</p></div><div class="row-actions"><button id="refresh-models" class="secondary-btn">刷新</button><button id="new-model" class="primary-btn">新增模型</button></div></div>
+          <div class="panel-head"><div><h2>模型能力</h2><p>“渠道默认”只表示该渠道内部的默认模型；前端未指定渠道和模型时，使用标记为“全局默认路由”的实际路由第 1 项。</p></div><div class="row-actions"><button id="refresh-models" class="secondary-btn">刷新</button><button id="new-model" class="primary-btn">新增模型</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>渠道</th><th>模型</th><th>能力</th><th>上下文 / 输出</th><th>优先级</th><th>可用状态</th><th></th></tr></thead><tbody id="models-body"></tbody></table></div>
         </div>
         <div id="model-editor" class="panel editor hidden">

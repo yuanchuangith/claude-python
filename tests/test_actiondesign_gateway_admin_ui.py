@@ -59,6 +59,13 @@ def test_admin_ui_is_served_without_bundled_credentials(tmp_path):
     assert "/admin/conversations" in script.text
     assert "/admin/request-logs" in script.text
     assert "routingOrder" in script.text
+    assert 'id="model-metric-default-provider"' in page.text
+    assert 'id="model-metric-default-model"' in page.text
+    assert 'id="model-metric-route-count"' in page.text
+    assert "渠道默认" in page.text
+    assert 'route.position === 1' in script.text
+    assert 'badge("全局默认路由", "green")' in script.text
+    assert 'badge(`路由 #${route.position}`, "")' in script.text
     assert 'cache: "no-store"' in script.text
     assert 'redirect: "error"' in script.text
     assert 'referrerPolicy: "no-referrer"' in script.text
