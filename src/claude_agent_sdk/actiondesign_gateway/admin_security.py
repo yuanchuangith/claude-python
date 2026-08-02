@@ -6,9 +6,10 @@ import secrets
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 class AdminSessionStore:

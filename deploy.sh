@@ -30,8 +30,9 @@ echo "Checking protected production environment..."
 ssh "${SSH_OPTIONS[@]}" "$USER@$SERVER" bash -s << 'REMOTE_PREFLIGHT'
 set -e
 ENV_FILE=/home/ubuntu/actiondesign-agent-gateway/.env
+# .env is root:root 600 in production; preflight must use sudo to read it.
 test -f "$ENV_FILE"
-python3 - "$ENV_FILE" << 'PY'
+sudo python3 - "$ENV_FILE" << 'PY'
 from pathlib import Path
 import sys
 
@@ -124,10 +125,22 @@ rm -f /tmp/claude-agent-sdk-deploy.tar.gz
 # dependency set (notably the system Keyring client added for Profile secrets).
 venv/bin/python -c 'import fastapi, httpx, jsonschema, keyring, pydantic'
 sudo systemctl restart claude-agent-gateway
-sleep 1
+# uvicorn needs a moment after restart; retry health instead of a single sleep.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if sudo systemctl is-active --quiet claude-agent-gateway \
+    && curl -sf http://127.0.0.1:8888/api/actiondesign-agent/health >/tmp/claude-agent-gateway-health.json; then
+    cat /tmp/claude-agent-gateway-health.json
+    echo
+    break
+  fi
+  if [ "$i" -eq 10 ]; then
+    echo "Health check failed after restart" >&2
+    sudo systemctl status claude-agent-gateway --no-pager || true
+    exit 1
+  fi
+  sleep 1
+done
 sudo systemctl is-active claude-agent-gateway
-curl -s http://127.0.0.1:8888/api/actiondesign-agent/health
-echo
 REMOTE_SCRIPT
 fi
 

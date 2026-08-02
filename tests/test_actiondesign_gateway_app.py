@@ -22,7 +22,6 @@ from claude_agent_sdk.actiondesign_gateway.session_log import (  # noqa: E402
 )
 from claude_agent_sdk.actiondesign_gateway.settings import Settings  # noqa: E402
 
-
 CONVERSATION_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_CONVERSATION_ID = "22222222-2222-4222-8222-222222222222"
 SERVICE_AUTH_CONVERSATION_ID = "33333333-3333-4333-8333-333333333333"
@@ -727,6 +726,11 @@ def test_stream_error_envelope_and_log_redact_secret_text(tmp_path, monkeypatch)
     assert response.status_code == 200
     assert len(events) == 1
     assert events[0]["type"] == "gateway.error"
+    assert events[0]["requestId"] == REQUEST_ID
+    assert events[0]["correlationId"] == CORRELATION_ID
+    assert set(events[0]["payload"]) == {"code", "message"}
+    assert "requestId" not in events[0]["payload"]
+    assert "correlationId" not in events[0]["payload"]
     serialized = json.dumps(events, ensure_ascii=False)
     assert "upstream-secret" not in serialized
     assert "authorization" not in serialized.lower()

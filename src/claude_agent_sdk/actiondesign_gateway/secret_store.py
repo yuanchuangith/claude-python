@@ -193,7 +193,7 @@ class _SecretMetadata(_StrictModel):
         return _validate_timestamp(value)
 
     @model_validator(mode="after")
-    def _state_is_consistent(self) -> "_SecretMetadata":
+    def _state_is_consistent(self) -> _SecretMetadata:
         configured = self.secret_ref is not None
         if configured:
             if not self.masked:
@@ -227,7 +227,7 @@ class _SecretMetadataFile(_StrictModel):
     secrets: list[_SecretMetadata] = Field(default_factory=list, max_length=1_000)
 
     @model_validator(mode="after")
-    def _identities_are_unique(self) -> "_SecretMetadataFile":
+    def _identities_are_unique(self) -> _SecretMetadataFile:
         ids = [item.id for item in self.secrets]
         if len(ids) != len(set(ids)):
             raise ValueError("managed Secret ids must be unique")

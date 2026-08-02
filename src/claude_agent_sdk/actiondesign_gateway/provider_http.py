@@ -503,46 +503,28 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
     usage: dict[str, Any] = {}
     model = req.model or profile.default_model
     try:
-        async with _provider_http_client(profile) as client:
-            async with client.stream(
-                "POST",
-                normalize_messages_url(profile.base_url),
-                headers=request_headers(profile),
-                json=request_body(req, profile, True),
-            ) as response:
-                if response.is_error:
-                    # Streaming responses are not buffered by httpx. Read only
-                    # the error body before mapping the status so the shared
-                    # error classifier can inspect it without ResponseNotRead.
-                    await response.aread()
-                _raise_provider_status(response)
-                event_name = ""
-                data_lines: list[str] = []
-                async for raw_line in response.aiter_lines():
-                    line = raw_line.strip()
-                    if not line:
-                        if data_lines:
-                            event = _parse_event(event_name, data_lines)
-                            event_name, data_lines = "", []
-                            if event is None:
-                                continue
-                            model, delta_text = _consume_stream_event(
-                                event,
-                                model,
-                                text_parts,
-                                tool_blocks,
-                                usage,
-                            )
-                            if delta_text:
-                                yield {"kind": "delta", "content": delta_text}
-                        continue
-                    if line.startswith("event:"):
-                        event_name = line.removeprefix("event:").strip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line.removeprefix("data:").strip())
-                if data_lines:
-                    event = _parse_event(event_name, data_lines)
-                    if event is not None:
+        async with _provider_http_client(profile) as client, client.stream(
+            "POST",
+            normalize_messages_url(profile.base_url),
+            headers=request_headers(profile),
+            json=request_body(req, profile, True),
+        ) as response:
+            if response.is_error:
+                # Streaming responses are not buffered by httpx. Read only
+                # the error body before mapping the status so the shared
+                # error classifier can inspect it without ResponseNotRead.
+                await response.aread()
+            _raise_provider_status(response)
+            event_name = ""
+            data_lines: list[str] = []
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+                if not line:
+                    if data_lines:
+                        event = _parse_event(event_name, data_lines)
+                        event_name, data_lines = "", []
+                        if event is None:
+                            continue
                         model, delta_text = _consume_stream_event(
                             event,
                             model,
@@ -552,6 +534,23 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
                         )
                         if delta_text:
                             yield {"kind": "delta", "content": delta_text}
+                    continue
+                if line.startswith("event:"):
+                    event_name = line.removeprefix("event:").strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line.removeprefix("data:").strip())
+            if data_lines:
+                event = _parse_event(event_name, data_lines)
+                if event is not None:
+                    model, delta_text = _consume_stream_event(
+                        event,
+                        model,
+                        text_parts,
+                        tool_blocks,
+                        usage,
+                    )
+                    if delta_text:
+                        yield {"kind": "delta", "content": delta_text}
     except httpx.TimeoutException as exc:
         raise _upstream_error(504, "PROVIDER_TIMEOUT", "Provider stream timed out", retryable=True, failover_scope="model") from exc
     except httpx.HTTPStatusError as exc:

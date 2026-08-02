@@ -11,12 +11,19 @@ from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .models import (
+    MIMO_MODELS,
     ApiProfileModel,
     ApiProfileWriteRequest,
-    MIMO_MODELS,
     ProviderModelDiscoveryRequest,
 )
 
@@ -234,7 +241,7 @@ class _PersistedProviderProfile(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_models(self) -> "_PersistedProviderProfile":
+    def _validate_models(self) -> _PersistedProviderProfile:
         ids = [model.id for model in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("persisted profile model ids must be unique")
@@ -271,14 +278,14 @@ class _PersistedProfileFile(BaseModel):
 
     schema_version: Literal["5"] = Field(alias="schemaVersion")
     profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
-    environment_overrides: list["_EnvironmentProfileOverride"] = Field(
+    environment_overrides: list[_EnvironmentProfileOverride] = Field(
         default_factory=list,
         alias="environmentOverrides",
         max_length=16,
     )
 
     @model_validator(mode="after")
-    def _validate_unique_ids(self) -> "_PersistedProfileFile":
+    def _validate_unique_ids(self) -> _PersistedProfileFile:
         ids = [profile.id for profile in self.profiles]
         if len(ids) != len(set(ids)):
             raise ValueError("persisted profile ids must be unique")
@@ -300,7 +307,7 @@ class _PersistedProfileFileV4(BaseModel):
 
     schema_version: Literal["4"] = Field(alias="schemaVersion")
     profiles: list[_PersistedProviderProfile] = Field(default_factory=list, max_length=100)
-    environment_overrides: list["_EnvironmentProfileOverride"] = Field(
+    environment_overrides: list[_EnvironmentProfileOverride] = Field(
         default_factory=list,
         alias="environmentOverrides",
         max_length=16,
@@ -317,7 +324,7 @@ class _EnvironmentProfileOverride(BaseModel):
     deleted: bool = False
 
     @model_validator(mode="after")
-    def _validate_models(self) -> "_EnvironmentProfileOverride":
+    def _validate_models(self) -> _EnvironmentProfileOverride:
         ids = [model.id for model in self.models]
         if len(ids) != len(set(ids)):
             raise ValueError("environment override model ids must be unique")
@@ -779,7 +786,7 @@ class ApiProfileStore:
         provider: str = "auto",
         profile_id: str = "",
         model: str = "",
-    ) -> list["RouteCandidate"]:
+    ) -> list[RouteCandidate]:
         """Build a deterministic profile/model failover chain.
 
         A selected model/profile is always first. Remaining models in that
@@ -893,7 +900,7 @@ class ApiProfileStore:
                 raise self._unavailable_profile(first_profile.id)
             return chain
 
-    def routing_order(self) -> list["RouteCandidate"]:
+    def routing_order(self) -> list[RouteCandidate]:
         try:
             return self.route_candidates()
         except HTTPException:

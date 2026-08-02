@@ -406,8 +406,7 @@ def create_app(
             "fullConversationLogEnabled": gateway_settings.full_conversation_log_enabled,
         }
 
-    @app.get(f"{API_PREFIX}/models", response_model=AgentModelsResponse)
-    async def models() -> dict[str, Any]:
+    def models_payload() -> dict[str, Any]:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for profile in profile_store.list_public():
             grouped.setdefault(profile["provider"], []).append(profile)
@@ -449,6 +448,14 @@ def create_app(
             ],
         }
 
+    @app.get(
+        f"{API_PREFIX}/models",
+        response_model=AgentModelsResponse,
+        dependencies=[Depends(_require_models_access)],
+    )
+    async def models() -> dict[str, Any]:
+        return models_payload()
+
     @app.get("/v1/models")
     async def compatible_models(request: Request) -> Response:
         try:
@@ -457,7 +464,7 @@ def create_app(
             body, status_code = openai_error_response(exc)
             return JSONResponse(status_code=status_code, content=body)
         return JSONResponse(
-            content=openai_models_response(await models(), created=int(time.time()))
+            content=openai_models_response(models_payload(), created=int(time.time()))
         )
 
     @app.post("/v1/chat/completions")
@@ -1601,9 +1608,14 @@ def create_app(
     @app.get(
         f"{API_PREFIX}/admin/mcp-servers",
         response_model=list[McpServerResponse],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.get(
+        f"{API_PREFIX}/mcp-config/servers",
+        response_model=list[McpServerResponse],
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def list_mcp_servers(request: Request) -> list[dict[str, Any]]:
-        _require_profile_admin(request, gateway_settings)
         return mcp_server_store.list_public(
             managed_secrets,
             proxy_enabled=gateway_settings.mcp_proxy_enabled,
@@ -1612,12 +1624,17 @@ def create_app(
     @app.get(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}",
         response_model=McpServerResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.get(
+        f"{API_PREFIX}/mcp-config/servers/{{server_id}}",
+        response_model=McpServerResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def get_mcp_server(
         server_id: McpServerIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         result = mcp_server_store.get_public(
             server_id,
             managed_secrets,
@@ -1630,13 +1647,18 @@ def create_app(
     @app.put(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}",
         response_model=McpServerResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.put(
+        f"{API_PREFIX}/mcp-config/servers/{{server_id}}",
+        response_model=McpServerResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def put_mcp_server(
         server_id: McpServerIdPath,
         req: McpServerConfig,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         if server_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "MCP_SERVER_ID_MISMATCH"})
@@ -1677,13 +1699,18 @@ def create_app(
     @app.put(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}/enabled",
         response_model=McpServerResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.put(
+        f"{API_PREFIX}/mcp-config/servers/{{server_id}}/enabled",
+        response_model=McpServerResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def set_mcp_server_enabled(
         server_id: McpServerIdPath,
         req: McpServerEnabledRequest,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
             candidate = mcp_server_store.create_enabled_candidate(server_id, req.enabled)
@@ -1716,12 +1743,17 @@ def create_app(
     @app.delete(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}",
         response_model=McpServerDeleteResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.delete(
+        f"{API_PREFIX}/mcp-config/servers/{{server_id}}",
+        response_model=McpServerDeleteResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def delete_mcp_server(
         server_id: McpServerIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
             candidate = mcp_server_store.create_delete_candidate(server_id)
@@ -1746,12 +1778,17 @@ def create_app(
     @app.post(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}/connection-test",
         response_model=McpServerConnectionTestResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.post(
+        f"{API_PREFIX}/mcp-config/servers/{{server_id}}/connection-test",
+        response_model=McpServerConnectionTestResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def test_mcp_server_connection(
         server_id: McpServerIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         started = time.monotonic()
         if not gateway_settings.mcp_proxy_enabled:
@@ -1792,20 +1829,30 @@ def create_app(
     @app.get(
         f"{API_PREFIX}/admin/secrets",
         response_model=list[SecretResponse],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.get(
+        f"{API_PREFIX}/mcp-config/secrets",
+        response_model=list[SecretResponse],
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def list_managed_secrets(request: Request) -> list[dict[str, Any]]:
-        _require_profile_admin(request, gateway_settings)
         return managed_secrets.list_public()
 
     @app.get(
         f"{API_PREFIX}/admin/secrets/{{secret_id}}",
         response_model=SecretResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.get(
+        f"{API_PREFIX}/mcp-config/secrets/{{secret_id}}",
+        response_model=SecretResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def get_managed_secret(
         secret_id: SecretIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         result = managed_secrets.get(secret_id)
         if result is None:
             raise HTTPException(status_code=404, detail={"code": "SECRET_NOT_FOUND"})
@@ -1814,13 +1861,18 @@ def create_app(
     @app.put(
         f"{API_PREFIX}/admin/secrets/{{secret_id}}",
         response_model=SecretResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.put(
+        f"{API_PREFIX}/mcp-config/secrets/{{secret_id}}",
+        response_model=SecretResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def put_managed_secret(
         secret_id: SecretIdPath,
         req: SecretUpsertRequest,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         if secret_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "SECRET_ID_MISMATCH"})
@@ -1868,13 +1920,18 @@ def create_app(
     @app.post(
         f"{API_PREFIX}/admin/secrets/{{secret_id}}/rotate",
         response_model=SecretResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.post(
+        f"{API_PREFIX}/mcp-config/secrets/{{secret_id}}/rotate",
+        response_model=SecretResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def rotate_managed_secret(
         secret_id: SecretIdPath,
         req: SecretRotateRequest,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
             candidate = mcp_server_store.create_secret_candidate([secret_id])
@@ -1918,12 +1975,17 @@ def create_app(
     @app.delete(
         f"{API_PREFIX}/admin/secrets/{{secret_id}}",
         response_model=SecretResponse,
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    @app.delete(
+        f"{API_PREFIX}/mcp-config/secrets/{{secret_id}}",
+        response_model=SecretResponse,
+        dependencies=[Depends(_require_client_api_key)],
     )
     async def revoke_managed_secret(
         secret_id: SecretIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        _require_profile_admin(request, gateway_settings)
         request_id = _audit_request_id(request)
         try:
             candidate = mcp_server_store.create_secret_candidate([secret_id])
@@ -2764,9 +2826,6 @@ def _sse_envelope(
     payload: dict[str, Any],
 ) -> str:
     event_payload = dict(payload)
-    if event_type == "gateway.error":
-        event_payload.setdefault("requestId", identity.request_id)
-        event_payload.setdefault("correlationId", identity.correlation_id)
     envelope = GatewayEventEnvelope.model_validate({
         "protocolVersion": PROTOCOL_VERSION,
         "sequence": sequence,
@@ -2966,6 +3025,24 @@ def _require_profile_admin(request: Request, settings: Settings) -> None:
     raise HTTPException(status_code=401, detail={"code": "PROFILE_ADMIN_AUTH_REQUIRED"})
 
 
+def _require_profile_admin_dependency(request: Request) -> None:
+    settings: Settings = request.app.state.settings
+    _require_profile_admin(request, settings)
+
+
+def _require_models_access(request: Request) -> None:
+    try:
+        _require_client_api_key(request)
+        return
+    except HTTPException as client_error:
+        try:
+            settings: Settings = request.app.state.settings
+            _require_profile_admin(request, settings)
+            return
+        except HTTPException:
+            raise client_error
+
+
 def _require_service_auth(
     request: Request,
     service_token: Annotated[
@@ -2982,6 +3059,11 @@ def _require_service_auth(
         service_token,
         settings.service_auth_token,
     ):
+        return
+    authorization = request.headers.get("Authorization", "")
+    authorization_scheme = authorization.partition(" ")[0].lower()
+    if authorization_scheme == "bearer" or request.headers.get("x-api-key", "").strip():
+        _require_client_api_key(request)
         return
     if browser_api_key:
         sessions: AdminSessionStore = request.app.state.admin_sessions
@@ -3006,8 +3088,16 @@ def _require_service_auth(
 
 
 def _require_client_api_key(request: Request) -> dict[str, Any]:
-    authorization = request.headers.get("Authorization", "")
-    bearer = authorization.removeprefix("Bearer ").strip() if authorization.startswith("Bearer ") else ""
+    authorization = request.headers.get("Authorization", "").strip()
+    bearer = ""
+    if authorization:
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer" or not token.strip():
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "CLIENT_API_KEY_REQUIRED"},
+            )
+        bearer = token.strip()
     candidates = [
         value
         for value in (
@@ -3030,10 +3120,14 @@ def _require_client_api_key(request: Request) -> dict[str, Any]:
             detail={"code": "CLIENT_API_KEY_INVALID"},
         )
     request.state.client_api_key_id = result["id"]
+    request.state.client_api_key_prefix = result["prefix"]
     return result
 
 
 def _audit_actor(request: Request) -> str:
+    client_api_key_prefix = getattr(request.state, "client_api_key_prefix", "")
+    if client_api_key_prefix:
+        return f"client-api-key:{client_api_key_prefix}"
     forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
     if forwarded:
         return forwarded

@@ -54,6 +54,16 @@ def test_admin_ui_is_served_without_bundled_credentials(tmp_path):
     assert "/admin/channels/health" in script.text
     assert "/admin/runtime-policy" in script.text
     assert "/admin/secrets" in script.text
+    assert "Client API Key · 唯一业务访问 Key" in page.text
+    assert "不授予任何后台管理权限" in page.text
+    assert "测试阶段创建后完整值会在当前页面持续显示" in page.text
+    assert "完整 Key 仅显示一次" not in page.text
+    assert "Browser API Key" not in page.text
+    assert "/admin/access-key" not in script.text
+    assert 'document.execCommand("copy")' in script.text
+    assert "navigator.clipboard?.writeText" in script.text
+    assert "setTimeout(clearDisplayedClientKey" not in script.text
+    assert 'document.addEventListener("visibilitychange"' not in script.text
     assert "secret.masked" not in script.text
     assert "/admin/audit-logs" in script.text
     assert "/admin/conversations" in script.text

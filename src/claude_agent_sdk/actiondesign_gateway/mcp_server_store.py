@@ -131,7 +131,7 @@ class McpServerConnectionTestResponse(_StrictModel):
     error_code: str = Field(default="", alias="errorCode", max_length=128)
 
     @model_validator(mode="after")
-    def _status_shape_is_consistent(self) -> "McpServerConnectionTestResponse":
+    def _status_shape_is_consistent(self) -> McpServerConnectionTestResponse:
         if self.status == "healthy" and self.error_code:
             raise ValueError("healthy MCP connection result must not include errorCode")
         if self.status == "unhealthy" and not self.error_code:
@@ -151,7 +151,7 @@ class _ManagedMcpServerFile(_StrictModel):
     servers: list[McpServerConfig] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
-    def _server_ids_are_unique(self) -> "_ManagedMcpServerFile":
+    def _server_ids_are_unique(self) -> _ManagedMcpServerFile:
         ids = [server.id for server in self.servers]
         if len(ids) != len(set(ids)):
             raise ValueError("managed MCP Server ids must be unique")

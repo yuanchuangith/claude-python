@@ -34,7 +34,7 @@ _MAX_CONVERSATION_ARTIFACT_BYTES = 5 * 1024 * 1024
 
 
 def append_log(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     filename: str,
     payload: Any,
@@ -57,7 +57,7 @@ def append_log(
         pass
 
 
-def conversation_log_enabled(settings: "Settings | Any") -> bool:
+def conversation_log_enabled(settings: Settings | Any) -> bool:
     return bool(getattr(settings, "full_conversation_log_enabled", False))
 
 
@@ -196,7 +196,7 @@ def resolve_correlation_identity(
 
 
 def append_conversation_event(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     event: Any,
 ) -> None:
@@ -261,7 +261,7 @@ def append_conversation_event(
 
 
 def store_conversation_artifact(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     value: Any,
 ) -> str:
@@ -324,7 +324,7 @@ def store_conversation_artifact(
 
 
 def read_conversation_artifact(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     artifact_ref: str,
 ) -> Any | None:
@@ -356,7 +356,7 @@ def read_conversation_artifact(
 
 
 def list_conversations(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     *,
     limit: int,
     offset: int,
@@ -495,7 +495,7 @@ def list_conversations(
 
 
 def seal_conversation(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     status: str,
 ) -> dict[str, Any]:
@@ -514,7 +514,7 @@ def seal_conversation(
 
 
 def read_conversation(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     *,
     limit: int,
@@ -570,7 +570,7 @@ def read_conversation(
 
 
 def reconstruct_conversation_transcript(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     *,
     limit: int,
@@ -629,7 +629,7 @@ def reconstruct_conversation_transcript(
 
 
 def _messages_from_event(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     event: dict[str, Any],
     *,
@@ -749,7 +749,7 @@ def _message_uuid(
 ) -> str:
     digest = bytearray(
         hashlib.sha256(
-            f"{conversation_id}:{request_id}:{event_sequence}:{role}".encode("utf-8")
+            f"{conversation_id}:{request_id}:{event_sequence}:{role}".encode()
         ).digest()[:16]
     )
     digest[6] = (digest[6] & 0x0F) | 0x40
@@ -892,7 +892,7 @@ class ToolResultStore:
 
     def store(
         self,
-        settings: "Settings | Any",
+        settings: Settings | Any,
         conversation_id: str,
         payload: Any,
         *,
@@ -940,7 +940,7 @@ class ToolResultStore:
 
 
 def _persisted_tool_result_exists(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     run_id: str,
     tool_call_id: str,
@@ -970,7 +970,7 @@ def _persisted_tool_result_exists(
 
 
 def _tool_result_log_record(
-    settings: "Settings | Any",
+    settings: Settings | Any,
     conversation_id: str,
     payload: dict[str, Any],
     *,

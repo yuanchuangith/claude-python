@@ -15,7 +15,6 @@ from claude_agent_sdk.actiondesign_gateway.app import create_app
 from claude_agent_sdk.actiondesign_gateway.profile_store import MemoryProfileSecretStore
 from claude_agent_sdk.actiondesign_gateway.settings import Settings
 
-
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 CONVERSATION_ID = "77777777-7777-4777-8777-777777777777"
 RUN_ID = "run_77777777-7777-4777-8777-777777777777"

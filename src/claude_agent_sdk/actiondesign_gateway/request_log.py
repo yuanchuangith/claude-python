@@ -14,7 +14,6 @@ from .profile_store import ProviderProfile
 from .redaction import redact_value
 from .session_log import model_to_dict
 
-
 DEFAULT_REQUEST_LOG_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_REQUEST_LOG_BACKUP_COUNT = 5
 _READ_CHUNK_BYTES = 64 * 1024

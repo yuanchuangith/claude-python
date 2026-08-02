@@ -206,7 +206,7 @@ class StdioTransportConfig(_StrictModel):
         return value
 
     @model_validator(mode="after")
-    def _bindings_are_stdio_only(self) -> "StdioTransportConfig":
+    def _bindings_are_stdio_only(self) -> StdioTransportConfig:
         if any(binding.target != "env" for binding in self.secret_bindings):
             raise ValueError("stdio MCP Secret bindings must target env")
         names = [binding.name for binding in self.secret_bindings]
@@ -278,7 +278,7 @@ class StreamableHttpTransportConfig(_StrictModel):
         return value
 
     @model_validator(mode="after")
-    def _bindings_are_http_only(self) -> "StreamableHttpTransportConfig":
+    def _bindings_are_http_only(self) -> StreamableHttpTransportConfig:
         if any(binding.target != "header" for binding in self.secret_bindings):
             raise ValueError("streamable HTTP MCP Secret bindings must target header")
         names = [binding.name.lower() for binding in self.secret_bindings]
@@ -364,7 +364,7 @@ class McpServerConfig(_StrictModel):
         return value
 
     @model_validator(mode="after")
-    def _transport_shape_is_exact(self) -> "McpServerConfig":
+    def _transport_shape_is_exact(self) -> McpServerConfig:
         if self.transport == "stdio":
             if self.stdio is None or self.streamable_http is not None:
                 raise ValueError("stdio MCP server requires only stdio configuration")

@@ -2,6 +2,13 @@
 
 该服务是 ActionDesign 前端 LangGraph Agent 的轻量 Python 网关。它不是 Agent 运行时。
 
+## 文档基线
+
+- 本文按 `2026-08-02` 当前工作树整理；接口事实以 `src/claude_agent_sdk/actiondesign_gateway/` 为准。
+- Python 包版本：`0.2.88`。
+- FastAPI 应用与 `/openapi.json` 中的 `info.version`：`3.1.0`。
+- 文档只描述 Python thin gateway；前端 LangGraph 的规划、Review、工具选择、完成闸门和业务状态机不在本仓实现。
+
 ## 职责
 
 - 受控转发动态渠道，并按 Profile 选择 OpenAI Chat Completions 或 Claude/Anthropic Messages 协议。
@@ -10,7 +17,7 @@
 - 记录 request、response、usage、耗时、错误和前端 tool result。
 - 管理 API Profile 与 Key，API 永不回显 secret。
 - 脱敏转发前端 LangGraph trace 到 LangSmith。
-- 通过环境只读或管理员 managed 的通用 stdio/streamable HTTP MCP proxy 注入目标 Secret、透传 Schema/result，并记录元数据日志。
+- 通过环境只读或受管配置提供 stdio/streamable HTTP MCP proxy；按安全条件投影 browser-direct 连接信息，注入目标 Secret、透传 Schema/result，并记录元数据日志。
 - 使用 Pydantic v2 校验请求、配置、SSE、响应、Profile、tool result 和 trace；使用 Draft 2020-12 JSON Schema 校验 Provider 返回的动态工具参数。
 
 ## 明确不负责
@@ -35,9 +42,21 @@ uvicorn claude_agent_sdk.actiondesign_gateway.app:app --host 0.0.0.0 --port 8888
 GET /api/actiondesign-agent/health
 ```
 
-OpenAPI document version: `2.2.0` (strict runtime identity and full request-attempt detail contract).
+FastAPI API contract version：`3.1.0`。
 
-Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and `runId` is `run_<uuid-v4>`. Chat/stream/tool-result require exact Body/Header identity agreement; the service seal path also requires UUID v4. Admin conversation lookup/seal retains legacy safe-ID compatibility for historical logs.
+运行时身份契约：`conversationId` 必须是 canonical lowercase UUID v4，`runId` 必须是 `run_<uuid-v4>`。原生 chat/stream/tool-result 要求 Body 与 Header 中的身份完全一致；服务侧 seal 路由同样要求 UUID v4。管理员会话查询与 seal 为历史日志保留 legacy safe-ID 兼容。OpenAI/Anthropic 兼容接口会在网关内部生成符合该契约的身份。
+
+## 认证与权限边界
+
+| 接口范围 | 凭据 | 说明 |
+| --- | --- | --- |
+| `/api/actiondesign-agent/health` | 无 | 仅返回运行状态和功能开关，不代表上游 Provider/MCP 已通过真实调用 |
+| `/api/actiondesign-agent/models` | Client API Key 或管理员 Bearer | 当前不再是匿名接口 |
+| 原生 chat/stream/tool-result/seal、MCP runtime、LangSmith batch | `X-ActionDesign-Service-Token`、`X-ActionDesign-Api-Key`，或 Client API Key | 生产环境必须使用 `ACTIONDESIGN_SERVICE_AUTH_MODE=required`；`disabled` 只用于显式本地开发 |
+| `/v1/*`、`/api/actiondesign-agent/mcp-config/*` | Client API Key | 不接受 Provider Key 充当网关凭据 |
+| `/api/actiondesign-agent/admin/*` 与 `/admin/client-api-keys` | 管理员 Bearer session/token | Client API Key 不能管理 Profile、日志或其他 Client API Key |
+
+Client API Key 可放在 `Authorization: Bearer ...`、`x-api-key: ...` 或 `X-ActionDesign-Api-Key: ...`。若同时提交多个 Header，其值必须完全一致，否则返回 401。Provider Key、Service Token 与 MCP Secret 是三个独立边界，均不得下发到浏览器或写入普通响应/日志。
 
 ## API
 
@@ -50,8 +69,9 @@ Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and
 - `POST /api/actiondesign-agent/mimo/chat/stream`
 - `POST /api/actiondesign-agent/claude-code/chat`
 - `POST /api/actiondesign-agent/claude-code/chat/stream`
+- `POST /api/actiondesign-agent/conversations/{conversationId}/seal`
 
-`mimo`/`claude-code` 固定路由保留用于兼容旧前端；动态渠道使用通用 `/chat` 路由。请求中的 `tools` 使用统一 native schema，网关会转换为 OpenAI `type=function` 或 Claude `input_schema`：
+`mimo`/`claude-code` 固定路由保留用于兼容旧前端；动态渠道使用通用 `/chat` 路由。`/models` 返回 `routingOrder`、全局默认 Provider/Model 和每个模型的能力元数据，但 `ready` 只表示 Profile 与 Key 已配置，不等于上游凭据有效。请求中的 `tools` 使用统一 native schema，网关会转换为 OpenAI `type=function` 或 Claude `input_schema`：
 
 ```json
 {
@@ -89,6 +109,20 @@ Runtime identity contract: `conversationId` is a canonical lowercase UUID v4 and
 `systemPrompt` 是必填非空字段，并映射到 Provider 的独立 `system` 字段；不会拼接到普通 `prompt`。缺失、仅空白、超长或结构不合法的请求在发起 Provider 调用前返回 422。
 
 网关只做通用传输层结构校验，不维护 ActionDesign 画布业务工具白名单。业务工具名称、计划范围、画布目标、写入冲突和完成闸门继续由前端 LangGraph 校验。MCP Server 与 transport 由管理员固定配置，请求不能覆盖 URL、command、Secret 或认证绑定；网关只校验调用方指定的工具确实由该 Server 的实时 tools/list 暴露。
+
+### OpenAI / Anthropic 兼容接口
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+
+规则：
+
+- 三个接口只接受 Client API Key。`/v1/messages` 还要求 `anthropic-version: 2023-06-01`。
+- `/v1/chat/completions` 与 `/v1/messages` 复用同一 Profile 路由、能力校验、failover、日志和脱敏边界，不创建第二套 Provider/Agent 实现。
+- `model` 可省略；省略时使用后端当前全局默认路由，显式提交时优先尝试所选模型。非流式响应通过 `X-Actual-Profile`、`X-Actual-Model` 和 `X-Route-Attempts` 标识实际路由。
+- 支持对应协议的非流式/流式 wire format、tools/tool result、tool choice、最近一条 user 消息中的图片，以及 OpenAI `reasoning_effort` / Anthropic `thinking` 的受支持子集。未知字段按 strict schema 拒绝，不承诺覆盖两家协议的全部参数。
+- 兼容请求中的 Client API Key 只用于网关认证；不会被当作 Provider Key、MCP Header 或 Secret 向上游透传。
 
 非流式响应：
 

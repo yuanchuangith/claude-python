@@ -177,7 +177,7 @@ class McpServerSettings(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_transport_shape(self) -> "McpServerSettings":
+    def _validate_transport_shape(self) -> McpServerSettings:
         if self.transport == "streamable_http":
             if not self.url or self.executable_path or self.args:
                 raise ValueError("HTTP MCP requires only url transport configuration")
@@ -548,7 +548,7 @@ class Settings(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_feature_dependencies(self) -> "Settings":
+    def _validate_feature_dependencies(self) -> Settings:
         if self.service_auth_mode == "required":
             if len(self.service_auth_token) < 32:
                 raise ValueError(

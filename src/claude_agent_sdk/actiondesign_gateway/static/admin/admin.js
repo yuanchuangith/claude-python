@@ -160,24 +160,40 @@ function updateSessionUi() {
   $("session-state").textContent = loggedIn ? `管理会话已登录${state.sessionExpiresAt ? ` · ${formatTime(state.sessionExpiresAt)} 到期` : ""}` : "未登录";
 }
 
-function clearOneTimeKey() {
-  clearTimeout(clearOneTimeKey.timer);
-  $("revealed-key-value").textContent = "";
-  $("revealed-key").classList.add("hidden");
-}
-
-function clearOneTimeClientKey() {
-  clearTimeout(clearOneTimeClientKey.timer);
+function clearDisplayedClientKey() {
   $("revealed-client-key-value").textContent = "";
   $("revealed-client-key").classList.add("hidden");
+}
+
+async function copyText(text) {
+  if (!text) throw new Error("没有可复制的内容");
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Public HTTP pages cannot always use the asynchronous Clipboard API.
+    }
+  }
+  const input = element("textarea");
+  input.value = text;
+  input.readOnly = true;
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, input.value.length);
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("浏览器拒绝复制");
 }
 
 function clearSensitiveUi() {
   document.querySelectorAll("input[type='password']").forEach((input) => { input.value = ""; });
   document.querySelectorAll("tbody").forEach((body) => body.replaceChildren());
-  clearOneTimeKey();
-  clearOneTimeClientKey();
-  $("key-status").textContent = "等待登录后加载";
+  clearDisplayedClientKey();
   $("dialog-body").replaceChildren();
   $("dialog-pages").replaceChildren();
   $("dialog-pages").classList.add("hidden");
@@ -657,15 +673,14 @@ function latestSecretAudit(items) {
 
 async function loadSecrets() {
   if (!state.sessionToken) return;
-  const [profilesResult, secretsResult, auditResult, keyResult, clientKeysResult] = await Promise.allSettled([
-    api("/admin/providers"), api("/admin/secrets"), api("/admin/audit-logs?limit=500&offset=0"), api("/admin/access-key"), api("/admin/client-api-keys"),
+  const [profilesResult, secretsResult, auditResult, clientKeysResult] = await Promise.allSettled([
+    api("/admin/providers"), api("/admin/secrets"), api("/admin/audit-logs?limit=500&offset=0"), api("/admin/client-api-keys"),
   ]);
   if (profilesResult.status === "fulfilled") state.profiles = profilesResult.value;
   if (secretsResult.status === "fulfilled") state.managedSecrets = secretsResult.value;
   const audit = latestSecretAudit(auditResult.status === "fulfilled" ? auditResult.value.items : []);
   renderProviderSecrets(audit.provider);
   renderManagedSecrets(audit.managed);
-  if (keyResult.status === "fulfilled") renderAccessKeyStatus(keyResult.value);
   if (clientKeysResult.status === "fulfilled") {
     state.clientApiKeys = clientKeysResult.value.items;
     renderClientApiKeys();
@@ -673,7 +688,6 @@ async function loadSecrets() {
   if (profilesResult.status === "rejected") showError("Provider Secret 状态加载失败", profilesResult.reason);
   if (secretsResult.status === "rejected") showError("Secret 列表加载失败", secretsResult.reason);
   if (auditResult.status === "rejected") showError("Secret 修改人加载失败", auditResult.reason);
-  if (keyResult.status === "rejected") showError("访问 Key 状态加载失败", keyResult.reason);
   if (clientKeysResult.status === "rejected") showError("Client API Key 加载失败", clientKeysResult.reason);
 }
 
@@ -706,10 +720,8 @@ async function createClientApiKey(event) {
     const result = await api("/admin/client-api-keys", { method: "POST", body: JSON.stringify({ name: nameInput.value.trim() }) });
     $("revealed-client-key-value").textContent = result.key;
     $("revealed-client-key").classList.remove("hidden");
-    clearTimeout(clearOneTimeClientKey.timer);
-    clearOneTimeClientKey.timer = setTimeout(clearOneTimeClientKey, 60000);
     nameInput.value = "";
-    showNotice("Client API Key 已创建；完整值将在 60 秒后清除");
+    showNotice("Client API Key 已创建；测试阶段将在当前页面持续显示");
     await loadClientApiKeys();
   } catch (error) { showError("Client API Key 创建失败", error); }
   finally { nameInput.value = ""; }
@@ -853,28 +865,6 @@ async function revokeManagedSecret(secret) {
     showNotice(`Secret ${secret.id} 已撤销`);
     await loadSecrets();
   } catch (error) { showError("Secret 撤销失败", error); }
-}
-
-function renderAccessKeyStatus(status) {
-  $("key-status").replaceChildren(badge(status.configured ? "已配置" : "未配置", status.configured ? "green" : "orange"), element("code", "mono", status.masked || "—"));
-}
-async function loadAccessKeyStatus() {
-  try { renderAccessKeyStatus(await api("/admin/access-key")); } catch (error) { showError("访问 Key 状态加载失败", error); }
-}
-async function rotateAccessKey(event) {
-  event.preventDefault();
-  if (!confirm("轮换后旧 Browser API Key 将立即失效，是否继续？")) return;
-  const value = $("custom-access-key").value;
-  try {
-    const result = await api("/admin/access-key/rotate", { method: "POST", body: JSON.stringify(value ? { apiKey: value } : {}) });
-    $("revealed-key-value").textContent = result.apiKey;
-    $("revealed-key").classList.remove("hidden");
-    clearTimeout(clearOneTimeKey.timer);
-    clearOneTimeKey.timer = setTimeout(clearOneTimeKey, 60000);
-    showNotice("访问 Key 已轮换；明文将在 60 秒后清除");
-    await loadAccessKeyStatus();
-  } catch (error) { showError("访问 Key 轮换失败", error); }
-  finally { $("custom-access-key").value = ""; }
 }
 
 function makePager(container, page, total, onChange, pageSize = PAGE_SIZE) {
@@ -1096,14 +1086,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("provider-auth").addEventListener("change", clearProviderModelCandidates);
   $("refresh-models").addEventListener("click", loadChannels); $("new-model").addEventListener("click", () => openModelEditor()); $("cancel-model").addEventListener("click", closeModelEditor); $("reset-model").addEventListener("click", () => state.editingModel ? openModelEditor(state.profiles.find((item) => item.id === state.editingModel.profileId), state.profiles.find((item) => item.id === state.editingModel.profileId).models.find((item) => item.id === state.editingModel.modelId)) : openModelEditor()); $("model-form").addEventListener("submit", saveModel);
   $("refresh-secrets").addEventListener("click", loadSecrets); $("provider-secret-form").addEventListener("submit", saveProviderSecret); $("cancel-provider-secret").addEventListener("click", closeProviderSecret); $("new-secret").addEventListener("click", () => openManagedSecret()); $("managed-secret-form").addEventListener("submit", saveManagedSecret); $("cancel-managed-secret").addEventListener("click", closeManagedSecret);
-  $("rotate-key-form").addEventListener("submit", rotateAccessKey); $("refresh-key").addEventListener("click", loadAccessKeyStatus); $("clear-key").addEventListener("click", clearOneTimeKey);
-  $("copy-key").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("revealed-key-value").textContent); showNotice("访问 Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
-  $("create-client-key-form").addEventListener("submit", createClientApiKey); $("refresh-client-keys").addEventListener("click", loadClientApiKeys); $("clear-client-key").addEventListener("click", clearOneTimeClientKey);
-  $("copy-client-key").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("revealed-client-key-value").textContent); showNotice("Client API Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
+  $("create-client-key-form").addEventListener("submit", createClientApiKey); $("refresh-client-keys").addEventListener("click", loadClientApiKeys); $("clear-client-key").addEventListener("click", clearDisplayedClientKey);
+  $("copy-client-key").addEventListener("click", async () => { try { await copyText($("revealed-client-key-value").textContent); showNotice("Client API Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
   $("refresh-audit").addEventListener("click", () => loadAudit()); $("refresh-conversations").addEventListener("click", () => loadConversations()); $("refresh-requests").addEventListener("click", () => loadRequests());
   $("request-filters").addEventListener("submit", (event) => { event.preventDefault(); state.requestPage = 1; loadRequests(1); });
   $("conversation-filters").addEventListener("submit", (event) => { event.preventDefault(); state.conversationPage = 1; loadConversations(1); });
   $("dialog-close").addEventListener("click", () => { state.conversationDetail = null; $("dialog-body").replaceChildren(); $("detail-dialog").close(); });
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
-  window.addEventListener("pagehide", clearSensitiveUi); document.addEventListener("visibilitychange", () => { if (document.hidden) { clearOneTimeKey(); clearOneTimeClientKey(); } });
+  window.addEventListener("pagehide", clearSensitiveUi);
 });

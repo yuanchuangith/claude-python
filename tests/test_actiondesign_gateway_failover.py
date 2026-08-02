@@ -13,7 +13,6 @@ from claude_agent_sdk.actiondesign_gateway.app import create_app
 from claude_agent_sdk.actiondesign_gateway.profile_store import MemoryProfileSecretStore
 from claude_agent_sdk.actiondesign_gateway.settings import Settings
 
-
 CONVERSATION_ID = "66666666-6666-4666-8666-666666666666"
 RUN_ID = "run_66666666-6666-4666-8666-666666666666"
 REQUEST_ID = "77777777-7777-4777-8777-777777777777"

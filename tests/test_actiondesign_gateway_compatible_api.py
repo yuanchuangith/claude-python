@@ -218,6 +218,196 @@ def test_client_api_key_requires_exact_match_and_revocation_is_immediate(tmp_pat
     assert revoked.json()["error"]["code"] == "CLIENT_API_KEY_INVALID"
 
 
+def test_client_key_headers_models_access_and_admin_boundaries(tmp_path):
+    client = _client(tmp_path)
+    key = str(_create_key(client)["key"])
+    client_headers = [
+        {"Authorization": f"Bearer {key}"},
+        {"x-api-key": key},
+        {"X-ActionDesign-Api-Key": key},
+    ]
+
+    for headers in client_headers:
+        response = client.get("/api/actiondesign-agent/models", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["routingOrder"]
+
+    admin_models = client.get(
+        "/api/actiondesign-agent/models",
+        headers=ADMIN_HEADERS,
+    )
+    conflicting = client.get(
+        "/api/actiondesign-agent/models",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "x-api-key": f"{key[:-1]}{'A' if key[-1] != 'A' else 'B'}",
+        },
+    )
+    malformed_authorization = client.get(
+        "/api/actiondesign-agent/models",
+        headers={"Authorization": "Basic invalid", "x-api-key": key},
+    )
+    assert admin_models.status_code == 200
+    assert conflicting.status_code == 401
+    assert conflicting.json()["detail"]["code"] == "CLIENT_API_KEY_REQUIRED"
+    assert malformed_authorization.status_code == 401
+    assert malformed_authorization.json()["detail"]["code"] == "CLIENT_API_KEY_REQUIRED"
+
+    forbidden_paths = [
+        "/api/actiondesign-agent/admin/profiles",
+        "/api/actiondesign-agent/admin/providers",
+        "/api/actiondesign-agent/admin/client-api-keys",
+        "/api/actiondesign-agent/admin/request-logs",
+        "/api/actiondesign-agent/admin/audit-logs",
+    ]
+    for path in forbidden_paths:
+        response = client.get(path, headers={"Authorization": f"Bearer {key}"})
+        assert response.status_code in {401, 403}, path
+
+
+def test_client_key_cors_is_limited_to_the_configured_actiondesign_origin(tmp_path):
+    allowed_origin = "http://cpm.rongchang.gxp2.com:51124"
+    client = _client(tmp_path, allow_origins=[allowed_origin])
+
+    accepted = client.options(
+        "/api/actiondesign-agent/models",
+        headers={
+            "Origin": allowed_origin,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    rejected = client.options(
+        "/api/actiondesign-agent/models",
+        headers={
+            "Origin": "http://untrusted.example.test",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.headers["access-control-allow-origin"] == allowed_origin
+    assert rejected.status_code == 400
+    assert "access-control-allow-origin" not in rejected.headers
+
+
+def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mcp_proxy_module,
+        "_resolve_host_addresses_sync",
+        lambda _host, _port: (ipaddress.ip_address("10.20.30.40"),),
+    )
+    client = _client(
+        tmp_path,
+        mcp_allowed_http_urls=["https://mcp.example.test/mcp"],
+    )
+    key = str(_create_key(client, "ActionDesign MCP client")["key"])
+    headers = {"Authorization": f"Bearer {key}"}
+    prefix = "/api/actiondesign-agent/mcp-config"
+
+    secret = client.put(
+        f"{prefix}/secrets/mcp-client-secret",
+        headers=headers,
+        json={
+            "id": "mcp-client-secret",
+            "kind": "mcp_key",
+            "displayName": "MCP client secret",
+            "value": "initial-secret-value",
+        },
+    )
+    assert secret.status_code == 200
+    assert secret.json()["configured"] is True
+    assert "value" not in secret.json()
+    assert "masked" not in secret.json()
+
+    server_payload = {
+        "id": "client-managed-mcp",
+        "displayName": "Client managed MCP",
+        "transport": "streamable_http",
+        "streamableHttp": {
+            "url": "https://mcp.example.test/mcp",
+            "headers": {},
+            "secretBindings": [
+                {
+                    "secretId": "mcp-client-secret",
+                    "target": "header",
+                    "name": "Authorization",
+                    "valuePrefix": "Bearer ",
+                }
+            ],
+            "sseReadTimeoutSeconds": 30,
+        },
+        "expectedServerName": "",
+        "timeoutSeconds": 30,
+        "executionMode": "gateway_proxy",
+        "authMode": "backend_secret",
+        "enabled": False,
+    }
+    saved = client.put(
+        f"{prefix}/servers/client-managed-mcp",
+        headers=headers,
+        json=server_payload,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["secretBindingStatus"] == [
+        {"secretId": "mcp-client-secret", "configured": True}
+    ]
+    for sensitive_key in (
+        "streamableHttp",
+        "stdio",
+        "url",
+        "headers",
+        "command",
+        "cwd",
+        "args",
+        "secretBindings",
+    ):
+        assert sensitive_key not in saved.json()
+
+    listed_servers = client.get(f"{prefix}/servers", headers=headers)
+    listed_secrets = client.get(f"{prefix}/secrets", headers=headers)
+    connection = client.post(
+        f"{prefix}/servers/client-managed-mcp/connection-test",
+        headers=headers,
+    )
+    disabled = client.put(
+        f"{prefix}/servers/client-managed-mcp/enabled",
+        headers=headers,
+        json={"enabled": False},
+    )
+    rotated = client.post(
+        f"{prefix}/secrets/mcp-client-secret/rotate",
+        headers=headers,
+        json={"value": "rotated-secret-value"},
+    )
+    assert listed_servers.status_code == listed_secrets.status_code == 200
+    assert connection.status_code == 200
+    assert connection.json()["status"] in {"healthy", "unhealthy"}
+    assert disabled.status_code == 200
+    assert rotated.status_code == 200
+    assert "value" not in listed_secrets.text
+    assert "masked" not in listed_secrets.text
+
+    deleted_server = client.delete(
+        f"{prefix}/servers/client-managed-mcp",
+        headers=headers,
+    )
+    revoked_secret = client.delete(
+        f"{prefix}/secrets/mcp-client-secret",
+        headers=headers,
+    )
+    assert deleted_server.status_code == 200
+    assert deleted_server.json()["deleted"] is True
+    assert revoked_secret.status_code == 200
+    assert revoked_secret.json()["configured"] is False
+    assert "value" not in revoked_secret.json()
+    assert "masked" not in revoked_secret.json()
+
+
 def test_openai_and_anthropic_nonstream_share_existing_provider_chain_without_key_leak(
     tmp_path,
     monkeypatch,
@@ -278,6 +468,58 @@ def test_openai_and_anthropic_nonstream_share_existing_provider_chain_without_ke
         if path.is_file() and path.suffix in {".json", ".jsonl"}
     )
     assert key not in persisted
+
+
+def test_compatible_requests_use_backend_default_only_when_model_is_omitted(
+    tmp_path,
+    monkeypatch,
+):
+    captured = []
+
+    async def fake_call(req, _profile):
+        captured.append(req)
+        return _provider_result(req)
+
+    monkeypatch.setattr(gateway_app, "call_provider", fake_call)
+    client = _client(tmp_path)
+    key = str(_create_key(client)["key"])
+
+    openai_default = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"messages": [{"role": "user", "content": "Use backend default"}]},
+    )
+    anthropic_default = client.post(
+        "/v1/messages",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+        json={
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Use backend default"}],
+        },
+    )
+    explicitly_selected = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "mimo-v2.5-pro",
+            "messages": [{"role": "user", "content": "Use selected model"}],
+        },
+    )
+
+    assert openai_default.status_code == 200
+    assert anthropic_default.status_code == 200
+    assert explicitly_selected.status_code == 200
+    assert [request.model for request in captured] == [
+        "mimo-v2.5",
+        "mimo-v2.5",
+        "mimo-v2.5-pro",
+    ]
+    assert openai_default.headers["x-actual-model"] == "mimo-v2.5"
+    assert anthropic_default.headers["x-actual-model"] == "mimo-v2.5"
+    assert explicitly_selected.headers["x-actual-model"] == "mimo-v2.5-pro"
 
 
 def test_openai_and_anthropic_streaming_wire_formats(tmp_path, monkeypatch):

@@ -129,7 +129,7 @@ class ImageInput(_GatewayBaseModel):
     url: str = ""
 
     @model_validator(mode="after")
-    def _validate_source(self) -> "ImageInput":
+    def _validate_source(self) -> ImageInput:
         data = self.data
         url = self.url
         if bool(data) == bool(url):
@@ -191,7 +191,7 @@ class NativeToolChoice(_GatewayBaseModel):
     name: str = ""
 
     @model_validator(mode="after")
-    def _validate_choice(self) -> "NativeToolChoice":
+    def _validate_choice(self) -> NativeToolChoice:
         choice_type = self.type
         name = self.name
         if choice_type == "tool":
@@ -218,7 +218,7 @@ class ThinkingConfig(_GatewayBaseModel):
     budget_tokens: int | None = Field(default=None, ge=1024, le=32768)
 
     @model_validator(mode="after")
-    def _validate_budget(self) -> "ThinkingConfig":
+    def _validate_budget(self) -> ThinkingConfig:
         if self.type == "enabled" and self.budget_tokens is None:
             raise ValueError("budget_tokens is required when thinking is enabled")
         if self.type == "disabled" and self.budget_tokens is not None:
@@ -276,7 +276,7 @@ class AgentChatMessage(_GatewayBaseModel):
 
     role: Literal["user", "assistant", "tool"]
     content: str = Field(default="", max_length=MAX_PROMPT_CHARS)
-    tool_calls: list["NativeToolCall"] = Field(
+    tool_calls: list[NativeToolCall] = Field(
         default_factory=list,
         alias="toolCalls",
         max_length=128,
@@ -298,7 +298,7 @@ class AgentChatMessage(_GatewayBaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_role_shape(self) -> "AgentChatMessage":
+    def _validate_role_shape(self) -> AgentChatMessage:
         if self.role == "assistant":
             if self.tool_call_id:
                 raise ValueError("assistant messages cannot set toolCallId")
@@ -445,7 +445,7 @@ class AgentChatRequest(RequestCorrelationIdentity):
         return value
 
     @model_validator(mode="after")
-    def _validate_tool_choice(self) -> "AgentChatRequest":
+    def _validate_tool_choice(self) -> AgentChatRequest:
         choice = self.tool_choice
         tools = self.tools
         if choice and choice.type == "tool" and choice.name not in {tool.name for tool in tools}:
@@ -513,7 +513,7 @@ class AgentChatResponse(_GatewayBaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_success_shape(self) -> "AgentChatResponse":
+    def _validate_success_shape(self) -> AgentChatResponse:
         success = self.success
         content = self.content
         calls = self.tool_calls
@@ -667,7 +667,7 @@ class ToolResultRequest(RequestCorrelationIdentity):
         return value
 
     @model_validator(mode="after")
-    def _validate_status_shape(self) -> "ToolResultRequest":
+    def _validate_status_shape(self) -> ToolResultRequest:
         if self.status == "success" and self.error:
             raise ValueError("successful tool results cannot include error")
         if self.status != "success" and not self.error:
@@ -755,7 +755,7 @@ class McpToolListResponse(_GatewayBaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_unique_tools(self) -> "McpToolListResponse":
+    def _validate_unique_tools(self) -> McpToolListResponse:
         names = [tool.name for tool in self.tools]
         if len(names) != len(set(names)):
             raise ValueError("MCP tool names must be unique")
@@ -885,7 +885,7 @@ class ApiProfileModel(_GatewayBaseModel):
         return value
 
     @model_validator(mode="after")
-    def _default_name(self) -> "ApiProfileModel":
+    def _default_name(self) -> ApiProfileModel:
         if not self.name:
             self.name = self.id
         if len(self.name) > 256:
@@ -943,7 +943,7 @@ class ApiProfileWriteRequest(_GatewayBaseModel):
         return value
 
     @model_validator(mode="after")
-    def _validate_models(self) -> "ApiProfileWriteRequest":
+    def _validate_models(self) -> ApiProfileWriteRequest:
         if not self.display_name:
             self.display_name = self.provider
         ids = [model.id for model in self.models]
@@ -1187,7 +1187,7 @@ class TraceEnvelope(_GatewayBaseModel):
         )
 
     @model_validator(mode="after")
-    def _validate_error_event(self) -> "TraceEnvelope":
+    def _validate_error_event(self) -> TraceEnvelope:
         if self.event == "error" and self.error is None:
             raise ValueError("trace error events require error details")
         return self
@@ -1236,7 +1236,7 @@ class TraceBatchRequest(RequestCorrelationIdentity):
         return value
 
     @model_validator(mode="after")
-    def _validate_single_runtime_identity(self) -> "TraceBatchRequest":
+    def _validate_single_runtime_identity(self) -> TraceBatchRequest:
         conversations = {event.metadata.conversation_id for event in self.events}
         runs = {event.agent_run_id for event in self.events}
         if (

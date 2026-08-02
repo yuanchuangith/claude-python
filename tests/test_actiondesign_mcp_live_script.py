@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
     / "scripts"
@@ -48,7 +47,7 @@ class _FakeClient:
         self.secret_configured = False
         self.secret_values: list[str] = []
 
-    def __enter__(self) -> "_FakeClient":
+    def __enter__(self) -> _FakeClient:
         return self
 
     def __exit__(self, *_args: Any) -> None:

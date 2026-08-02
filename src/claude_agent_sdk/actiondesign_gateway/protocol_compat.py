@@ -62,7 +62,7 @@ class OpenAIStreamOptions(_CompatibilityRequest):
 
 
 class OpenAIChatCompletionRequest(_CompatibilityRequest):
-    model: str
+    model: str = ""
     messages: list[dict[str, Any]] = Field(min_length=1, max_length=_MAX_COMPAT_ITEMS)
     max_tokens: int | None = Field(default=None, ge=1, le=32768)
     max_completion_tokens: int | None = Field(default=None, ge=1, le=32768)
@@ -79,14 +79,14 @@ class OpenAIChatCompletionRequest(_CompatibilityRequest):
         return value
 
     @model_validator(mode="after")
-    def _validate_token_aliases(self) -> "OpenAIChatCompletionRequest":
+    def _validate_token_aliases(self) -> OpenAIChatCompletionRequest:
         if self.max_tokens is not None and self.max_completion_tokens is not None:
             raise ValueError("max_tokens and max_completion_tokens are mutually exclusive")
         return self
 
 
 class AnthropicMessagesRequest(_CompatibilityRequest):
-    model: str
+    model: str = ""
     messages: list[dict[str, Any]] = Field(min_length=1, max_length=_MAX_COMPAT_ITEMS)
     max_tokens: int = Field(ge=1, le=32768)
     system: str | list[dict[str, Any]] | None = None
