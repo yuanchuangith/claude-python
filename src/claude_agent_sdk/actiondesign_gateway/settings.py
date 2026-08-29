@@ -397,6 +397,40 @@ class Settings(BaseModel):
     mcp_proxy_enabled: bool = Field(
         default_factory=lambda: _bool("ACTIONDESIGN_MCP_PROXY_ENABLED", False)
     )
+    public_browser_mcp_config: bool = Field(
+        default_factory=lambda: _bool(
+            "ACTIONDESIGN_PUBLIC_BROWSER_MCP_CONFIG",
+            False,
+        )
+    )
+    mcp_deployments_enabled: bool = Field(
+        default_factory=lambda: _bool("ACTIONDESIGN_MCP_DEPLOYMENTS_ENABLED", False)
+    )
+    mcp_deployer_socket_path: Path = Field(
+        default_factory=lambda: Path(
+            _env(
+                "ACTIONDESIGN_MCP_DEPLOYER_SOCKET",
+                default="/run/actiondesign-mcp-deployer/api.sock",
+            )
+        )
+    )
+    mcp_deployer_token: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_MCP_DEPLOYER_TOKEN")
+    )
+    mcp_stdio_bridge_path: Path = Field(
+        default_factory=lambda: Path(
+            _env(
+                "ACTIONDESIGN_MCP_STDIO_BRIDGE_PATH",
+                default="/usr/local/libexec/actiondesign-mcp-stdio-bridge",
+            )
+        )
+    )
+    mcp_deployment_public_base_url: str = Field(
+        default_factory=lambda: _env(
+            "ACTIONDESIGN_MCP_PUBLIC_BASE_URL",
+            default="https://43-135-137-212.sslip.io",
+        )
+    )
     mcp_servers: list[McpServerSettings] = Field(
         default_factory=lambda: _json_list("ACTIONDESIGN_MCP_SERVERS_JSON"),
         max_length=64,
@@ -541,6 +575,7 @@ class Settings(BaseModel):
         "admin_password",
         "langsmith_api_key",
         "service_auth_token",
+        "mcp_deployer_token",
     )
     def _validate_secret_length(cls, value: str) -> str:
         if value and len(value) > 8192:
@@ -596,6 +631,35 @@ class Settings(BaseModel):
                         raise ValueError("MCP executablePath is invalid") from exc
                     if not executable.is_file() or executable not in allowed_executables:
                         raise ValueError("MCP executablePath is not allowlisted")
+        if self.public_browser_mcp_config:
+            if not self.allow_origins or "*" in self.allow_origins:
+                raise ValueError(
+                    "ACTIONDESIGN_AGENT_ALLOW_ORIGINS must contain at least one "
+                    "explicit Origin when public browser MCP configuration is enabled"
+                )
+        if self.mcp_deployments_enabled:
+            if not self.mcp_proxy_enabled or not self.public_browser_mcp_config:
+                raise ValueError(
+                    "MCP deployments require MCP proxy and public browser MCP configuration"
+                )
+            if len(self.mcp_deployer_token) < 32:
+                raise ValueError(
+                    "ACTIONDESIGN_MCP_DEPLOYER_TOKEN must contain at least 32 characters"
+                )
+            if not self.mcp_deployer_socket_path.is_absolute():
+                raise ValueError("MCP Deployer socket path must be absolute")
+            if not self.mcp_stdio_bridge_path.is_absolute():
+                raise ValueError("MCP stdio bridge path must be absolute")
+            parsed_public = urlsplit(self.mcp_deployment_public_base_url)
+            if (
+                parsed_public.scheme != "https"
+                or not parsed_public.hostname
+                or parsed_public.username
+                or parsed_public.password
+                or parsed_public.query
+                or parsed_public.fragment
+            ):
+                raise ValueError("MCP deployment public base URL must use absolute HTTPS")
         return self
 
 

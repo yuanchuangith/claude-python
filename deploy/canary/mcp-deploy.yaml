@@ -1,0 +1,14 @@
+apiVersion: actiondesign.mcp/v1
+transport: streamable_http
+http:
+  containerPort: 8000
+  mcpPath: /mcp
+  healthCheck:
+    type: http
+    path: /health
+environment: []
+resources:
+  cpu: 0.25
+  memoryMiB: 128
+  pids: 64
+startupTimeoutSeconds: 60

@@ -292,7 +292,7 @@ def test_client_key_cors_is_limited_to_the_configured_actiondesign_origin(tmp_pa
     assert "access-control-allow-origin" not in rejected.headers
 
 
-def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
+def test_client_key_mcp_config_reuses_complete_browser_projection_and_versions(
     tmp_path,
     monkeypatch,
 ):
@@ -328,23 +328,22 @@ def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
         "id": "client-managed-mcp",
         "displayName": "Client managed MCP",
         "transport": "streamable_http",
+        "expectedConfigVersion": 0,
         "streamableHttp": {
             "url": "https://mcp.example.test/mcp",
-            "headers": {},
+            "staticHeaders": {},
             "secretBindings": [
                 {
                     "secretId": "mcp-client-secret",
-                    "target": "header",
                     "name": "Authorization",
                     "valuePrefix": "Bearer ",
+                    "value": "initial-secret-value",
                 }
             ],
             "sseReadTimeoutSeconds": 30,
         },
         "expectedServerName": "",
         "timeoutSeconds": 30,
-        "executionMode": "gateway_proxy",
-        "authMode": "backend_secret",
         "enabled": False,
     }
     saved = client.put(
@@ -353,20 +352,19 @@ def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
         json=server_payload,
     )
     assert saved.status_code == 200, saved.text
-    assert saved.json()["secretBindingStatus"] == [
-        {"secretId": "mcp-client-secret", "configured": True}
-    ]
-    for sensitive_key in (
-        "streamableHttp",
-        "stdio",
+    assert saved.json()["executionMode"] == "browser_direct"
+    assert saved.json()["configVersion"] == 1
+    assert saved.json()["streamableHttp"]["headers"] == {
+        "Authorization": "Bearer initial-secret-value"
+    }
+    assert set(saved.json()["streamableHttp"]) == {
         "url",
         "headers",
-        "command",
-        "cwd",
-        "args",
+        "staticHeaders",
         "secretBindings",
-    ):
-        assert sensitive_key not in saved.json()
+        "protocolVersion",
+        "sseReadTimeoutSeconds",
+    }
 
     listed_servers = client.get(f"{prefix}/servers", headers=headers)
     listed_secrets = client.get(f"{prefix}/secrets", headers=headers)
@@ -377,7 +375,7 @@ def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
     disabled = client.put(
         f"{prefix}/servers/client-managed-mcp/enabled",
         headers=headers,
-        json={"enabled": False},
+        json={"enabled": False, "expectedConfigVersion": 1},
     )
     rotated = client.post(
         f"{prefix}/secrets/mcp-client-secret/rotate",
@@ -385,6 +383,7 @@ def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
         json={"value": "rotated-secret-value"},
     )
     assert listed_servers.status_code == listed_secrets.status_code == 200
+    assert "initial-secret-value" in listed_servers.text
     assert connection.status_code == 200
     assert connection.json()["status"] in {"healthy", "unhealthy"}
     assert disabled.status_code == 200
@@ -392,9 +391,11 @@ def test_client_key_mcp_config_server_and_secret_lifecycle_is_redacted(
     assert "value" not in listed_secrets.text
     assert "masked" not in listed_secrets.text
 
-    deleted_server = client.delete(
+    deleted_server = client.request(
+        "DELETE",
         f"{prefix}/servers/client-managed-mcp",
-        headers=headers,
+        headers={**headers, "Content-Type": "application/json"},
+        json={"expectedConfigVersion": 3},
     )
     revoked_secret = client.delete(
         f"{prefix}/secrets/mcp-client-secret",
@@ -588,7 +589,7 @@ def test_openai_and_anthropic_streaming_wire_formats(tmp_path, monkeypatch):
     assert '"type":"message_stop"' in anthropic.text
 
 
-def test_mcp_proxy_uses_client_key_only_for_gateway_auth_and_independent_mcp_secret(
+def test_client_key_cannot_route_http_mcp_through_gateway_proxy(
     tmp_path,
     monkeypatch,
 ):
@@ -649,6 +650,20 @@ def test_mcp_proxy_uses_client_key_only_for_gateway_auth_and_independent_mcp_sec
 
     proxy._session = fake_session
     client.app.state.mcp_proxy = proxy
+    candidate = client.app.state.mcp_server_store.create_upsert_candidate(
+        {
+            "id": "remote-mcp",
+            "displayName": "Remote MCP",
+            "transport": "streamable_http",
+            "executionMode": "browser_direct",
+            "streamableHttp": {
+                "url": "https://mcp.example.test/mcp",
+                "headers": {"X-Client-Version": "1"},
+                "secretBindings": [],
+            },
+        }
+    )
+    client.app.state.mcp_server_store.commit_metadata_candidate(candidate)
     headers = {
         "X-ActionDesign-Api-Key": client_key,
         "X-Request-Id": REQUEST_ID,
@@ -660,16 +675,9 @@ def test_mcp_proxy_uses_client_key_only_for_gateway_auth_and_independent_mcp_sec
         headers=headers,
     )
 
-    assert response.status_code == 200
-    assert response.json()["tools"][0]["name"] == "search"
-    assert captured == {
-        "url": "https://mcp.example.test/mcp",
-        "headers": {
-            "X-Client-Version": "1",
-            "Authorization": f"Bearer {mcp_secret}",
-        },
-        "secret_values": (mcp_secret,),
-    }
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "MCP_BROWSER_DIRECT_REQUIRED"
+    assert captured == {}
     assert client_key != mcp_secret
     assert client_key not in json.dumps(captured, ensure_ascii=False)
 
@@ -741,11 +749,11 @@ def test_client_key_reads_only_minimal_mcp_runtime_config_and_has_no_admin_acces
     assert runtime.json() == {
         "id": "direct-mcp",
         "transport": "streamable_http",
-        "executionMode": "auto",
+        "executionMode": "browser_direct",
         "authMode": "none",
         "browserDirectUrl": "https://mcp.example.test/private-runtime-path",
         "enabled": True,
-        "proxyEnabled": True,
+        "proxyEnabled": False,
         "configVersion": 1,
         "activeVersion": 1,
         "connectionStatus": "disconnected",

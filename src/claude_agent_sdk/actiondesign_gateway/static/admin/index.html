@@ -107,6 +107,82 @@
 
       <section id="view-secrets" class="view">
         <div class="panel">
+          <div class="panel-head"><div><h2>MCP 一键容器部署</h2><p>只接受固定 Digest 的 OCI 镜像，或固定完整 Commit 且仓库根目录包含 Dockerfile 与 mcp-deploy.yaml 的 Git 项目。容器无持久卷、允许完全出网，本地数据会在重建后丢失。</p></div><div class="row-actions"><button id="refresh-mcp-deployments" class="secondary-btn">刷新</button><button id="new-mcp-deployment" class="primary-btn">新建部署</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Deployment</th><th>来源</th><th>Transport</th><th>状态 / 版本</th><th>Revision</th><th></th></tr></thead><tbody id="mcp-deployments-body"></tbody></table></div>
+        </div>
+        <div id="mcp-deployment-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="mcp-deployment-title">新建 MCP 部署</h2><p>HTTP 候选会由当前浏览器直接执行 initialize 与 tools/list；stdio 候选由 Gateway 通过固定 Bridge 验证。构建期间旧版本继续运行。</p></div><button id="cancel-mcp-deployment" class="ghost-btn" type="button">关闭</button></div>
+          <form id="mcp-deployment-form" autocomplete="off">
+            <input id="mcp-deployment-version" type="hidden" value="0">
+            <input id="mcp-deployment-config-version" type="hidden" value="0">
+            <div class="form-grid four">
+              <label>Deployment ID<input id="mcp-deployment-id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label>
+              <label>显示名称<input id="mcp-deployment-name" required maxlength="256"></label>
+              <label>来源<select id="mcp-deployment-source"><option value="oci">OCI 镜像 Digest</option><option value="git">Git 固定 Commit</option></select></label>
+              <label class="switch-label">部署后启用<input id="mcp-deployment-enabled" type="checkbox" checked></label>
+              <label>调用超时（秒）<input id="mcp-deployment-timeout" type="number" min="1" max="600" value="30" required></label>
+              <label>预期 Server Name<input id="mcp-deployment-expected" maxlength="128"></label>
+              <label>私有源 Secret ID<input id="mcp-deployment-credential" maxlength="128" placeholder="可留空；必须为 deployment_only"></label>
+            </div>
+            <div id="mcp-deployment-oci-fields" class="form-grid two deployment-source-fields">
+              <label>OCI 镜像<input id="mcp-deployment-image" maxlength="1024" placeholder="ghcr.io/org/mcp@sha256:..."></label>
+              <label>Transport<select id="mcp-deployment-transport"><option value="streamable_http">streamable_http</option><option value="stdio">stdio</option></select></label>
+            </div>
+            <div id="mcp-deployment-git-fields" class="form-grid two deployment-source-fields hidden">
+              <label>Git HTTPS/SSH URL<input id="mcp-deployment-repository" maxlength="2048" placeholder="https://github.com/org/repo.git"></label>
+              <label>完整 Commit<input id="mcp-deployment-commit" maxlength="40" pattern="[0-9a-f]{40}"></label>
+            </div>
+            <div id="mcp-deployment-http-fields" class="form-grid four deployment-source-fields">
+              <label>容器端口<input id="mcp-deployment-port" type="number" min="1024" max="65535" value="8000"></label>
+              <label>MCP Path<input id="mcp-deployment-mcp-path" value="/mcp" maxlength="512"></label>
+              <label>健康检查<select id="mcp-deployment-health-type"><option value="http">HTTP</option><option value="tcp">TCP</option></select></label>
+              <label>健康检查 Path<input id="mcp-deployment-health-path" value="/health" maxlength="512"></label>
+            </div>
+            <div id="mcp-deployment-stdio-fields" class="deployment-source-fields hidden">
+              <label>stdio command[] JSON<textarea id="mcp-deployment-command" rows="3" spellcheck="false">["node","server.js"]</textarea></label>
+            </div>
+            <div class="form-grid four deployment-source-fields">
+              <label>CPU<input id="mcp-deployment-cpu" type="number" min="0.1" max="1" step="0.1" value="0.5"></label>
+              <label>内存 MiB<input id="mcp-deployment-memory" type="number" min="64" max="512" value="256"></label>
+              <label>PIDs<input id="mcp-deployment-pids" type="number" min="16" max="128" value="128"></label>
+              <label>启动超时（秒）<input id="mcp-deployment-startup-timeout" type="number" min="5" max="300" value="60"></label>
+            </div>
+            <div class="form-grid two deployment-source-fields">
+              <label>容器环境 Secret 绑定 JSON<textarea id="mcp-deployment-environment" rows="6" spellcheck="false">[]</textarea></label>
+              <label>浏览器静态 Header JSON<textarea id="mcp-deployment-static-headers" rows="6" spellcheck="false">{}</textarea></label>
+              <label>浏览器敏感 Header JSON<textarea id="mcp-deployment-secret-bindings" rows="6" spellcheck="false">[]</textarea></label>
+            </div>
+            <div class="form-actions"><button class="primary-btn" type="submit">开始部署</button></div>
+          </form>
+        </div>
+        <div id="mcp-deployment-job" class="panel hidden">
+          <div class="panel-head"><div><h2>部署任务</h2><p id="mcp-deployment-job-status" class="mono">等待任务</p></div><div class="row-actions"><button id="validate-mcp-deployment" class="primary-btn hidden" type="button">浏览器验证并发布</button><button id="close-mcp-deployment-job" class="ghost-btn" type="button">关闭</button></div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><div><h2>MCP Server</h2><p>Streamable HTTP 固定由浏览器直连；完整 URL、Header 和 Secret 会返回浏览器并出现在内存与 Network 面板。stdio 是后端代理例外。</p></div><div class="row-actions"><button id="refresh-mcp-servers" class="secondary-btn">刷新</button><button id="new-mcp-server" class="primary-btn">新增 HTTP MCP</button></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Server</th><th>来源 / Transport</th><th>执行模式</th><th>状态 / 版本</th><th>目标</th><th></th></tr></thead><tbody id="mcp-servers-body"></tbody></table></div>
+        </div>
+        <div id="mcp-server-editor" class="panel editor hidden">
+          <div class="panel-head"><div><h2 id="mcp-server-title">新增 HTTP MCP</h2><p>敏感 Header 必须使用 secretId/name/valuePrefix/value；保存与 Secret 更新在同一次请求中回滚。</p></div><button id="cancel-mcp-server" class="ghost-btn">关闭</button></div>
+          <form id="mcp-server-form" autocomplete="off">
+            <input id="mcp-server-version" type="hidden" value="0">
+            <div class="form-grid four">
+              <label>Server ID<input id="mcp-server-id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label>
+              <label>显示名称<input id="mcp-server-name" required maxlength="256"></label>
+              <label>预期 Server Name<input id="mcp-server-expected" maxlength="128"></label>
+              <label>调用超时（秒）<input id="mcp-server-timeout" type="number" min="1" max="600" value="30" required></label>
+              <label>SSE 读取超时（秒）<input id="mcp-server-sse-timeout" type="number" min="1" max="3600" value="300" required></label>
+              <label class="switch-label">启用<input id="mcp-server-enabled" type="checkbox" checked></label>
+            </div>
+            <div class="form-grid two">
+              <label>MCP URL（HTTPS）<input id="mcp-server-url" type="url" required maxlength="4096" placeholder="https://mcp.example.com/mcp"></label>
+              <label>静态 Header JSON<textarea id="mcp-server-static-headers" rows="6" spellcheck="false">{}</textarea></label>
+              <label>敏感 Header JSON 数组<textarea id="mcp-server-secret-bindings" rows="8" spellcheck="false">[]</textarea></label>
+            </div>
+            <div class="form-actions"><button class="primary-btn" type="submit">保存 HTTP MCP</button></div>
+          </form>
+        </div>
+        <div class="panel">
           <div class="panel-head"><div><h2>Provider API Key</h2><p>只显示掩码；环境来源不可在线修改，托管来源支持更新、轮换和撤销。</p></div><button id="refresh-secrets" class="secondary-btn">刷新</button></div>
           <div class="table-wrap"><table><thead><tr><th>Profile</th><th>状态</th><th>来源</th><th>最近修改</th><th></th></tr></thead><tbody id="provider-secrets-body"></tbody></table></div>
         </div>
@@ -121,7 +197,7 @@
         </div>
         <div id="managed-secret-editor" class="panel editor hidden">
           <div class="panel-head"><div><h2 id="managed-secret-title">新增 Secret</h2><p>更新元数据时可留空；新建或轮换必须填写新值。</p></div><button id="cancel-managed-secret" class="ghost-btn">关闭</button></div>
-          <form id="managed-secret-form" autocomplete="off"><input id="managed-secret-mode" type="hidden"><div class="form-grid four"><label>Secret ID<input id="managed-secret-id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>类型<input id="managed-secret-kind" required maxlength="64" list="secret-kinds"><datalist id="secret-kinds"><option value="mcp_key"><option value="oauth_token"><option value="provider_api_key"><option value="token_reference"></datalist></label><label>显示名称<input id="managed-secret-name" required maxlength="256"></label><label>新值<input id="managed-secret-value" type="password" minlength="8" maxlength="8192" autocomplete="new-password"></label></div><div class="form-actions"><button class="danger-btn" type="submit">提交</button></div></form>
+          <form id="managed-secret-form" autocomplete="off"><input id="managed-secret-mode" type="hidden"><div class="form-grid four"><label>Secret ID<input id="managed-secret-id" required maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label><label>类型<input id="managed-secret-kind" required maxlength="64" list="secret-kinds"><datalist id="secret-kinds"><option value="mcp_key"><option value="oauth_token"><option value="provider_api_key"><option value="token_reference"></datalist></label><label>暴露范围<select id="managed-secret-exposure"><option value="browser_header">browser_header</option><option value="deployment_only">deployment_only</option><option value="stdio_env">stdio_env</option></select></label><label>显示名称<input id="managed-secret-name" required maxlength="256"></label><label>新值<input id="managed-secret-value" type="password" minlength="8" maxlength="8192" autocomplete="new-password"></label></div><div class="form-actions"><button class="danger-btn" type="submit">提交</button></div></form>
         </div>
 
         <div class="panel narrow">

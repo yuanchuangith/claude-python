@@ -21,8 +21,16 @@ from jsonschema.exceptions import SchemaError
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
+from .mcp_deployment import McpDeploymentRef
 from .redaction import redact_value
 from .secret_store import ManagedSecretStoreError
 
@@ -232,14 +240,21 @@ class StreamableHttpTransportConfig(_StrictModel):
 
     @field_validator("url")
     @classmethod
-    def _url_is_structurally_safe(cls, value: str) -> str:
+    def _url_is_structurally_safe(cls, value: str, info: ValidationInfo) -> str:
         if value != value.strip() or any(
             ord(character) < 32 or ord(character) == 127 for character in value
         ):
             raise ValueError("streamable HTTP MCP URL is invalid")
         parsed = urlsplit(value)
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise ValueError("streamable HTTP MCP URL must use absolute HTTPS")
+        allow_browser_http = bool(
+            info.context and info.context.get("allow_browser_http")
+        )
+        allowed_schemes = {"http", "https"} if allow_browser_http else {"https"}
+        if parsed.scheme not in allowed_schemes or not parsed.hostname:
+            requirement = "HTTP(S)" if allow_browser_http else "HTTPS"
+            raise ValueError(
+                f"streamable HTTP MCP URL must use absolute {requirement}"
+            )
         try:
             port = parsed.port
         except ValueError as exc:
@@ -320,6 +335,10 @@ class McpServerConfig(_StrictModel):
         le=600.0,
     )
     enabled: bool = True
+    deployment_ref: McpDeploymentRef | None = Field(
+        default=None,
+        alias="deploymentRef",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -327,8 +346,17 @@ class McpServerConfig(_StrictModel):
         if not isinstance(value, Mapping):
             return value
         payload = dict(value)
-        if "executionMode" not in payload and "execution_mode" not in payload:
-            payload["executionMode"] = "gateway_proxy"
+        # streamable HTTP used to support ``auto`` and ``gateway_proxy``.  It is
+        # now browser-direct only.  Coerce persisted/environment legacy values
+        # during validation so the v1 -> v2 store migration is lossless instead
+        # of making an otherwise valid deployment fail at startup.
+        if payload.get("transport") == "streamable_http":
+            payload.pop("execution_mode", None)
+            payload["executionMode"] = "browser_direct"
+        elif "executionMode" not in payload and "execution_mode" not in payload:
+            payload["executionMode"] = (
+                "gateway_proxy"
+            )
         if "authMode" not in payload and "auth_mode" not in payload:
             transport = payload.get("transport")
             transport_config = (
@@ -386,21 +414,27 @@ class McpServerConfig(_StrictModel):
             raise ValueError("MCP Secret bindings require backend_secret authentication")
         if self.transport == "stdio" and self.execution_mode != "gateway_proxy":
             raise ValueError("stdio MCP servers must use gateway_proxy execution")
-        if self.auth_mode == "backend_secret" and self.execution_mode != "gateway_proxy":
-            raise ValueError(
-                "backend_secret MCP servers must use gateway_proxy execution"
-            )
         if (
             self.transport == "streamable_http"
-            and self.streamable_http is not None
-            and self.streamable_http.headers
-            and self.execution_mode != "gateway_proxy"
+            and self.execution_mode != "browser_direct"
         ):
             raise ValueError(
-                "streamable HTTP MCP servers with static headers must use "
-                "gateway_proxy execution"
+                "streamable HTTP MCP servers must use browser_direct execution"
             )
         return self
+
+
+def validate_browser_mcp_server_config(value: Any) -> McpServerConfig:
+    """Validate persisted browser-direct metadata, including explicit HTTP URLs.
+
+    The regular ``McpServerConfig`` entry point remains HTTPS-only so a caller
+    cannot accidentally pass an insecure browser URL to the Gateway transport.
+    """
+
+    return McpServerConfig.model_validate(
+        value,
+        context={"allow_browser_http": True},
+    )
 
 
 class McpProxy:
@@ -415,6 +449,13 @@ class McpProxy:
         allowed_http_urls: Sequence[str] = (),
     ) -> None:
         parsed_servers = [McpServerConfig.model_validate(item) for item in servers]
+        for server in parsed_servers:
+            if (
+                server.transport == "streamable_http"
+                and server.streamable_http is not None
+                and urlsplit(server.streamable_http.url).scheme != "https"
+            ):
+                raise ValueError("gateway MCP proxy requires HTTPS")
         ids = [item.id for item in parsed_servers]
         if len(ids) != len(set(ids)):
             raise ValueError("MCP server ids must be unique")

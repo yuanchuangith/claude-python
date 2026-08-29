@@ -1,0 +1,3 @@
+# This line belongs inside the HTTPS server block in
+# /etc/nginx/sites-available/actiondesign-gateway.
+include /etc/nginx/actiondesign-mcp-runtime/*.conf;

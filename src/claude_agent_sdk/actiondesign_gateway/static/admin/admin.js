@@ -18,6 +18,11 @@ const state = {
   models: null,
   health: new Map(),
   policy: null,
+  mcpServers: [],
+  mcpDeployments: [],
+  mcpDeploymentJobId: "",
+  mcpDeploymentPollTimer: 0,
+  validatingMcpDeployment: false,
   managedSecrets: [],
   clientApiKeys: [],
   editingProvider: null,
@@ -198,7 +203,11 @@ function clearSensitiveUi() {
   $("dialog-pages").replaceChildren();
   $("dialog-pages").classList.add("hidden");
   if ($("detail-dialog").open) $("detail-dialog").close();
-  for (const id of ["provider-editor", "model-editor", "provider-secret-editor", "managed-secret-editor"]) $(id).classList.add("hidden");
+  for (const id of ["provider-editor", "model-editor", "provider-secret-editor", "managed-secret-editor", "mcp-server-editor", "mcp-deployment-editor", "mcp-deployment-job"]) $(id).classList.add("hidden");
+  clearTimeout(state.mcpDeploymentPollTimer);
+  state.mcpDeploymentPollTimer = 0;
+  state.mcpDeploymentJobId = "";
+  state.validatingMcpDeployment = false;
 }
 
 function logout(notify = true) {
@@ -211,6 +220,8 @@ function logout(notify = true) {
   state.models = null;
   state.health = new Map();
   state.policy = null;
+  state.mcpServers = [];
+  state.mcpDeployments = [];
   state.managedSecrets = [];
   state.clientApiKeys = [];
   state.editingProvider = null;
@@ -796,6 +807,410 @@ async function revokeProviderSecret(profile) {
   } catch (error) { showError("Provider Secret 撤销失败", error); }
 }
 
+const MCP_DEPLOYMENT_TERMINAL_STATES = new Set(["running", "failed", "rolled_back", "rollback_failed"]);
+
+async function loadMcpDeployments() {
+  if (!state.sessionToken) return;
+  try {
+    state.mcpDeployments = await api("/admin/mcp-deployments");
+    renderMcpDeployments();
+  } catch (error) {
+    state.mcpDeployments = [];
+    emptyRow($("mcp-deployments-body"), 6, String(error?.message || error).includes("MCP_DEPLOYMENTS_DISABLED") ? "MCP 容器部署功能尚未启用" : "部署服务不可用");
+    if (!String(error?.message || error).includes("MCP_DEPLOYMENTS_DISABLED")) showError("MCP 部署加载失败", error);
+  }
+}
+
+function deploymentConfigVersion(record) {
+  return state.mcpServers.find((item) => item.id === record.id)?.configVersion ?? record.configVersion ?? 0;
+}
+
+function renderMcpDeployments() {
+  const tbody = $("mcp-deployments-body");
+  if (!state.mcpDeployments.length) return emptyRow(tbody, 6, "暂无 MCP 容器部署");
+  tbody.replaceChildren(...state.mcpDeployments.map((record) => {
+    const row = element("tr");
+    const name = td(); name.append(element("strong", "", record.registration?.displayName || record.id), element("div", "subtle mono", record.id));
+    const source = td();
+    if (record.source?.type === "oci") source.append(badge("OCI", "purple"), element("div", "subtle mono endpoint", record.source.image));
+    else source.append(badge("Git", "blue"), element("div", "subtle mono endpoint", `${record.source?.repository || ""}@${(record.source?.commit || "").slice(0, 12)}`));
+    const status = td(); status.append(badge(record.status, record.status === "running" ? "green" : record.status === "stopped" ? "orange" : "red"), element("div", "subtle mono", `deployment v${record.deploymentVersion} · config v${deploymentConfigVersion(record)}`));
+    const actions = td(); const wrap = element("div", "row-actions");
+    const edit = element("button", "link-btn", "更新"); edit.addEventListener("click", () => openMcpDeployment(record));
+    const toggle = element("button", "link-btn", record.status === "running" ? "停用" : "启用"); toggle.addEventListener("click", () => setDeploymentEnabled(record, record.status !== "running"));
+    const logs = element("button", "link-btn", "日志"); logs.addEventListener("click", () => showDeploymentLogs(record.id));
+    const rollback = element("button", "link-btn", "回滚"); rollback.disabled = !record.previousRevision; rollback.addEventListener("click", () => rollbackDeployment(record));
+    const remove = element("button", "link-btn danger", "删除"); remove.addEventListener("click", () => deleteDeployment(record));
+    wrap.append(edit, toggle, logs, rollback, remove); actions.append(wrap);
+    row.append(name, source, td(record.manifest?.transport || "—", "mono"), status, td((record.activeRevision || "").slice(0, 16) || "—", "mono"), actions);
+    return row;
+  }));
+}
+
+function updateMcpDeploymentFields() {
+  const isGit = $("mcp-deployment-source").value === "git";
+  $("mcp-deployment-oci-fields").classList.toggle("hidden", isGit);
+  $("mcp-deployment-git-fields").classList.toggle("hidden", !isGit);
+  $("mcp-deployment-image").required = !isGit;
+  $("mcp-deployment-repository").required = isGit;
+  $("mcp-deployment-commit").required = isGit;
+  $("mcp-deployment-transport").disabled = isGit;
+  const isStdio = !isGit && $("mcp-deployment-transport").value === "stdio";
+  $("mcp-deployment-http-fields").classList.toggle("hidden", isGit || isStdio);
+  $("mcp-deployment-stdio-fields").classList.toggle("hidden", isGit || !isStdio);
+  $("mcp-deployment-health-path").disabled = $("mcp-deployment-health-type").value === "tcp";
+  if ($("mcp-deployment-health-type").value === "tcp") $("mcp-deployment-health-path").value = "/health";
+}
+
+function openMcpDeployment(record = null) {
+  const source = record?.source || { type: "oci" };
+  const manifest = record?.manifest || null;
+  const registration = record?.registration || {};
+  $("mcp-deployment-id").value = record?.id || "";
+  $("mcp-deployment-id").disabled = Boolean(record);
+  $("mcp-deployment-version").value = String(record?.deploymentVersion || 0);
+  $("mcp-deployment-config-version").value = String(record ? deploymentConfigVersion(record) : 0);
+  $("mcp-deployment-name").value = registration.displayName || "";
+  $("mcp-deployment-source").value = source.type || "oci";
+  $("mcp-deployment-source").disabled = false;
+  $("mcp-deployment-enabled").checked = registration.enabled ?? true;
+  $("mcp-deployment-timeout").value = String(registration.timeoutSeconds || 30);
+  $("mcp-deployment-expected").value = registration.expectedServerName || "";
+  $("mcp-deployment-credential").value = source.credentialSecretId || "";
+  $("mcp-deployment-image").value = source.image || "";
+  $("mcp-deployment-repository").value = source.repository || "";
+  $("mcp-deployment-commit").value = source.commit || "";
+  $("mcp-deployment-transport").value = manifest?.transport || "streamable_http";
+  $("mcp-deployment-port").value = String(manifest?.http?.containerPort || 8000);
+  $("mcp-deployment-mcp-path").value = manifest?.http?.mcpPath || "/mcp";
+  $("mcp-deployment-health-type").value = manifest?.http?.healthCheck?.type || "http";
+  $("mcp-deployment-health-path").value = manifest?.http?.healthCheck?.path || "/health";
+  $("mcp-deployment-command").value = JSON.stringify(manifest?.stdio?.command || ["node", "server.js"], null, 2);
+  $("mcp-deployment-cpu").value = String(manifest?.resources?.cpu || 0.5);
+  $("mcp-deployment-memory").value = String(manifest?.resources?.memoryMiB || 256);
+  $("mcp-deployment-pids").value = String(manifest?.resources?.pids || 128);
+  $("mcp-deployment-startup-timeout").value = String(manifest?.startupTimeoutSeconds || 60);
+  $("mcp-deployment-environment").value = JSON.stringify(manifest?.environment || [], null, 2);
+  $("mcp-deployment-static-headers").value = JSON.stringify(registration.staticHeaders || {}, null, 2);
+  $("mcp-deployment-secret-bindings").value = JSON.stringify(registration.secretBindings || [], null, 2);
+  $("mcp-deployment-title").textContent = record ? `更新 MCP 部署 · ${record.id}` : "新建 MCP 部署";
+  updateMcpDeploymentFields();
+  $("mcp-deployment-editor").classList.remove("hidden");
+}
+
+function closeMcpDeployment() {
+  $("mcp-deployment-form").reset();
+  $("mcp-deployment-id").disabled = false;
+  $("mcp-deployment-source").disabled = false;
+  $("mcp-deployment-version").value = "0";
+  $("mcp-deployment-config-version").value = "0";
+  $("mcp-deployment-environment").value = "[]";
+  $("mcp-deployment-static-headers").value = "{}";
+  $("mcp-deployment-secret-bindings").value = "[]";
+  $("mcp-deployment-editor").classList.add("hidden");
+  updateMcpDeploymentFields();
+}
+
+async function saveMcpDeployment(event) {
+  event.preventDefault();
+  const id = $("mcp-deployment-id").value.trim();
+  try {
+    const sourceType = $("mcp-deployment-source").value;
+    const environment = parseMcpEditorJson("mcp-deployment-environment", "[]");
+    const staticHeaders = parseMcpEditorJson("mcp-deployment-static-headers", "{}");
+    const secretBindings = parseMcpEditorJson("mcp-deployment-secret-bindings", "[]");
+    if (!Array.isArray(environment) || !Array.isArray(secretBindings) || !staticHeaders || Array.isArray(staticHeaders) || typeof staticHeaders !== "object") throw new Error("部署 Secret/Header JSON 格式不正确");
+    const credentialSecretId = $("mcp-deployment-credential").value.trim();
+    const source = sourceType === "oci" ? {
+      type: "oci", image: $("mcp-deployment-image").value.trim(), credentialSecretId,
+    } : {
+      type: "git", repository: $("mcp-deployment-repository").value.trim(), commit: $("mcp-deployment-commit").value.trim(), dockerfilePath: "Dockerfile", contextPath: ".", manifestPath: "mcp-deploy.yaml", credentialSecretId,
+    };
+    let manifest = null;
+    if (sourceType === "oci") {
+      const transport = $("mcp-deployment-transport").value;
+      manifest = {
+        apiVersion: "actiondesign.mcp/v1", transport, environment,
+        resources: { cpu: Number($("mcp-deployment-cpu").value), memoryMiB: Number($("mcp-deployment-memory").value), pids: Number($("mcp-deployment-pids").value) },
+        startupTimeoutSeconds: Number($("mcp-deployment-startup-timeout").value),
+        ...(transport === "streamable_http" ? { http: { containerPort: Number($("mcp-deployment-port").value), mcpPath: $("mcp-deployment-mcp-path").value.trim(), healthCheck: { type: $("mcp-deployment-health-type").value, path: $("mcp-deployment-health-path").value.trim() || "/health" } } } : { stdio: { command: parseMcpEditorJson("mcp-deployment-command", "[]") } }),
+      };
+    }
+    const result = await api(`/admin/mcp-deployments/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        id, source, manifest,
+        registration: {
+          displayName: $("mcp-deployment-name").value.trim(), expectedServerName: $("mcp-deployment-expected").value.trim(), timeoutSeconds: Number($("mcp-deployment-timeout").value), enabled: $("mcp-deployment-enabled").checked, staticHeaders, secretBindings,
+        },
+        expectedDeploymentVersion: Number($("mcp-deployment-version").value),
+        expectedConfigVersion: Number($("mcp-deployment-config-version").value),
+      }),
+    });
+    closeMcpDeployment();
+    state.mcpDeploymentJobId = result.jobId;
+    $("mcp-deployment-job").classList.remove("hidden");
+    $("validate-mcp-deployment").classList.add("hidden");
+    $("mcp-deployment-job-status").textContent = `${id} · queued · ${result.jobId}`;
+    pollMcpDeploymentJob();
+  } catch (error) { showError("MCP 部署启动失败", error); await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]); }
+}
+
+async function pollMcpDeploymentJob() {
+  clearTimeout(state.mcpDeploymentPollTimer);
+  const jobId = state.mcpDeploymentJobId;
+  if (!jobId || !state.sessionToken) return;
+  try {
+    const job = await api(`/admin/mcp-deployment-jobs/${encodeURIComponent(jobId)}`);
+    $("mcp-deployment-job-status").textContent = `${job.deploymentId} · ${job.status}${job.errorCode ? ` · ${job.errorCode}` : ""} · ${jobId}`;
+    const awaiting = job.status === "awaiting_browser_validation";
+    $("validate-mcp-deployment").classList.toggle("hidden", !awaiting);
+    if (awaiting && !state.validatingMcpDeployment) {
+      state.validatingMcpDeployment = true;
+      await validateCurrentMcpDeployment();
+      state.validatingMcpDeployment = false;
+      return;
+    }
+    if (MCP_DEPLOYMENT_TERMINAL_STATES.has(job.status)) {
+      await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]);
+      return;
+    }
+    state.mcpDeploymentPollTimer = setTimeout(pollMcpDeploymentJob, 1500);
+  } catch (error) { showError("部署任务轮询失败", error); }
+}
+
+async function sha256Json(value) {
+  const canonical = JSON.stringify(value);
+  if (!globalThis.crypto?.subtle) return `unavailable:${canonical.length}`;
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function validateCurrentMcpDeployment() {
+  const jobId = state.mcpDeploymentJobId;
+  if (!jobId) return;
+  $("validate-mcp-deployment").disabled = true;
+  let validationPayload = { success: false, toolListHash: "" };
+  try {
+    const candidate = await api(`/admin/mcp-deployment-jobs/${encodeURIComponent(jobId)}/candidate-config`);
+    if (candidate.transport === "stdio") {
+      validationPayload = { success: true, toolListHash: "stdio-gateway-validation" };
+    } else {
+      const initialized = await browserMcpPost(candidate, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "actiondesign-admin-deployer", version: "1.0.0" } } });
+      await browserMcpPost(candidate, { jsonrpc: "2.0", method: "notifications/initialized" }, initialized.sessionId);
+      const listed = await browserMcpPost(candidate, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, initialized.sessionId);
+      const tools = listed.payload?.result?.tools || [];
+      validationPayload = { success: true, toolListHash: await sha256Json(tools), initializeOk: true, toolsListOk: true };
+    }
+    const committed = await api(`/admin/mcp-deployment-jobs/${encodeURIComponent(jobId)}/browser-validation`, { method: "POST", body: JSON.stringify(validationPayload) });
+    $("mcp-deployment-job-status").textContent = `${committed.id || committed.deploymentId || "deployment"} · ${committed.status || "running"}`;
+    showNotice("MCP 候选验证通过并已发布");
+  } catch (error) {
+    try { await api(`/admin/mcp-deployment-jobs/${encodeURIComponent(jobId)}/browser-validation`, { method: "POST", body: JSON.stringify(validationPayload) }); } catch { /* rollback is best effort and reported by polling */ }
+    showError("MCP 候选验证失败，已请求恢复旧版本", error);
+  } finally {
+    $("validate-mcp-deployment").disabled = false;
+    await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]);
+    state.mcpDeploymentPollTimer = setTimeout(pollMcpDeploymentJob, 1000);
+  }
+}
+
+async function showDeploymentLogs(id) {
+  try { openJsonDialog(`MCP 部署日志 · ${id}`, await api(`/admin/mcp-deployments/${encodeURIComponent(id)}/logs`)); }
+  catch (error) { showError("MCP 部署日志加载失败", error); }
+}
+
+async function setDeploymentEnabled(record, enabled) {
+  try {
+    await api(`/admin/mcp-deployments/${encodeURIComponent(record.id)}/enabled`, { method: "PUT", body: JSON.stringify({ enabled, expectedDeploymentVersion: record.deploymentVersion, expectedConfigVersion: deploymentConfigVersion(record) }) });
+    await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]);
+  } catch (error) { showError("MCP 部署状态更新失败", error); await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]); }
+}
+
+async function rollbackDeployment(record) {
+  if (!confirm(`确定将 ${record.id} 回滚到上一 Revision？`)) return;
+  try {
+    await api(`/admin/mcp-deployments/${encodeURIComponent(record.id)}/rollback`, { method: "POST", body: JSON.stringify({ expectedDeploymentVersion: record.deploymentVersion, expectedConfigVersion: deploymentConfigVersion(record) }) });
+    await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]);
+  } catch (error) { showError("MCP 部署回滚失败", error); await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]); }
+}
+
+async function deleteDeployment(record) {
+  if (!confirm(`确定删除部署 ${record.id}、容器、路由和 MCP 配置？`)) return;
+  try {
+    await api(`/admin/mcp-deployments/${encodeURIComponent(record.id)}`, { method: "DELETE", body: JSON.stringify({ expectedDeploymentVersion: record.deploymentVersion, expectedConfigVersion: deploymentConfigVersion(record) }) });
+    await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]);
+  } catch (error) { showError("MCP 部署删除失败", error); await Promise.allSettled([loadMcpDeployments(), loadMcpServers()]); }
+}
+
+async function loadMcpServers() {
+  if (!state.sessionToken) return;
+  try {
+    state.mcpServers = await api("/admin/mcp-servers");
+    renderMcpServers();
+  } catch (error) { showError("MCP Server 加载失败", error); }
+}
+
+function renderMcpServers() {
+  const tbody = $("mcp-servers-body");
+  if (!state.mcpServers.length) return emptyRow(tbody, 6, "暂无 MCP Server");
+  tbody.replaceChildren(...state.mcpServers.map((server) => {
+    const row = element("tr");
+    const name = td(); name.append(element("strong", "", server.displayName), element("div", "subtle mono", server.id));
+    const source = td(); source.append(badge(server.source), element("div", "subtle mono", server.transport));
+    const mode = td(); mode.append(badge(server.executionMode === "browser_direct" ? "浏览器直连" : "Gateway 代理", server.executionMode === "browser_direct" ? "green" : "orange"));
+    const status = td();
+    status.append(badge(server.enabled ? "已启用" : "已停用", server.enabled ? "green" : "orange"), element("div", "subtle mono", `v${server.configVersion}`));
+    if (server.configStatus === "invalid") status.append(element("div", "error-text", server.errorCode));
+    const actions = td(); const wrap = element("div", "row-actions");
+    const edit = element("button", "link-btn", server.editable ? "编辑" : "查看");
+    edit.addEventListener("click", () => server.editable ? openMcpServer(server) : openJsonDialog(`${server.id} · stdio 摘要`, server));
+    const test = element("button", "link-btn", server.executionMode === "browser_direct" ? "浏览器直连测试" : "stdio 后端测试");
+    test.disabled = !server.enabled || server.configStatus === "invalid";
+    test.addEventListener("click", () => testMcpServer(server));
+    wrap.append(edit, test);
+    if (server.editable) {
+      const toggle = element("button", "link-btn", server.enabled ? "停用" : "启用");
+      toggle.addEventListener("click", () => setMcpServerEnabled(server, !server.enabled));
+      const remove = element("button", "link-btn danger", "删除");
+      remove.addEventListener("click", () => deleteMcpServer(server));
+      wrap.append(toggle, remove);
+    }
+    actions.append(wrap);
+    row.append(name, source, mode, status, td(server.streamableHttp?.url || "stdio 配置未公开", "mono"), actions);
+    return row;
+  }));
+}
+
+function parseMcpEditorJson(id, fallback) {
+  const text = $(id).value.trim() || fallback;
+  const value = JSON.parse(text);
+  return value;
+}
+
+function openMcpServer(server = null) {
+  $("mcp-server-id").value = server?.id || "";
+  $("mcp-server-id").disabled = Boolean(server);
+  $("mcp-server-name").value = server?.displayName || "";
+  $("mcp-server-expected").value = server?.expectedServerName || "";
+  $("mcp-server-timeout").value = String(server?.timeoutSeconds || 30);
+  $("mcp-server-sse-timeout").value = String(server?.streamableHttp?.sseReadTimeoutSeconds || 300);
+  $("mcp-server-enabled").checked = server?.enabled ?? true;
+  $("mcp-server-version").value = String(server?.configVersion || 0);
+  $("mcp-server-url").value = server?.streamableHttp?.url || "";
+  $("mcp-server-static-headers").value = JSON.stringify(server?.streamableHttp?.staticHeaders || {}, null, 2);
+  $("mcp-server-secret-bindings").value = JSON.stringify(server?.streamableHttp?.secretBindings || [], null, 2);
+  $("mcp-server-title").textContent = server ? `编辑 HTTP MCP · ${server.id}` : "新增 HTTP MCP";
+  $("mcp-server-editor").classList.remove("hidden");
+}
+
+function closeMcpServer() {
+  $("mcp-server-form").reset();
+  $("mcp-server-id").disabled = false;
+  $("mcp-server-version").value = "0";
+  $("mcp-server-static-headers").value = "{}";
+  $("mcp-server-secret-bindings").value = "[]";
+  $("mcp-server-editor").classList.add("hidden");
+}
+
+async function saveMcpServer(event) {
+  event.preventDefault();
+  const id = $("mcp-server-id").value.trim();
+  try {
+    const staticHeaders = parseMcpEditorJson("mcp-server-static-headers", "{}");
+    const secretBindings = parseMcpEditorJson("mcp-server-secret-bindings", "[]");
+    if (!staticHeaders || Array.isArray(staticHeaders) || typeof staticHeaders !== "object") throw new Error("静态 Header 必须是 JSON 对象");
+    if (!Array.isArray(secretBindings)) throw new Error("敏感 Header 必须是 JSON 数组");
+    await api(`/admin/mcp-servers/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        id,
+        displayName: $("mcp-server-name").value.trim(),
+        transport: "streamable_http",
+        expectedConfigVersion: Number($("mcp-server-version").value),
+        expectedServerName: $("mcp-server-expected").value.trim(),
+        timeoutSeconds: Number($("mcp-server-timeout").value),
+        enabled: $("mcp-server-enabled").checked,
+        streamableHttp: {
+          url: $("mcp-server-url").value.trim(),
+          staticHeaders,
+          secretBindings,
+          sseReadTimeoutSeconds: Number($("mcp-server-sse-timeout").value),
+        },
+      }),
+    });
+    showNotice(`MCP Server ${id} 已保存`);
+    closeMcpServer();
+    await loadMcpServers();
+  } catch (error) {
+    if (String(error?.message || error).includes("MCP_CONFIG_VERSION_CONFLICT")) {
+      showNotice("配置版本冲突：编辑内容已保留，列表已刷新，请核对后重新提交", "error");
+      await loadMcpServers();
+    } else showError("MCP Server 保存失败", error);
+  }
+}
+
+async function setMcpServerEnabled(server, enabled) {
+  try {
+    if (server.managedBy === "deployment") {
+      await api(`/admin/mcp-deployments/${encodeURIComponent(server.id)}/enabled`, {
+        method: "PUT", body: JSON.stringify({ enabled, expectedConfigVersion: server.configVersion, expectedDeploymentVersion: server.deploymentVersion }),
+      });
+    } else {
+      await api(`/admin/mcp-servers/${encodeURIComponent(server.id)}/enabled`, {
+        method: "PUT", body: JSON.stringify({ enabled, expectedConfigVersion: server.configVersion }),
+      });
+    }
+    await Promise.allSettled([loadMcpServers(), loadMcpDeployments()]);
+  } catch (error) { showError("MCP Server 状态更新失败", error); await Promise.allSettled([loadMcpServers(), loadMcpDeployments()]); }
+}
+
+async function deleteMcpServer(server) {
+  if (!confirm(`确定删除 MCP Server ${server.id}？`)) return;
+  try {
+    const path = server.managedBy === "deployment" ? `/admin/mcp-deployments/${encodeURIComponent(server.id)}` : `/admin/mcp-servers/${encodeURIComponent(server.id)}`;
+    await api(path, {
+      method: "DELETE", body: JSON.stringify({ expectedConfigVersion: server.configVersion, ...(server.managedBy === "deployment" ? { expectedDeploymentVersion: server.deploymentVersion } : {}) }),
+    });
+    await Promise.allSettled([loadMcpServers(), loadMcpDeployments()]);
+  } catch (error) { showError("MCP Server 删除失败", error); await Promise.allSettled([loadMcpServers(), loadMcpDeployments()]); }
+}
+
+function parseMcpRpcResponse(text, contentType) {
+  if (!contentType.includes("text/event-stream")) return JSON.parse(text);
+  const data = text.split(/\r?\n/).filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim()).find((line) => line && line !== "[DONE]");
+  if (!data) throw new Error("MCP SSE 响应为空");
+  return JSON.parse(data);
+}
+
+async function browserMcpPost(server, body, sessionId = "") {
+  const headers = {
+    ...server.streamableHttp.headers,
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    "MCP-Protocol-Version": "2025-06-18",
+    ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+  };
+  const response = await fetch(server.streamableHttp.url, { method: "POST", headers, body: JSON.stringify(body), cache: "no-store", redirect: "error" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`目标 MCP HTTP ${response.status}: ${text.slice(0, 500)}`);
+  return { payload: text ? parseMcpRpcResponse(text, response.headers.get("content-type") || "") : null, sessionId: response.headers.get("mcp-session-id") || sessionId };
+}
+
+async function testMcpServer(server) {
+  try {
+    if (server.executionMode !== "browser_direct") {
+      const result = await api(`/admin/mcp-servers/${encodeURIComponent(server.id)}/connection-test`, { method: "POST" });
+      return openJsonDialog(`stdio 后端连接测试 · ${server.id}`, result);
+    }
+    const initialized = await browserMcpPost(server, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "actiondesign-admin-browser", version: "1.0.0" } } });
+    await browserMcpPost(server, { jsonrpc: "2.0", method: "notifications/initialized" }, initialized.sessionId);
+    const listed = await browserMcpPost(server, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, initialized.sessionId);
+    openJsonDialog(`浏览器直连测试 · ${server.id}`, { serverInfo: initialized.payload?.result?.serverInfo, tools: listed.payload?.result?.tools || [] });
+  } catch (error) { showError("MCP 连接测试失败（请检查目标 CORS）", error); }
+}
+
 function renderManagedSecrets(auditMap) {
   const tbody = $("managed-secrets-body");
   if (!state.managedSecrets.length) return emptyRow(tbody, 6, "暂无 MCP / OAuth / 其他 Secret");
@@ -809,7 +1224,8 @@ function renderManagedSecrets(auditMap) {
     const rotate = element("button", "link-btn", "轮换"); rotate.disabled = !secret.configured; rotate.addEventListener("click", () => openManagedSecret(secret, "rotate"));
     const revoke = element("button", "link-btn danger", "撤销"); revoke.disabled = !secret.configured; revoke.addEventListener("click", () => revokeManagedSecret(secret));
     wrap.append(edit, rotate, revoke); actions.append(wrap);
-    row.append(name, td(secret.kind, "mono"), status, td(formatTime(secret.updatedAt)), td(audit ? audit.actor : "—"), actions);
+    const kind = td(); kind.append(element("div", "mono", secret.kind), element("div", "subtle mono", secret.exposure || "browser_header"));
+    row.append(name, kind, status, td(formatTime(secret.updatedAt)), td(audit ? audit.actor : "—"), actions);
     return row;
   }));
 }
@@ -818,11 +1234,13 @@ function openManagedSecret(secret = null, mode = "upsert") {
   $("managed-secret-mode").value = mode;
   $("managed-secret-id").value = secret ? secret.id : "";
   $("managed-secret-kind").value = secret ? secret.kind : "mcp_key";
+  $("managed-secret-exposure").value = secret?.exposure || "browser_header";
   $("managed-secret-name").value = secret ? secret.displayName : "";
   $("managed-secret-value").value = "";
   const locked = Boolean(secret);
   $("managed-secret-id").disabled = locked;
   $("managed-secret-kind").disabled = mode === "rotate";
+  $("managed-secret-exposure").disabled = mode === "rotate";
   $("managed-secret-name").disabled = mode === "rotate";
   $("managed-secret-value").required = !secret || mode === "rotate";
   $("managed-secret-title").textContent = mode === "rotate" ? `轮换 ${secret.id}` : secret ? `更新 ${secret.id}` : "新增 Secret";
@@ -834,6 +1252,7 @@ function closeManagedSecret() {
   $("managed-secret-value").value = "";
   $("managed-secret-id").disabled = false;
   $("managed-secret-kind").disabled = false;
+  $("managed-secret-exposure").disabled = false;
   $("managed-secret-name").disabled = false;
   $("managed-secret-editor").classList.add("hidden");
 }
@@ -847,7 +1266,7 @@ async function saveManagedSecret(event) {
     if (mode === "rotate") {
       await api(`/admin/secrets/${encodeURIComponent(id)}/rotate`, { method: "POST", body: JSON.stringify({ value }) });
     } else {
-      const body = { id, kind: $("managed-secret-kind").value.trim(), displayName: $("managed-secret-name").value.trim() };
+      const body = { id, kind: $("managed-secret-kind").value.trim(), displayName: $("managed-secret-name").value.trim(), exposure: $("managed-secret-exposure").value };
       if (value) body.value = value;
       await api(`/admin/secrets/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) });
     }
@@ -1072,7 +1491,7 @@ function switchView(name) {
   if (!state.sessionToken) return;
   if (name === "channels") loadChannels();
   if (name === "models") state.profiles.length ? renderModels() : loadChannels();
-  if (name === "secrets") loadSecrets();
+  if (name === "secrets") { loadSecrets(); loadMcpServers(); loadMcpDeployments(); }
   if (name === "requests") loadRequests();
   if (name === "conversations") loadConversations();
   if (name === "audit") loadAudit();
@@ -1086,6 +1505,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("provider-auth").addEventListener("change", clearProviderModelCandidates);
   $("refresh-models").addEventListener("click", loadChannels); $("new-model").addEventListener("click", () => openModelEditor()); $("cancel-model").addEventListener("click", closeModelEditor); $("reset-model").addEventListener("click", () => state.editingModel ? openModelEditor(state.profiles.find((item) => item.id === state.editingModel.profileId), state.profiles.find((item) => item.id === state.editingModel.profileId).models.find((item) => item.id === state.editingModel.modelId)) : openModelEditor()); $("model-form").addEventListener("submit", saveModel);
   $("refresh-secrets").addEventListener("click", loadSecrets); $("provider-secret-form").addEventListener("submit", saveProviderSecret); $("cancel-provider-secret").addEventListener("click", closeProviderSecret); $("new-secret").addEventListener("click", () => openManagedSecret()); $("managed-secret-form").addEventListener("submit", saveManagedSecret); $("cancel-managed-secret").addEventListener("click", closeManagedSecret);
+  $("refresh-mcp-servers").addEventListener("click", loadMcpServers); $("new-mcp-server").addEventListener("click", () => openMcpServer()); $("mcp-server-form").addEventListener("submit", saveMcpServer); $("cancel-mcp-server").addEventListener("click", closeMcpServer);
+  $("refresh-mcp-deployments").addEventListener("click", () => Promise.allSettled([loadMcpDeployments(), loadMcpServers()])); $("new-mcp-deployment").addEventListener("click", () => openMcpDeployment()); $("mcp-deployment-form").addEventListener("submit", saveMcpDeployment); $("cancel-mcp-deployment").addEventListener("click", closeMcpDeployment); $("mcp-deployment-source").addEventListener("change", updateMcpDeploymentFields); $("mcp-deployment-transport").addEventListener("change", updateMcpDeploymentFields); $("mcp-deployment-health-type").addEventListener("change", updateMcpDeploymentFields); $("validate-mcp-deployment").addEventListener("click", async () => { if (state.validatingMcpDeployment) return; state.validatingMcpDeployment = true; try { await validateCurrentMcpDeployment(); } finally { state.validatingMcpDeployment = false; } }); $("close-mcp-deployment-job").addEventListener("click", () => { clearTimeout(state.mcpDeploymentPollTimer); state.mcpDeploymentPollTimer = 0; state.mcpDeploymentJobId = ""; $("mcp-deployment-job").classList.add("hidden"); });
   $("create-client-key-form").addEventListener("submit", createClientApiKey); $("refresh-client-keys").addEventListener("click", loadClientApiKeys); $("clear-client-key").addEventListener("click", clearDisplayedClientKey);
   $("copy-client-key").addEventListener("click", async () => { try { await copyText($("revealed-client-key-value").textContent); showNotice("Client API Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
   $("refresh-audit").addEventListener("click", () => loadAudit()); $("refresh-conversations").addEventListener("click", () => loadConversations()); $("refresh-requests").addEventListener("click", () => loadRequests());

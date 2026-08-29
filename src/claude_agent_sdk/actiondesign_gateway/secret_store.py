@@ -24,9 +24,10 @@ from .profile_store import ProfileSecretStore, ProfileSecretStoreError
 _SECRET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SECRET_KIND_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 _SECRET_REF_RE = re.compile(r"^profile:[0-9a-f]{32}$")
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 _MIN_SECRET_LENGTH = 8
 _MAX_SECRET_LENGTH = 8_192
+SecretExposure = Literal["browser_header", "deployment_only", "stdio_env"]
 
 
 class ManagedSecretStoreError(RuntimeError):
@@ -93,6 +94,7 @@ class SecretUpsertRequest(_StrictModel):
     kind: str
     display_name: str = Field(alias="displayName", min_length=1, max_length=256)
     value: str = Field(default="", max_length=_MAX_SECRET_LENGTH)
+    exposure: SecretExposure | None = None
 
     @field_validator("id")
     @classmethod
@@ -133,6 +135,7 @@ class SecretResponse(_StrictModel):
     updated_at: str = Field(alias="updatedAt")
     rotated_at: str = Field(default="", alias="rotatedAt")
     revoked_at: str = Field(default="", alias="revokedAt")
+    exposure: SecretExposure
 
     @field_validator("id")
     @classmethod
@@ -164,6 +167,7 @@ class _SecretMetadata(_StrictModel):
     updated_at: str = Field(alias="updatedAt")
     rotated_at: str = Field(default="", alias="rotatedAt")
     revoked_at: str = Field(default="", alias="revokedAt")
+    exposure: SecretExposure = "browser_header"
 
     @field_validator("id")
     @classmethod
@@ -218,12 +222,13 @@ class _SecretMetadata(_StrictModel):
                 "updatedAt": self.updated_at,
                 "rotatedAt": self.rotated_at,
                 "revokedAt": self.revoked_at,
+                "exposure": self.exposure,
             }
         ).model_dump(mode="json", by_alias=True)
 
 
 class _SecretMetadataFile(_StrictModel):
-    schema_version: Literal["1"] = Field(alias="schemaVersion")
+    schema_version: Literal["1", "2"] = Field(alias="schemaVersion")
     secrets: list[_SecretMetadata] = Field(default_factory=list, max_length=1_000)
 
     @model_validator(mode="after")
@@ -255,15 +260,37 @@ class ManagedSecretRollbackSnapshot:
 class ManagedSecretStore:
     """Metadata-only registry backed by an existing secure Secret backend."""
 
-    def __init__(self, path: Path, secret_store: ProfileSecretStore) -> None:
+    def __init__(
+        self,
+        path: Path,
+        secret_store: ProfileSecretStore,
+        *,
+        legacy_exposures: Mapping[str, SecretExposure] | None = None,
+    ) -> None:
         self.path = Path(path)
         self._secret_store = secret_store
         self._lock = threading.RLock()
-        self._secrets = self._load()
+        self._secrets, needs_migration = self._load()
+        if needs_migration and legacy_exposures:
+            for secret_id, exposure in legacy_exposures.items():
+                item = self._secrets.get(secret_id)
+                if item is not None:
+                    self._secrets[secret_id] = item.model_copy(
+                        update={"exposure": exposure}
+                    )
+        if needs_migration:
+            self._save()
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
             return [self._secrets[item].public() for item in sorted(self._secrets)]
+
+    def reload(self) -> None:
+        """Refresh metadata written atomically by the other trusted service."""
+
+        with self._lock:
+            secrets, _needs_migration = self._load()
+            self._secrets = secrets
 
     def list_public(self) -> list[dict[str, Any]]:
         return self.list()
@@ -284,6 +311,20 @@ class ManagedSecretStore:
             if not value:
                 raise ManagedSecretStoreError("configured Secret value is unavailable")
             return value
+
+    def require_exposure(
+        self,
+        secret_id: str,
+        allowed: set[SecretExposure],
+    ) -> dict[str, Any]:
+        safe_id = _validate_secret_id(secret_id)
+        with self._lock:
+            item = self._secrets.get(safe_id)
+            if item is None or item.secret_ref is None:
+                raise KeyError(safe_id)
+            if item.exposure not in allowed:
+                raise PermissionError("Secret exposure is not permitted for this binding")
+            return item.public()
 
     def candidate_overlay(
         self,
@@ -394,6 +435,10 @@ class ManagedSecretStore:
                         else (current.rotated_at if current is not None else "")
                     ),
                     "revokedAt": "" if configured else (current.revoked_at if current else now),
+                    "exposure": (
+                        payload.exposure
+                        or (current.exposure if current is not None else "browser_header")
+                    ),
                 }
             )
             self._secrets[payload.id] = item
@@ -490,9 +535,9 @@ class ManagedSecretStore:
                 raise exc
             return item.public()
 
-    def _load(self) -> dict[str, _SecretMetadata]:
+    def _load(self) -> tuple[dict[str, _SecretMetadata], bool]:
         if not self.path.exists():
-            return {}
+            return {}, False
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             payload = _SecretMetadataFile.model_validate(raw)
@@ -500,7 +545,7 @@ class ManagedSecretStore:
             for item in secrets.values():
                 if item.secret_ref and not self._backend_get(item.secret_ref):
                     raise ValueError("configured Secret value is unavailable")
-            return secrets
+            return secrets, payload.schema_version != _SCHEMA_VERSION
         except (
             OSError,
             TypeError,
@@ -647,5 +692,6 @@ __all__ = [
     "ManagedSecretStoreError",
     "SecretResponse",
     "SecretRotateRequest",
+    "SecretExposure",
     "SecretUpsertRequest",
 ]

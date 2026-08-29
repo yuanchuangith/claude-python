@@ -1,0 +1,10 @@
+apiVersion: actiondesign.mcp/v1
+transport: stdio
+stdio:
+  command: ["python", "/app/server.py", "stdio"]
+environment: []
+resources:
+  cpu: 0.25
+  memoryMiB: 128
+  pids: 64
+startupTimeoutSeconds: 60

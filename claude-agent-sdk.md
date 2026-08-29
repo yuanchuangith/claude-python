@@ -1,5 +1,86 @@
 # ActionDesign Thin Gateway
 
+## MCP 单一配置源与浏览器直连（2026-08-09，优先于下文旧 MCP 描述）
+
+MCP 配置只有一个 `McpServerStore` 和一个 `ManagedSecretStore`。环境变量提供只读 Server 层；`/admin/`、管理员 API、兼容期 `/mcp-config/*` 与公开 `/mcp-browser/*` 都操作同一个 managed 层，不存在 Browser 专用 Store，也不按“管理员创建/前端创建”拆成两套数据。合并时环境 ID 优先且只读，managed 配置不能覆盖环境 Server；启动发现历史 ID 冲突会 fail closed。
+
+最终数据流：
+
+```text
+环境配置（只读） ───────────────┐
+后端管理员 /admin 与管理 API ───┼─> McpServerStore + ManagedSecretStore
+前端设置页 /mcp-browser/* ──────┘                 │
+                                                  ▼
+                                    合并并展开浏览器完整配置
+                                                  │
+                                                  ▼
+                              浏览器 initialize / tools/list / tools/call
+```
+
+### 无 Client API Key 的浏览器配置接口
+
+以下接口由 `ACTIONDESIGN_PUBLIC_BROWSER_MCP_CONFIG=true` 显式开启，默认关闭。开启时 `ACTIONDESIGN_AGENT_ALLOW_ORIGINS` 必须至少包含一个精确 Origin，不能留空或使用 `*`。接口要求请求携带匹配的 `Origin`，并统一返回 `Cache-Control: no-store`；CORS/Origin 限制只是部署边界，不是用户身份认证。
+
+- `GET /api/actiondesign-agent/mcp-browser/servers`
+- `GET /api/actiondesign-agent/mcp-browser/servers/{serverId}`
+- `PUT /api/actiondesign-agent/mcp-browser/servers/{serverId}`
+- `PUT /api/actiondesign-agent/mcp-browser/servers/{serverId}/enabled`
+- `DELETE /api/actiondesign-agent/mcp-browser/servers/{serverId}`
+- `POST /api/actiondesign-agent/mcp-browser/servers/{serverId}/connection-test`
+
+公开写接口只接受 `transport=streamable_http`。新增时 `expectedConfigVersion=0`；修改、启停和删除必须提交当前正整数版本，过期页面返回 `409 MCP_CONFIG_VERSION_CONFLICT`。Server 配置变化或绑定 Secret 轮换会令所有受影响 Server 的有效版本各增加一次；环境 Server 的版本也会持久化，但环境配置本身不变。
+
+公开响应严格返回 `source/editable/enabled/transport/executionMode/configVersion/configStatus/errorCode`，以及完整的 `streamableHttp.url`、最终 `headers`、`protocolVersion=2025-06-18` 和超时，不返回内部 `staticHeaders`、`secretBindings`、Secret ID 或部署管理字段。写入端接受前端最终 `headers`；兼容期管理员和旧 `/mcp-config/*` 调用仍可提交 `staticHeaders + secretBindings`，但两种格式不能混用。最终 Header 中的 Authorization、API Key 等敏感值会自动进入 `ManagedSecretStore`，非敏感 Header 留在 Server metadata。Secret 缺失或撤销时返回 `configStatus=invalid`，不返回半完整 Header。HTTP Header 名称按大小写去重，调用方不能配置 `Content-Type`、`Accept`、`MCP-Protocol-Version` 或 `Mcp-Session-Id`。
+
+这是已确认的新安全边界：HTTP MCP Secret 会出现在 Gateway 配置响应、浏览器内存、目标 MCP 请求和开发者工具 Network 面板中。配置响应禁止缓存；Secret 仍不得写入日志、审计正文、Trace、Prompt、checkpoint、localStorage、IndexedDB 或其他持久化前端状态。审计只保存入口、Server/Secret ID、有效版本和不含 Secret 值的配置 hash。
+
+### HTTP 与 stdio 执行分流
+
+- `streamable_http` 固定为 `executionMode=browser_direct`。后端不执行其 `initialize`、`tools/list`、`tools/call`，也没有 Gateway fallback。`/mcp/{serverId}/tools|call` 对 HTTP 返回 `MCP_BROWSER_DIRECT_REQUIRED`。
+- HTTP 后端“连接测试”只检查 strict schema、HTTP/HTTPS URL、Header、Secret binding 和版本完整性。真实连接测试由 `/admin/` 或前端设置页的浏览器直接请求目标 URL。浏览器直连元数据允许 HTTP/HTTPS；只有 Gateway transport/proxy 的公网目标继续强制 HTTPS。
+- `stdio` 是明确例外，只能由环境或管理员配置，继续使用 `executionMode=gateway_proxy`、受认证 Gateway、executable allowlist、最小环境继承和 Secret env 注入。公开投影只显示 stdio 摘要，不返回 command、cwd、args、env 或 Secret。
+- `/admin/` 的 HTTP MCP 编辑器明确显示“浏览器直连”和密钥回传警告；stdio 真实连接测试仍由后端执行。
+
+浏览器在页面加载、Agent run 开始、每个新 Step Snapshot 前以及本页保存/启停/删除后重新读取配置。同一 `serverId + configVersion` 复用会话；新版本创建新 Transport，进行中的请求和已经绑定当前 Step 的旧会话不热替换。删除、停用或 Secret 轮换只影响下一 Step Snapshot。
+
+真实验收必须在目标 MCP 已允许 CPM Origin、POST、自定义认证 Header、`MCP-Protocol-Version`、`Mcp-Session-Id` 并暴露 `Mcp-Session-Id` 的浏览器中完成。聚焦单元测试和后端配置完整性检查不等于真实 CORS、凭据或 MCP 会话验收。
+
+### `gxp-lowcode-readonly` 当前部署状态（2026-08-10）
+
+- Gateway 已注册 managed Server `gxp-lowcode-readonly`，地址为 `http://43.135.137.212:8890/mcp`，`headers={}`、`configVersion=1`、`enabled=true`。
+- Gateway 重启后配置仍存在；服务器本机已完成 MCP `initialize` 与 `tools/list`，当前暴露 11 个只读工具。
+- 这仍不是浏览器验收：公网 TCP 8890 当前超时，需先开放腾讯云安全组；数据库连接为 `configured=true, reachable=false`，还需数据库白名单/ACL 放行 `43.135.137.212`。两项完成后再从 CPM 页面验证 CORS、Session Header 和真实工具调用。
+
+## MCP 一键容器部署（2026-08-10）
+
+`actiondesign-mcp-deployer.service` 是唯一可访问 Docker、专用构建目录和 MCP Nginx include 的进程。8888 Gateway 只通过 root 管理、`0660 root:actiondesign-gateway` 的 Unix Socket 调用 Deployer；Gateway 用户不加入 `docker` 组，也不能访问 Docker Socket。功能由 `ACTIONDESIGN_MCP_DEPLOYMENTS_ENABLED=true` 显式开启，默认关闭。
+
+- OCI 来源必须是 `registry/path@sha256:<64 hex>`，Registry host 必须在 `ACTIONDESIGN_MCP_DEPLOY_ALLOWED_REGISTRIES`。
+- Git 来源必须是 allowlist host 上的 HTTPS/SSH URL 和完整小写 40 位 Commit；构建文件固定为仓库根目录 `Dockerfile`、根上下文和 `mcp-deploy.yaml`，不接受压缩包、自动语言识别、动态 Dockerfile path 或 shell 启动字段。
+- HTTP 稳定地址固定为 `https://43-135-137-212.sslip.io/mcp-runtime/{serverId}/mcp`。候选使用五分钟有效的随机 HTTPS path，由 `/admin/` 所在浏览器直接执行 `initialize`、initialized notification 与 `tools/list`，成功后才切换稳定路由和共享 `McpServerStore`。
+- 部署生成的 stdio Server 只执行 allowlist 中的固定 `actiondesign-mcp-stdio-bridge`。Bridge 通过另一个受限 Unix Socket 请求 Deployer 创建临时容器；Gateway 不直接运行 Docker。
+- `McpDeploymentStore` 只保存 source、Revision、Job、容器和回滚状态；MCP 的有效配置仍只有 `McpServerStore + ManagedSecretStore`。代码 Revision 切换、回滚、启停只令有效 `configVersion` 增加一次。
+- 容器无持久卷、允许出网、使用 bridge network、非 root image、只读根文件系统、默认 seccomp、`no-new-privileges`、capabilities 全删除，禁止 privileged、host network/PID/IPC、设备和主机目录挂载。默认资源为 `0.5 CPU / 256 MiB / 128 PIDs`，上限为 `1 CPU / 512 MiB`。
+
+Git 仓库的 manifest 固定示例：
+
+```yaml
+apiVersion: actiondesign.mcp/v1
+transport: streamable_http
+http:
+  containerPort: 8000
+  mcpPath: /mcp
+  healthCheck: {type: http, path: /health}
+environment:
+  - {name: UPSTREAM_TOKEN, secretId: mcp-upstream, valuePrefix: ""}
+resources: {cpu: 0.5, memoryMiB: 256, pids: 128}
+startupTimeoutSeconds: 60
+```
+
+Secret 暴露范围是强制边界：`browser_header` 才能进入 HTTP 浏览器配置；`deployment_only` 只用于 Git/Registry 和 HTTP 容器环境；`stdio_env` 只用于 stdio 容器环境。明文不进入 source、manifest、Job、DeploymentStore、审计或命令参数。Deployer 每次部署和 stdio 启动前重新读取原子 Secret metadata，以识别管理员后来新增或轮换的 Secret。
+
+管理员 Bearer 接口位于 `/api/actiondesign-agent/admin/mcp-deployments*` 与 `/admin/mcp-deployment-jobs*`，覆盖 202 异步部署、Job 轮询、候选配置、浏览器验证、启停、回滚、脱敏有界日志和补偿式删除。部署和 MCP 配置分别携带 `expectedDeploymentVersion` 与 `expectedConfigVersion`；并发任务返回 `MCP_DEPLOYMENT_BUSY`。Deployer 重启会 fail closed 地回滚所有未完成 Job。
+
 该服务是 ActionDesign 前端 LangGraph Agent 的轻量 Python 网关。它不是 Agent 运行时。
 
 ## 文档基线
@@ -17,7 +98,7 @@
 - 记录 request、response、usage、耗时、错误和前端 tool result。
 - 管理 API Profile 与 Key，API 永不回显 secret。
 - 脱敏转发前端 LangGraph trace 到 LangSmith。
-- 通过环境只读或受管配置提供 stdio/streamable HTTP MCP proxy；按安全条件投影 browser-direct 连接信息，注入目标 Secret、透传 Schema/result，并记录元数据日志。
+- 合并环境只读层与 managed 层并投影完整的 browser-direct HTTP MCP 配置；仅对 stdio 提供受认证 Gateway proxy、Secret env 注入和有界 Schema/result 透传。
 - 使用 Pydantic v2 校验请求、配置、SSE、响应、Profile、tool result 和 trace；使用 Draft 2020-12 JSON Schema 校验 Provider 返回的动态工具参数。
 
 ## 明确不负责
@@ -54,9 +135,10 @@ FastAPI API contract version：`3.1.0`。
 | `/api/actiondesign-agent/models` | Client API Key 或管理员 Bearer | 当前不再是匿名接口 |
 | 原生 chat/stream/tool-result/seal、MCP runtime、LangSmith batch | `X-ActionDesign-Service-Token`、`X-ActionDesign-Api-Key`，或 Client API Key | 生产环境必须使用 `ACTIONDESIGN_SERVICE_AUTH_MODE=required`；`disabled` 只用于显式本地开发 |
 | `/v1/*`、`/api/actiondesign-agent/mcp-config/*` | Client API Key | 不接受 Provider Key 充当网关凭据 |
+| `/api/actiondesign-agent/mcp-browser/*` | 无 Client API Key | 仅在 `ACTIONDESIGN_PUBLIC_BROWSER_MCP_CONFIG=true` 时启用；要求精确 Origin/CORS，响应 `Cache-Control: no-store` |
 | `/api/actiondesign-agent/admin/*` 与 `/admin/client-api-keys` | 管理员 Bearer session/token | Client API Key 不能管理 Profile、日志或其他 Client API Key |
 
-Client API Key 可放在 `Authorization: Bearer ...`、`x-api-key: ...` 或 `X-ActionDesign-Api-Key: ...`。若同时提交多个 Header，其值必须完全一致，否则返回 401。Provider Key、Service Token 与 MCP Secret 是三个独立边界，均不得下发到浏览器或写入普通响应/日志。
+Client API Key 可放在 `Authorization: Bearer ...`、`x-api-key: ...` 或 `X-ActionDesign-Api-Key: ...`。若同时提交多个 Header，其值必须完全一致，否则返回 401。Provider Key 与 Service Token 不得下发浏览器。HTTP MCP Secret 是明确例外，会通过 `/mcp-browser/*` 完整配置响应返回浏览器，但不得写入日志、审计正文、Trace、Prompt、checkpoint 或持久化前端存储；stdio Secret 仍不得公开。
 
 ## API
 
@@ -108,7 +190,7 @@ Client API Key 可放在 `Authorization: Bearer ...`、`x-api-key: ...` 或 `X-A
 
 `systemPrompt` 是必填非空字段，并映射到 Provider 的独立 `system` 字段；不会拼接到普通 `prompt`。缺失、仅空白、超长或结构不合法的请求在发起 Provider 调用前返回 422。
 
-网关只做通用传输层结构校验，不维护 ActionDesign 画布业务工具白名单。业务工具名称、计划范围、画布目标、写入冲突和完成闸门继续由前端 LangGraph 校验。MCP Server 与 transport 由管理员固定配置，请求不能覆盖 URL、command、Secret 或认证绑定；网关只校验调用方指定的工具确实由该 Server 的实时 tools/list 暴露。
+网关只做通用传输层结构校验，不维护 ActionDesign 画布业务工具白名单。业务工具名称、计划范围、画布目标、写入冲突和完成闸门继续由前端 LangGraph 校验。HTTP MCP 由浏览器使用完整配置直接执行并校验实时 tools/list；stdio 仍由受认证 Gateway 校验并代理，调用方不能覆盖 command、Secret 或 env 绑定。
 
 ### OpenAI / Anthropic 兼容接口
 
@@ -165,17 +247,18 @@ data: {"protocolVersion":"1.0","sequence":2,"conversationId":"11111111-1111-4111
 
 该接口只记录前端工具执行结果，并按 `conversationId + runId + toolCallId` 幂等；不会触发下一轮模型调用。
 
-### 通用 MCP transport / Secret proxy
+### MCP 浏览器直连与 stdio proxy
 
 - `GET /api/actiondesign-agent/mcp/{serverId}/tools`
 - `POST /api/actiondesign-agent/mcp/{serverId}/call`
 
 规则：
 
-- MCP Server 来自环境只读配置或管理员 managed store；普通调用方只能提交 serverId、该 Server 实时暴露的 toolName 和 arguments。
-- 仅支持后端 `stdio` 与 `streamable_http`。HTTP 强制 HTTPS、精确 authority/path allowlist、禁止 redirect；stdio 强制现存绝对 executable allowlist。
-- stdio 子进程只继承最小系统环境并注入当前 Server 显式绑定的 Secret；HTTP 只向当前 Server 的固定 Header 注入 Secret。Provider、LangSmith、Admin 和其他 MCP Secret 不会交叉继承。
-- tools/list 的 Draft 2020-12 input/output Schema 与 call result 使用有界 JSON 原样透传。网关不按业务含义选择工具、不解析 SQL、不解释结果，也不包含固定 Skill、工具目录或业务结果 Schema。
+- MCP Server 来自同一个环境只读层与 managed store；`/admin/`、管理员 API、兼容路由和 `/mcp-browser/*` 复用同一配置服务。
+- `streamable_http` 固定为 `browser_direct`，浏览器配置 URL 可使用 HTTP 或 HTTPS；后端不执行 initialize、tools/list 或 tools/call，`/mcp/{serverId}/tools|call` 返回 `MCP_BROWSER_DIRECT_REQUIRED`。Gateway transport/proxy 的公网目标仍强制 HTTPS。
+- `/mcp-browser/*` 只投影完整 URL、最终 Header、协议版本和超时，不返回内部 Header/Secret binding 结构。缺失或撤销的 Secret 令配置 fail closed，不返回半完整 Header；响应禁止缓存。
+- `stdio` 强制现存绝对 executable allowlist，只继承最小系统环境并注入当前 Server 显式绑定的 Secret；它是后端真实连接测试及 tools/list/tools/call 的唯一 transport。
+- stdio tools/list 的 Draft 2020-12 input/output Schema 与 call result 使用有界 JSON 原样透传。网关不按业务含义选择工具、不解析 SQL、不解释结果，也不包含固定 Skill、工具目录或业务结果 Schema。
 - 调用日志只记录参数/result 的 hash、长度、键名、耗时和 `isError`，不保存参数或结果正文。
 - 启用时 `ACTIONDESIGN_AGENT_ALLOW_ORIGINS` 必须是显式 Origin，禁止 `*`。生产环境仍应放在已认证反向代理之后。
 - 前端 Skill/Graph 决定调用顺序；网关不实现诊断工作流、不读取 Skill prompt、不判断业务结论。
@@ -265,7 +348,7 @@ ACTIONDESIGN_REQUEST_LOG_BACKUP_COUNT=5
 
 请求日志只保留严格白名单内的 usage/error、hash、长度、耗时和路由元数据；读取历史行时再次清洗。默认单文件 10 MiB、保留 5 个备份，列表与详情使用有界分块反向读取，不会把整个日志文件载入内存。
 
-生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要删除客户端伪造的 Service Token Header；浏览器使用短期 session 或独立 Browser API Key，不读取 Provider Key/Service Token。`chat`、流式路由、兼容 Provider 路由、`tool-result`、通用 MCP 和 LangSmith batch 接受有效 `X-ActionDesign-Api-Key`，内部调用也可使用 `X-ActionDesign-Service-Token`；`health/models` 保持公开只读。短期 session 只应放内存或 sessionStorage，不应放 localStorage。
+生产环境必须使用 HTTPS 同源反向代理保护薄网关。代理需要删除客户端伪造的 Service Token Header；浏览器使用短期 session 或独立 Browser API Key，不读取 Provider Key/Service Token。`chat`、流式路由、兼容 Provider 路由、`tool-result`、stdio MCP 和 LangSmith batch 接受有效 `X-ActionDesign-Api-Key`，内部调用也可使用 `X-ActionDesign-Service-Token`；`health` 保持公开，`models` 要求有效 Client API Key 或管理员 Bearer。启用 Feature Flag 后，`mcp-browser/*` 按明确的公开配置边界工作。短期 session 只应放内存或 sessionStorage，不应放 localStorage。
 
 ### MiMo
 
@@ -324,19 +407,41 @@ LANGSMITH_WORKSPACE_ID=...
 ACTIONDESIGN_LANGSMITH_TIMEOUT_SECONDS=15
 ```
 
-### 通用 MCP proxy
+### MCP 单一配置源与 stdio proxy
 
 ```text
 ACTIONDESIGN_MCP_PROXY_ENABLED=true
+ACTIONDESIGN_PUBLIC_BROWSER_MCP_CONFIG=true
 ACTIONDESIGN_MCP_TIMEOUT_SECONDS=30
-ACTIONDESIGN_MCP_ALLOWED_HOSTS=mcp.example.com
-ACTIONDESIGN_MCP_ALLOWED_HTTP_PATHS=/mcp
 ACTIONDESIGN_MCP_ALLOWED_EXECUTABLE_PATHS=C:\absolute\path\to\mcp-server.exe
 ACTIONDESIGN_MCP_SERVER_STORE_PATH=config/actiondesign-managed-mcp-servers.json
 ACTIONDESIGN_MCP_SERVERS_JSON=[{"id":"shared","transport":"streamable_http","url":"https://mcp.example.com/mcp","secretId":"mcp-main","secretBinding":{"target":"header","name":"Authorization","prefix":"Bearer "}}]
 ```
 
-`ACTIONDESIGN_MCP_SERVERS_JSON` 只提供只读环境来源；管理页面新增的 Server 写入 `ACTIONDESIGN_MCP_SERVER_STORE_PATH`，保存、启停或删除后立即热加载到当前 proxy。启用 MCP proxy 时允许初始零 Server，但 `ACTIONDESIGN_SERVICE_AUTH_MODE` 必须为 `required`，且 Origin 必须显式配置，禁止 `*`。普通调用方不能覆盖 transport、URL、command、Header、环境变量或 Secret；Secret 明文只通过管理员 Secret API 写入安全后端，Server 响应只返回 masked/configured binding 状态。
+`ACTIONDESIGN_MCP_SERVERS_JSON` 只提供只读环境来源；管理页面与 `/mcp-browser/*` 写入同一个 `ACTIONDESIGN_MCP_SERVER_STORE_PATH`。HTTP 保存、启停和 Secret 轮换只更新配置及有效版本，不构建或热替换后端 proxy；新的浏览器会话在下一次配置读取后使用新版本。stdio 修改才重建受认证 proxy。启用公开浏览器配置时 Origin 必须显式配置且禁止 `*`。前端最终 `headers` 写入时，敏感 Header 自动进入统一 Secret Store；公开投影只返回合并后的最终 Header，不暴露内部 binding 结构。Provider/Admin/Service Secret 与 stdio command、env、Secret 仍只返回 masked/configured 状态。
+
+一键部署在 Gateway 与 Deployer 共用的 `.env` 中至少配置：
+
+```dotenv
+ACTIONDESIGN_MCP_DEPLOYMENTS_ENABLED=false
+ACTIONDESIGN_MCP_DEPLOYER_SOCKET=/run/actiondesign-mcp-deployer/api.sock
+ACTIONDESIGN_MCP_DEPLOYER_TOKEN=<至少32字符的随机值>
+ACTIONDESIGN_MCP_STDIO_BRIDGE_PATH=/usr/local/libexec/actiondesign-mcp-stdio-bridge
+ACTIONDESIGN_MCP_STDIO_BROKER_SOCKET=/run/actiondesign-mcp-deployer/stdio.sock
+ACTIONDESIGN_MCP_PUBLIC_BASE_URL=https://43-135-137-212.sslip.io
+ACTIONDESIGN_MCP_DEPLOYMENT_STORE_PATH=/var/lib/actiondesign-mcp/deployments.json
+ACTIONDESIGN_MCP_DEPLOY_WORK_ROOT=/var/lib/actiondesign-mcp/work
+ACTIONDESIGN_MCP_DEPLOY_LOG_ROOT=/var/log/actiondesign-mcp
+ACTIONDESIGN_MCP_NGINX_SNIPPET_ROOT=/etc/nginx/actiondesign-mcp-runtime
+ACTIONDESIGN_MCP_DEPLOY_ALLOWED_GIT_HOSTS=github.com,gitlab.com
+ACTIONDESIGN_MCP_DEPLOY_ALLOWED_REGISTRIES=docker.io,ghcr.io
+ACTIONDESIGN_MCP_DEPLOY_MAX_HTTP_RUNTIMES=2
+ACTIONDESIGN_MCP_DEPLOY_BUILD_TIMEOUT_SECONDS=900
+ACTIONDESIGN_MCP_BROWSER_VALIDATION_TIMEOUT_SECONDS=300
+ACTIONDESIGN_MCP_STDIO_MAX_SESSION_SECONDS=600
+```
+
+`ACTIONDESIGN_MCP_ALLOWED_EXECUTABLE_PATHS` 还必须精确包含固定 Bridge 路径。先以 `ACTIONDESIGN_MCP_DEPLOYMENTS_ENABLED=false` 安装服务、Socket、Bridge 和 Nginx include，完成 Deployer health、HTTP/stdio canary 后再改为 `true` 并重启 8888 Gateway。
 
 ## 日志与脱敏
 

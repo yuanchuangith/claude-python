@@ -1,0 +1,46 @@
+[Unit]
+Description=ActionDesign MCP Container Deployer
+After=docker.service nginx.service network-online.target
+Requires=docker.service nginx.service
+
+[Service]
+Type=simple
+User=root
+Group=actiondesign-gateway
+WorkingDirectory=/home/ubuntu/claude-agent-sdk
+EnvironmentFile=/home/ubuntu/actiondesign-agent-gateway/.env
+Environment=HOME=/var/lib/actiondesign-mcp
+RuntimeDirectory=actiondesign-mcp-deployer
+RuntimeDirectoryMode=0750
+StateDirectory=actiondesign-mcp
+StateDirectoryMode=0700
+LogsDirectory=actiondesign-mcp
+LogsDirectoryMode=0700
+UMask=0077
+ExecStart=/home/ubuntu/claude-agent-sdk/venv/bin/uvicorn --factory claude_agent_sdk.actiondesign_gateway.mcp_deployer:create_deployer_app --uds /run/actiondesign-mcp-deployer/api.sock --workers 1 --no-access-log
+ExecStartPost=/bin/sh -c 'count=0; while [ ! -S /run/actiondesign-mcp-deployer/api.sock ] || [ ! -S /run/actiondesign-mcp-deployer/stdio.sock ]; do count=$$((count + 1)); [ "$$count" -lt 100 ] || exit 1; sleep 0.1; done'
+ExecStartPost=/bin/chown root:actiondesign-gateway /run/actiondesign-mcp-deployer/api.sock
+ExecStartPost=/bin/chmod 0660 /run/actiondesign-mcp-deployer/api.sock
+ExecStartPost=/bin/chown root:actiondesign-gateway /run/actiondesign-mcp-deployer/stdio.sock
+ExecStartPost=/bin/chmod 0660 /run/actiondesign-mcp-deployer/stdio.sock
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=60
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/var/lib/actiondesign-mcp /var/log/actiondesign-mcp /run/actiondesign-mcp-deployer /etc/nginx/actiondesign-mcp-runtime /run/nginx.pid /var/log/nginx/error.log /var/log/nginx/access.log
+
+[Install]
+WantedBy=multi-user.target

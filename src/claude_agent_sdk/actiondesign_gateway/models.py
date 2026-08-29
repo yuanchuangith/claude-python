@@ -570,11 +570,25 @@ class ToolResultRequest(RequestCorrelationIdentity):
     duration_ms: int = Field(default=0, alias="durationMs", ge=0, le=86_400_000)
     protocol_version: str = Field(default="1.0", alias="protocolVersion")
     graph_version: str = Field(default="", alias="graphVersion")
+    prompt_manifest_version: str = Field(
+        default="", alias="promptManifestVersion", max_length=32
+    )
+    prompt_manifest_hash: str = Field(
+        default="", alias="promptManifestHash", max_length=71
+    )
+    tool_catalog_version: str = Field(
+        default="", alias="toolCatalogVersion", max_length=32
+    )
+    tool_catalog_hash: str = Field(
+        default="", alias="toolCatalogHash", max_length=71
+    )
     skill_catalog_version: str = Field(default="", alias="skillCatalogVersion")
     skill_catalog_hash: str = Field(default="", alias="skillCatalogHash")
     loaded_skill_versions: dict[str, str] = Field(default_factory=dict, alias="loadedSkillVersions")
     mcp_server_ids: list[str] = Field(default_factory=list, alias="mcpServerIds")
     trace_id: str = Field(default="", alias="traceId")
+    parent_trace_run_id: str = Field(default="", alias="parentTraceRunId")
+    trace_sampled: bool = Field(default=False, alias="traceSampled")
     artifact_ref: str = Field(default="", alias="artifactRef", max_length=2048)
 
     @field_validator("run_id")
@@ -591,7 +605,7 @@ class ToolResultRequest(RequestCorrelationIdentity):
     def _validate_conversation_id(cls, value: str) -> str:
         return validate_conversation_uuid4(value)
 
-    @field_validator("topic_id", "checkpoint_id", "trace_id")
+    @field_validator("topic_id", "checkpoint_id", "trace_id", "parent_trace_run_id")
     def _validate_optional_identifier(cls, value: str) -> str:
         if value and not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("identifier is invalid")
@@ -627,10 +641,10 @@ class ToolResultRequest(RequestCorrelationIdentity):
             raise ValueError("skillCatalogVersion is too long")
         return value
 
-    @field_validator("skill_catalog_hash")
-    def _validate_skill_catalog_hash(cls, value: str) -> str:
+    @field_validator("prompt_manifest_hash", "tool_catalog_hash", "skill_catalog_hash")
+    def _validate_catalog_hash(cls, value: str) -> str:
         if value and not SHA256_RE.fullmatch(value):
-            raise ValueError("skillCatalogHash must be a sha256 hash")
+            raise ValueError("manifest/catalog hash must be a sha256 hash")
         return value
 
     @field_validator("loaded_skill_versions")
@@ -1279,6 +1293,10 @@ class HealthResponse(_GatewayBaseModel):
     protocol_version: Literal["1.0"] = Field(alias="protocolVersion")
     langsmith_enabled: bool = Field(alias="langsmithEnabled")
     mcp_proxy_enabled: bool = Field(alias="mcpProxyEnabled")
+    public_browser_mcp_config_enabled: bool = Field(
+        alias="publicBrowserMcpConfigEnabled"
+    )
+    mcp_deployments_enabled: bool = Field(alias="mcpDeploymentsEnabled")
     full_conversation_log_enabled: bool = Field(alias="fullConversationLogEnabled")
 
 
@@ -1565,6 +1583,18 @@ class ToolResultLogRecord(_GatewayBaseModel):
     checkpoint_id: str = Field(default="", alias="checkpointId", max_length=256)
     protocol_version: str = Field(default="1.0", alias="protocolVersion", max_length=32)
     graph_version: str = Field(default="", alias="graphVersion", max_length=32)
+    prompt_manifest_version: str = Field(
+        default="", alias="promptManifestVersion", max_length=32
+    )
+    prompt_manifest_hash: str = Field(
+        default="", alias="promptManifestHash", max_length=71
+    )
+    tool_catalog_version: str = Field(
+        default="", alias="toolCatalogVersion", max_length=32
+    )
+    tool_catalog_hash: str = Field(
+        default="", alias="toolCatalogHash", max_length=71
+    )
     skill_catalog_version: str = Field(
         default="", alias="skillCatalogVersion", max_length=32
     )
@@ -1585,6 +1615,8 @@ class ToolResultLogRecord(_GatewayBaseModel):
     tool_name: str = Field(alias="toolName")
     status: Literal["success", "failed", "rejected", "cancelled"]
     trace_id: str = Field(default="", alias="traceId")
+    parent_trace_run_id: str = Field(default="", alias="parentTraceRunId")
+    trace_sampled: bool = Field(default=False, alias="traceSampled")
     turn: int = Field(default=0, ge=0)
     duplicate: bool = False
     success: bool
@@ -1612,16 +1644,16 @@ class ToolResultLogRecord(_GatewayBaseModel):
     def _validate_tool_log_request_ids(cls, value: str) -> str:
         return validate_uuid4_id(value) if value else value
 
-    @field_validator("topic_id", "checkpoint_id")
+    @field_validator("topic_id", "checkpoint_id", "trace_id", "parent_trace_run_id")
     def _validate_tool_log_optional_ids(cls, value: str) -> str:
         if value and not IDENTIFIER_RE.fullmatch(value):
             raise ValueError("tool result audit identifier is invalid")
         return value
 
-    @field_validator("skill_catalog_hash")
-    def _validate_tool_log_skill_catalog_hash(cls, value: str) -> str:
+    @field_validator("prompt_manifest_hash", "tool_catalog_hash", "skill_catalog_hash")
+    def _validate_tool_log_catalog_hash(cls, value: str) -> str:
         if value and not SHA256_RE.fullmatch(value):
-            raise ValueError("skillCatalogHash must be a sha256 hash")
+            raise ValueError("manifest/catalog hash must be a sha256 hash")
         return value
 
     @field_validator("loaded_skill_versions")

@@ -929,6 +929,12 @@ def test_tool_result_logging_is_idempotent(tmp_path):
         "correlationId": CORRELATION_ID,
         "toolCallId": "call_1",
         "toolName": "create_node",
+        "promptManifestVersion": "3.11.7",
+        "promptManifestHash": "sha256:" + "a" * 64,
+        "toolCatalogVersion": "2.3.5",
+        "toolCatalogHash": "sha256:" + "b" * 64,
+        "parentTraceRunId": "trace.parent:1",
+        "traceSampled": True,
         "arguments": {
             "elementKey": "ExitAction",
             "apiKey": "tool-argument-secret",
@@ -972,6 +978,12 @@ def test_tool_result_logging_is_idempotent(tmp_path):
     assert all(
         event["inlineResult"]["authorization"] == "[REDACTED]" for event in events
     )
+    assert all(event["promptManifestVersion"] == "3.11.7" for event in events)
+    assert all(event["promptManifestHash"] == "sha256:" + "a" * 64 for event in events)
+    assert all(event["toolCatalogVersion"] == "2.3.5" for event in events)
+    assert all(event["toolCatalogHash"] == "sha256:" + "b" * 64 for event in events)
+    assert all(event["parentTraceRunId"] == "trace.parent:1" for event in events)
+    assert all(event["traceSampled"] is True for event in events)
     persisted = json.dumps(events, ensure_ascii=False)
     assert "tool-argument-secret" not in persisted
     assert "tool-result-secret" not in persisted
@@ -982,6 +994,10 @@ def test_tool_result_logging_is_idempotent(tmp_path):
     )
     assert len(canonical) == 1
     assert canonical[0]["requestId"] == first.headers["x-request-id"]
+    assert canonical[0]["promptManifestVersion"] == "3.11.7"
+    assert canonical[0]["toolCatalogVersion"] == "2.3.5"
+    assert canonical[0]["parentTraceRunId"] == "trace.parent:1"
+    assert canonical[0]["traceSampled"] is True
 
 
 def test_tool_result_idempotency_uses_tool_call_id_and_survives_restart(tmp_path):

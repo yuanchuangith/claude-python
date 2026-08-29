@@ -74,21 +74,30 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
     return Settings(**values)
 
 
-def managed_http_server(server_id: str = "managed.server-1") -> dict:
+def managed_http_server(
+    server_id: str = "managed.server-1",
+    *,
+    secret_value: str = "managed-mcp-secret-1234",
+    expected_version: int = 0,
+) -> dict:
     return {
         "id": server_id,
         "displayName": "Managed MCP Server",
         "transport": "streamable_http",
+        "expectedConfigVersion": expected_version,
         "streamableHttp": {
             "url": "https://mcp.example.test/mcp",
+            "staticHeaders": {"X-Tenant": "quality"},
             "secretBindings": [
                 {
                     "secretId": "mcp.primary",
-                    "target": "header",
                     "name": "Authorization",
                     "valuePrefix": "Bearer ",
+                    "value": secret_value,
                 }
             ],
+
+            "sseReadTimeoutSeconds": 300.0,
         },
         "expectedServerName": "managed-server",
         "timeoutSeconds": 20.0,
@@ -161,7 +170,9 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
         "updatedAt",
         "rotatedAt",
         "revokedAt",
+        "exposure",
     }
+    assert secret.json()["exposure"] == "browser_header"
 
     created = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
@@ -170,35 +181,16 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
     )
     assert created.status_code == 200, created.text
     assert created.json()["source"] == "managed"
-    assert created.json()["proxyEnabled"] is True
-    assert created.json()["browserConfigurable"] is True
-    assert created.json()["secretBindingStatus"] == [
-        {"secretId": "mcp.primary", "configured": True}
-    ]
-    assert set(created.json()) == {
-        "id",
-        "displayName",
-        "transport",
-        "expectedServerName",
-        "timeoutSeconds",
-        "enabled",
-        "source",
-        "proxyEnabled",
-        "browserConfigurable",
-        "executionMode",
-        "authMode",
-        "browserDirectUrl",
-        "configVersion",
-        "activeVersion",
-        "connectionStatus",
-        "secretBindingStatus",
+    assert created.json()["executionMode"] == "browser_direct"
+    assert created.json()["browserSupported"] is True
+    assert created.json()["configVersion"] == 1
+    assert created.json()["streamableHttp"]["headers"] == {
+        "X-Tenant": "quality",
+        "Authorization": f"Bearer {secret_value}",
     }
-    assert all(
-        key not in created.json()
-        for key in ("stdio", "streamableHttp", "url", "headers", "command", "cwd", "args")
-    )
+    assert created.json()["streamableHttp"]["secretBindings"][0]["value"] == secret_value
     active_proxy = client.app.state.mcp_proxy
-    assert active_proxy is not initial_proxy
+    assert active_proxy is initial_proxy
     persisted = settings.mcp_server_store_path.read_text(encoding="utf-8")
     assert "managed.server-1" in persisted
     assert "mcp.primary" in persisted
@@ -213,22 +205,19 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
         "/api/actiondesign-agent/mcp/managed.server-1/tools",
         headers=runtime_headers,
     )
-    assert listed.status_code == 200, listed.text
-    assert listed.json()["tools"][0]["name"] == "echo.value"
+    assert listed.status_code == 409, listed.text
+    assert listed.json()["detail"]["code"] == "MCP_BROWSER_DIRECT_REQUIRED"
 
-    rejected_update = managed_http_server()
-    rejected_update["streamableHttp"]["url"] = "https://unapproved.example.test/mcp"
-    rejected = client.put(
+    update = managed_http_server(expected_version=1)
+    update["streamableHttp"]["url"] = "https://unapproved.example.test/mcp"
+    updated = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
         headers=ADMIN_HEADERS,
-        json=rejected_update,
+        json=update,
     )
-    assert rejected.status_code == 422
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["configVersion"] == 2
     assert client.app.state.mcp_proxy is active_proxy
-    assert client.get(
-        "/api/actiondesign-agent/mcp/managed.server-1/tools",
-        headers=runtime_headers,
-    ).status_code == 200
 
     tested = client.post(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1/connection-test",
@@ -237,13 +226,14 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
     assert tested.status_code == 200, tested.text
     assert tested.json()["status"] == "healthy"
     assert tested.json()["serverName"] == "managed-server"
-    assert tested.json()["toolCount"] == 1
+    assert tested.json()["serverVersion"] == "configuration-only"
+    assert tested.json()["toolCount"] == 0
     assert tested.json()["errorCode"] == ""
 
     disabled = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1/enabled",
         headers=ADMIN_HEADERS,
-        json={"enabled": False},
+        json={"enabled": False, "expectedConfigVersion": 2},
     )
     assert disabled.status_code == 200
     assert disabled.json()["enabled"] is False
@@ -251,17 +241,19 @@ def test_managed_mcp_server_crud_hot_reloads_proxy_and_never_persists_secret(
         "/api/actiondesign-agent/mcp/managed.server-1/tools",
         headers=runtime_headers,
     )
-    assert unavailable.status_code == 503
-    assert unavailable.json()["detail"]["code"] == "MCP_SERVER_DISABLED"
+    assert unavailable.status_code == 409
+    assert unavailable.json()["detail"]["code"] == "MCP_BROWSER_DIRECT_REQUIRED"
 
     assert client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1/enabled",
         headers=ADMIN_HEADERS,
-        json={"enabled": True},
+        json={"enabled": True, "expectedConfigVersion": 3},
     ).status_code == 200
-    deleted = client.delete(
+    deleted = client.request(
+        "DELETE",
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
-        headers=ADMIN_HEADERS,
+        headers={**ADMIN_HEADERS, "Content-Type": "application/json"},
+        json={"expectedConfigVersion": 4},
     )
     assert deleted.status_code == 200
     assert deleted.json() == {"id": "managed.server-1", "deleted": True}
@@ -298,9 +290,9 @@ def test_environment_mcp_servers_are_read_only_and_managed_ids_use_full_contract
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == "environment.server-1"
     assert listed.json()[0]["source"] == "environment"
-    assert listed.json()[0]["browserConfigurable"] is False
-    assert "streamableHttp" not in listed.json()[0]
-    assert "url" not in listed.text
+    assert listed.json()[0]["editable"] is False
+    assert listed.json()[0]["executionMode"] == "browser_direct"
+    assert listed.json()[0]["streamableHttp"]["url"] == "https://mcp.example.test/mcp"
 
     replacement = managed_http_server("environment.server-1")
     for response in (
@@ -312,11 +304,13 @@ def test_environment_mcp_servers_are_read_only_and_managed_ids_use_full_contract
         client.put(
             "/api/actiondesign-agent/admin/mcp-servers/environment.server-1/enabled",
             headers=ADMIN_HEADERS,
-            json={"enabled": False},
+            json={"enabled": False, "expectedConfigVersion": 1},
         ),
-        client.delete(
+        client.request(
+            "DELETE",
             "/api/actiondesign-agent/admin/mcp-servers/environment.server-1",
-            headers=ADMIN_HEADERS,
+            headers={**ADMIN_HEADERS, "Content-Type": "application/json"},
+            json={"expectedConfigVersion": 1},
         ),
     ):
         assert response.status_code == 409
@@ -346,7 +340,7 @@ def test_legacy_host_and_path_allowlists_are_rejected_when_proxy_is_enabled(tmp_
         )
 
 
-def test_managed_mcp_server_rejects_non_allowlisted_transport_without_persisting(
+def test_managed_browser_http_server_does_not_use_backend_url_allowlist(
     tmp_path,
 ):
     settings = make_settings(tmp_path)
@@ -360,9 +354,9 @@ def test_managed_mcp_server_rejects_non_allowlisted_transport_without_persisting
         headers=ADMIN_HEADERS,
         json=payload,
     )
-    assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "MCP_SERVER_CONFIGURATION_INVALID"
-    assert not settings.mcp_server_store_path.exists()
+    assert response.status_code == 200, response.text
+    assert response.json()["streamableHttp"]["url"] == "https://unapproved.example.test/mcp"
+    assert settings.mcp_server_store_path.exists()
 
 
 def test_public_https_mcp_server_does_not_require_static_url_allowlist(
@@ -401,8 +395,8 @@ def test_public_https_mcp_server_does_not_require_static_url_allowlist(
     )
 
     assert created.status_code == 200, created.text
-    assert "streamableHttp" not in created.json()
-    assert "public.example.test" not in created.text
+    assert created.json()["streamableHttp"]["url"] == "https://public.example.test/mcp"
+    assert created.json()["executionMode"] == "browser_direct"
 
 
 def test_mcp_server_admin_requires_bearer_and_strict_128_character_id(tmp_path):
@@ -428,7 +422,7 @@ def test_mcp_server_admin_requires_bearer_and_strict_128_character_id(tmp_path):
         assert path in schema["paths"]
 
 
-def test_missing_bound_secret_can_be_saved_disabled_but_cannot_be_activated(
+def test_browser_http_write_requires_inline_secret_value_and_is_atomic(
     tmp_path,
 ):
     settings = make_settings(tmp_path)
@@ -437,36 +431,28 @@ def test_missing_bound_secret_can_be_saved_disabled_but_cannot_be_activated(
     )
     payload = managed_http_server()
     payload["enabled"] = False
-    created = client.put(
+    del payload["streamableHttp"]["secretBindings"][0]["value"]
+    rejected = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
         headers=ADMIN_HEADERS,
         json=payload,
     )
-    assert created.status_code == 200
-    assert created.json()["secretBindingStatus"] == [
-        {"secretId": "mcp.primary", "configured": False}
-    ]
-    reloaded = TestClient(
-        create_app(settings, profile_secret_store=MemoryProfileSecretStore())
-    )
-    assert reloaded.get(
+    assert rejected.status_code == 422
+    assert client.get(
         "/api/actiondesign-agent/admin/mcp-servers",
         headers=ADMIN_HEADERS,
-    ).json()[0]["id"] == "managed.server-1"
-    active_proxy = client.app.state.mcp_proxy
-    enabled = client.put(
-        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1/enabled",
-        headers=ADMIN_HEADERS,
-        json={"enabled": True},
-    )
-    assert enabled.status_code == 503
-    assert enabled.json()["detail"]["code"] == "MCP_SECRET_UNAVAILABLE"
-    assert "mcp.primary" not in enabled.text
-    assert client.app.state.mcp_proxy is active_proxy
-    assert client.get(
+    ).json() == []
+
+    valid = managed_http_server()
+    valid["enabled"] = False
+    created = client.put(
         "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
         headers=ADMIN_HEADERS,
-    ).json()["enabled"] is False
+        json=valid,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["enabled"] is False
+    assert created.json()["configStatus"] == "ready"
 
 
 @pytest.mark.parametrize("operation", ["upsert", "rotate", "revoke"])
@@ -492,7 +478,7 @@ def test_secret_candidate_publish_failure_restores_old_secret_via_api(
         }, ()
 
     monkeypatch.setattr(McpProxy, "_session", fake_session)
-    original_value = "old-managed-secret"
+    original_value = "managed-mcp-secret-1234"
     created_secret = client.put(
         "/api/actiondesign-agent/admin/secrets/mcp.primary",
         headers=ADMIN_HEADERS,
@@ -517,8 +503,8 @@ def test_secret_candidate_publish_failure_restores_old_secret_via_api(
         raise RuntimeError("simulated candidate publish failure")
 
     monkeypatch.setattr(
-        client.app.state.mcp_server_store,
-        "commit_candidate",
+        client.app.state.browser_mcp_config,
+        "commit_metadata_candidate",
         fail_commit,
     )
     if operation == "rotate":
@@ -556,29 +542,14 @@ def test_secret_candidate_publish_failure_restores_old_secret_via_api(
     assert "new-managed-secret" not in persisted
 
 
-def test_secret_revoke_swaps_to_fail_closed_proxy_and_old_proxy_can_drain(
+def test_http_secret_revoke_increments_version_without_swapping_proxy(
     tmp_path,
-    monkeypatch,
 ):
     settings = make_settings(tmp_path)
     client = TestClient(
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
     )
-    original_session = McpProxy._session
-
-    @asynccontextmanager
-    async def fake_session(_self, server):
-        class FakeSession:
-            async def list_tools(self):
-                return SimpleNamespace(tools=[])
-
-        yield FakeSession(), {
-            "serverName": server.expected_server_name,
-            "serverVersion": "1.0.0",
-        }, ()
-
-    monkeypatch.setattr(McpProxy, "_session", fake_session)
-    old_value = "old-managed-secret"
+    old_value = "managed-mcp-secret-1234"
     assert client.put(
         "/api/actiondesign-agent/admin/secrets/mcp.primary",
         headers=ADMIN_HEADERS,
@@ -595,7 +566,9 @@ def test_secret_revoke_swaps_to_fail_closed_proxy_and_old_proxy_can_drain(
         json=managed_http_server(),
     ).status_code == 200
     old_proxy = client.app.state.mcp_proxy
-    monkeypatch.setattr(McpProxy, "_session", original_session)
+    old_version = client.app.state.mcp_server_store.effective_version(
+        "managed.server-1"
+    )
 
     revoked = client.delete(
         "/api/actiondesign-agent/admin/secrets/mcp.primary",
@@ -604,10 +577,17 @@ def test_secret_revoke_swaps_to_fail_closed_proxy_and_old_proxy_can_drain(
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["configured"] is False
     new_proxy = client.app.state.mcp_proxy
-    assert new_proxy is not old_proxy
-    assert old_proxy._secret_store.resolve_value("mcp.primary") == old_value
-    with pytest.raises(KeyError):
-        new_proxy._secret_store.resolve_value("mcp.primary")
+    assert new_proxy is old_proxy
+    assert client.app.state.mcp_server_store.effective_version(
+        "managed.server-1"
+    ) == old_version + 1
+    projected = client.get(
+        "/api/actiondesign-agent/admin/mcp-servers/managed.server-1",
+        headers=ADMIN_HEADERS,
+    ).json()
+    assert projected["configStatus"] == "invalid"
+    assert projected["errorCode"] == "MCP_SECRET_UNAVAILABLE"
+    assert projected["streamableHttp"] is None
 
     runtime = client.get(
         "/api/actiondesign-agent/mcp/managed.server-1/tools",
@@ -617,8 +597,8 @@ def test_secret_revoke_swaps_to_fail_closed_proxy_and_old_proxy_can_drain(
             "X-Correlation-Id": CORRELATION_ID,
         },
     )
-    assert runtime.status_code == 503
-    assert runtime.json()["detail"]["code"] == "MCP_SECRET_UNAVAILABLE"
+    assert runtime.status_code == 409
+    assert runtime.json()["detail"]["code"] == "MCP_BROWSER_DIRECT_REQUIRED"
 
 
 def test_corrupt_managed_mcp_server_store_fails_closed(tmp_path):
@@ -646,7 +626,7 @@ def test_corrupt_managed_mcp_server_store_fails_closed(tmp_path):
         create_app(settings, profile_secret_store=MemoryProfileSecretStore())
 
 
-def test_environment_http_allowlist_uses_exact_authority_and_path(tmp_path):
+def test_environment_browser_http_does_not_require_backend_proxy_allowlist(tmp_path):
     server = {
         "id": "environment.server-port",
         "transport": "streamable_http",
@@ -669,18 +649,22 @@ def test_environment_http_allowlist_uses_exact_authority_and_path(tmp_path):
         **server,
         "url": "https://mcp.example.test:8443/other",
     }
-    with pytest.raises(ValueError, match="non-global"):
+    crossed_client = TestClient(
         create_app(
             make_settings(
                 tmp_path,
                 mcp_servers=[crossed],
-                mcp_allowed_http_urls=[
-                    "https://mcp.example.test:8443/mcp",
-                    "https://other.example.test:8443/other",
-                ],
+                mcp_allowed_http_urls=["https://mcp.example.test:8443/mcp"],
             ),
             profile_secret_store=MemoryProfileSecretStore(),
         )
+    )
+    projected = crossed_client.get(
+        "/api/actiondesign-agent/admin/mcp-servers/environment.server-port",
+        headers=ADMIN_HEADERS,
+    )
+    assert projected.status_code == 200
+    assert projected.json()["streamableHttp"]["url"] == crossed["url"]
 
 
 def test_store_serializes_persistence_and_runtime_publish_in_commit_order(tmp_path):
@@ -707,9 +691,16 @@ def test_store_serializes_persistence_and_runtime_publish_in_commit_order(tmp_pa
         try:
             store.upsert(
                 {
-                    **managed_http_server(server_id),
+                    "id": server_id,
+                    "displayName": "Managed MCP Server",
+                    "transport": "streamable_http",
+                    "executionMode": "browser_direct",
+                    "expectedServerName": "",
+                    "timeoutSeconds": 20.0,
+                    "enabled": True,
                     "streamableHttp": {
                         "url": "https://mcp.example.test/mcp",
+                        "headers": {},
                         "secretBindings": [],
                     },
                 },

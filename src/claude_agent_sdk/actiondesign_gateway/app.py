@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -42,13 +43,31 @@ from .identifiers import (
     validate_safe_request_id,
 )
 from .langsmith_forwarder import forward_trace_batch
+from .mcp_browser_config import (
+    AdminMcpStdioServerWriteRequest,
+    BrowserMcpConfigurationService,
+    BrowserMcpDeleteRequest,
+    BrowserMcpEnabledRequest,
+    BrowserMcpServerWriteRequest,
+)
+from .mcp_deployment import (
+    McpDeployerClient,
+    McpDeployerUnavailableError,
+    McpDeploymentBusyError,
+    McpDeploymentError,
+    McpDeploymentJob,
+    McpDeploymentManifest,
+    McpDeploymentRecord,
+    McpDeploymentUpsertRequest,
+    McpDeploymentVersionConflictError,
+)
 from .mcp_proxy import McpProxy, McpProxyError, McpSecretResolver, McpServerConfig
 from .mcp_server_store import (
     McpRuntimeConfigResponse,
     McpServerCandidateStaleError,
+    McpServerConfigVersionConflictError,
     McpServerConnectionTestResponse,
     McpServerDeleteResponse,
-    McpServerEnabledRequest,
     McpServerResponse,
     McpServerStore,
     McpServerStoreError,
@@ -127,6 +146,7 @@ from .request_log import RequestLogStore
 from .secret_store import (
     ManagedSecretStore,
     ManagedSecretStoreError,
+    SecretExposure,
     SecretResponse,
     SecretRotateRequest,
     SecretUpsertRequest,
@@ -204,14 +224,11 @@ def create_app(
     settings: Settings | None = None,
     *,
     profile_secret_store: ProfileSecretStore | None = None,
+    mcp_deployer_client: McpDeployerClient | None = None,
 ) -> FastAPI:
     gateway_settings = settings or Settings()
     profile_store = ApiProfileStore(gateway_settings, profile_secret_store)
     tool_results = ToolResultStore()
-    managed_secrets = ManagedSecretStore(
-        gateway_settings.managed_secret_store_path,
-        profile_store.secret_backend,
-    )
     mcp_server_store = McpServerStore(
         gateway_settings.mcp_server_store_path,
         [
@@ -219,8 +236,53 @@ def create_app(
             for server in gateway_settings.mcp_servers
         ],
     )
+    legacy_exposures: dict[str, SecretExposure] = {}
+    for server in mcp_server_store.list_configs():
+        bindings = (
+            server.streamable_http.secret_bindings
+            if server.transport == "streamable_http" and server.streamable_http
+            else server.stdio.secret_bindings
+            if server.stdio
+            else ()
+        )
+        exposure: SecretExposure = (
+            "browser_header"
+            if server.transport == "streamable_http"
+            else "stdio_env"
+        )
+        for binding in bindings:
+            previous_exposure = legacy_exposures.get(binding.secret_id)
+            if previous_exposure is not None and previous_exposure != exposure:
+                raise ManagedSecretStoreError(
+                    "one legacy Secret cannot be shared by HTTP and stdio MCP bindings"
+                )
+            legacy_exposures[binding.secret_id] = exposure
+    managed_secrets = ManagedSecretStore(
+        gateway_settings.managed_secret_store_path,
+        profile_store.secret_backend,
+        legacy_exposures=legacy_exposures,
+    )
+    browser_mcp_config = BrowserMcpConfigurationService(
+        mcp_server_store,
+        managed_secrets,
+    )
+    mcp_deployer = (
+        mcp_deployer_client
+        or McpDeployerClient(
+            gateway_settings.mcp_deployer_socket_path,
+            gateway_settings.mcp_deployer_token,
+        )
+        if gateway_settings.mcp_deployments_enabled
+        else None
+    )
     initial_mcp_configs = (
-        mcp_server_store.list_configs() if gateway_settings.mcp_proxy_enabled else []
+        [
+            server
+            for server in mcp_server_store.list_configs()
+            if server.transport == "stdio"
+        ]
+        if gateway_settings.mcp_proxy_enabled
+        else []
     )
     mcp_proxy = _build_mcp_proxy(
         initial_mcp_configs,
@@ -244,28 +306,33 @@ def create_app(
         gateway_settings.log_root or gateway_settings.profile_store_path.parent
     )
     audit_logs = AuditLogStore(audit_root / "system" / "admin-audit.jsonl")
+    mcp_mutation_lock = asyncio.Lock()
     app = FastAPI(title="ActionDesign Thin Gateway", version="3.1.0")
     app.state.settings = gateway_settings
     app.state.profile_store = profile_store
     app.state.tool_results = tool_results
     app.state.managed_secrets = managed_secrets
     app.state.mcp_server_store = mcp_server_store
+    app.state.browser_mcp_config = browser_mcp_config
+    app.state.mcp_deployer = mcp_deployer
     app.state.mcp_proxy = mcp_proxy
     app.state.request_logs = request_logs
     app.state.admin_sessions = admin_sessions
     app.state.browser_api_keys = browser_api_keys
     app.state.client_api_keys = client_api_keys
     app.state.audit_logs = audit_logs
+    app.state.mcp_mutation_lock = mcp_mutation_lock
 
     def _managed_mcp_runtime(
         configs: list[McpServerConfig],
         secret_overrides: dict[str, str] | None = None,
     ) -> McpProxy:
+        stdio_configs = [server for server in configs if server.transport == "stdio"]
         return _build_mcp_proxy(
-            configs,
+            stdio_configs,
             _snapshot_mcp_secrets(
                 managed_secrets,
-                configs,
+                stdio_configs,
                 overrides=secret_overrides,
             ),
             gateway_settings,
@@ -287,7 +354,7 @@ def create_app(
         )
         for server_id in candidate.server_ids:
             server = candidate.config(server_id)
-            if server is None or not server.enabled:
+            if server is None or not server.enabled or server.transport != "stdio":
                 continue
             await runtime.list_tools(server_id)
         return runtime
@@ -304,12 +371,25 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'none'; script-src 'self'; style-src 'self'; "
-                "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+                "connect-src 'self' https:; img-src 'self' data:; font-src 'self'; "
                 "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
             )
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith(
+            (
+                f"{API_PREFIX}/mcp-browser/",
+                f"{API_PREFIX}/admin/mcp-servers",
+                f"{API_PREFIX}/mcp-config/servers",
+                f"{API_PREFIX}/admin/mcp-deployment",
+                f"{API_PREFIX}/admin/mcp-deployments",
+            )
+        ):
+            # Apply this after routing so validation and exception responses are
+            # non-cacheable too; route-local Response headers only cover success.
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
         return response
 
     @app.exception_handler(HTTPException)
@@ -403,6 +483,8 @@ def create_app(
                 and gateway_settings.langsmith_api_key
             ),
             "mcpProxyEnabled": gateway_settings.mcp_proxy_enabled,
+            "publicBrowserMcpConfigEnabled": gateway_settings.public_browser_mcp_config,
+            "mcpDeploymentsEnabled": gateway_settings.mcp_deployments_enabled,
             "fullConversationLogEnabled": gateway_settings.full_conversation_log_enabled,
         }
 
@@ -717,6 +799,7 @@ def create_app(
         identity = resolve_correlation_identity(request, header_only=True)
         _apply_correlation_headers(response, identity)
         _require_mcp_origin(request, gateway_settings)
+        _require_stdio_mcp_server(mcp_server_store, server_id)
         _require_mcp_enabled(gateway_settings)
         proxy: McpProxy = request.app.state.mcp_proxy
         try:
@@ -783,6 +866,7 @@ def create_app(
         identity = resolve_correlation_identity(request, req)
         _apply_correlation_headers(response, identity)
         _require_mcp_origin(request, gateway_settings)
+        _require_stdio_mcp_server(mcp_server_store, server_id)
         _require_mcp_enabled(gateway_settings)
         proxy: McpProxy = request.app.state.mcp_proxy
         try:
@@ -1585,6 +1669,832 @@ def create_app(
         _require_profile_admin(request, gateway_settings)
         return profile_store.list_health()
 
+    def _require_mcp_deployer() -> McpDeployerClient:
+        if not gateway_settings.mcp_deployments_enabled or mcp_deployer is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "MCP_DEPLOYMENTS_DISABLED"},
+            )
+        return mcp_deployer
+
+    def _deployer_http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, McpDeploymentVersionConflictError):
+            return HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MCP_DEPLOYMENT_VERSION_CONFLICT",
+                    "id": exc.deployment_id,
+                    "expected": exc.expected,
+                    "current": exc.current,
+                },
+            )
+        if isinstance(exc, McpDeploymentBusyError):
+            return HTTPException(status_code=409, detail={"code": "MCP_DEPLOYMENT_BUSY"})
+        if isinstance(exc, KeyError):
+            return HTTPException(status_code=404, detail={"code": "MCP_DEPLOYMENT_NOT_FOUND"})
+        if isinstance(exc, McpDeployerUnavailableError):
+            return HTTPException(status_code=503, detail={"code": "MCP_DEPLOYER_UNAVAILABLE"})
+        return HTTPException(status_code=400, detail={"code": "MCP_DEPLOYMENT_INVALID"})
+
+    async def _deployment_records() -> dict[str, dict[str, Any]]:
+        if not gateway_settings.mcp_deployments_enabled or mcp_deployer is None:
+            return {}
+        try:
+            payload = await mcp_deployer.request("GET", "/v1/deployments")
+        except McpDeploymentError:
+            return {}
+        assert isinstance(payload, list)
+        return {
+            str(item.get("id")): item
+            for item in payload
+            if isinstance(item, dict) and item.get("id")
+        }
+
+    async def _enrich_deployment_projection(
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        records = await _deployment_records()
+        for item in items:
+            ref = item.get("deploymentRef")
+            if not isinstance(ref, dict):
+                continue
+            record = records.get(str(ref.get("deploymentId") or item.get("id")))
+            item["deploymentVersion"] = int(record.get("deploymentVersion", 0)) if record else 0
+            item["deploymentStatus"] = str(record.get("status", "unavailable")) if record else "unavailable"
+        return items
+
+    def _legacy_mcp_config_projection(item: dict[str, Any]) -> dict[str, Any]:
+        """Return the exact plaintext DTO consumed by the browser Agent."""
+
+        fields = (
+            "id",
+            "displayName",
+            "source",
+            "editable",
+            "transport",
+            "executionMode",
+            "browserSupported",
+            "expectedServerName",
+            "timeoutSeconds",
+            "enabled",
+            "configVersion",
+            "configStatus",
+            "errorCode",
+            "streamableHttp",
+            "managedBy",
+            "deploymentRef",
+        )
+        result = {name: item[name] for name in fields}
+        for name in ("deploymentVersion", "deploymentStatus"):
+            if name in item:
+                result[name] = item[name]
+        transport = result.get("streamableHttp")
+        if isinstance(transport, dict):
+            result["streamableHttp"] = {
+                name: transport[name]
+                for name in (
+                    "url",
+                    "headers",
+                    "staticHeaders",
+                    "secretBindings",
+                    "protocolVersion",
+                    "sseReadTimeoutSeconds",
+                )
+            }
+        return result
+
+    def _browser_contract_projection(item: dict[str, Any]) -> dict[str, Any]:
+        fields = (
+            "id",
+            "displayName",
+            "source",
+            "editable",
+            "transport",
+            "executionMode",
+            "browserSupported",
+            "expectedServerName",
+            "timeoutSeconds",
+            "enabled",
+            "configVersion",
+            "configStatus",
+            "errorCode",
+            "streamableHttp",
+        )
+        result = {name: item[name] for name in fields}
+        transport = result.get("streamableHttp")
+        if isinstance(transport, dict):
+            result["streamableHttp"] = {
+                name: transport[name]
+                for name in (
+                    "url",
+                    "headers",
+                    "protocolVersion",
+                    "sseReadTimeoutSeconds",
+                )
+            }
+        return result
+
+    def _deployment_server_config(job: McpDeploymentJob) -> McpServerConfig:
+        if job.manifest is None or not job.revision:
+            raise ValueError("deployment job has no prepared runtime")
+        registration = job.request.registration
+        common: dict[str, Any] = {
+            "id": job.deployment_id,
+            "displayName": registration.display_name,
+            "transport": job.manifest.transport,
+            "expectedServerName": registration.expected_server_name,
+            "timeoutSeconds": registration.timeout_seconds,
+            "enabled": registration.enabled,
+            "deploymentRef": {
+                "deploymentId": job.deployment_id,
+                "revision": job.revision,
+            },
+        }
+        if job.manifest.transport == "streamable_http":
+            common.update(
+                {
+                    "executionMode": "browser_direct",
+                    "authMode": "backend_secret" if registration.secret_bindings else "none",
+                    "streamableHttp": {
+                        "url": (
+                            gateway_settings.mcp_deployment_public_base_url.rstrip("/")
+                            + f"/mcp-runtime/{job.deployment_id}/mcp"
+                        ),
+                        "headers": registration.static_headers,
+                        "secretBindings": [
+                            {
+                                "secretId": binding.secret_id,
+                                "target": "header",
+                                "name": binding.name,
+                                "valuePrefix": binding.value_prefix,
+                            }
+                            for binding in registration.secret_bindings
+                        ],
+                        "sseReadTimeoutSeconds": 300.0,
+                    },
+                }
+            )
+        else:
+            common.update(
+                {
+                    "executionMode": "gateway_proxy",
+                    "authMode": "none",
+                    "stdio": {
+                        "command": str(gateway_settings.mcp_stdio_bridge_path),
+                        "args": [
+                            "--deployment-id",
+                            job.deployment_id,
+                            "--revision",
+                            job.revision,
+                            "--job-id",
+                            job.id,
+                        ],
+                        "cwd": str(gateway_settings.mcp_stdio_bridge_path.parent),
+                        "secretBindings": [],
+                    },
+                }
+            )
+        return McpServerConfig.model_validate(common)
+
+    def _deployment_record_server(record: McpDeploymentRecord) -> McpServerConfig:
+        registration = record.registration
+        common: dict[str, Any] = {
+            "id": record.id,
+            "displayName": registration.display_name,
+            "transport": record.manifest.transport,
+            "expectedServerName": registration.expected_server_name,
+            "timeoutSeconds": registration.timeout_seconds,
+            "enabled": registration.enabled,
+            "deploymentRef": {
+                "deploymentId": record.id,
+                "revision": record.active_revision,
+            },
+        }
+        if record.manifest.transport == "streamable_http":
+            common.update(
+                {
+                    "executionMode": "browser_direct",
+                    "authMode": "backend_secret" if registration.secret_bindings else "none",
+                    "streamableHttp": {
+                        "url": gateway_settings.mcp_deployment_public_base_url.rstrip("/")
+                        + f"/mcp-runtime/{record.id}/mcp",
+                        "headers": registration.static_headers,
+                        "secretBindings": [
+                            {
+                                "secretId": binding.secret_id,
+                                "target": "header",
+                                "name": binding.name,
+                                "valuePrefix": binding.value_prefix,
+                            }
+                            for binding in registration.secret_bindings
+                        ],
+                        "sseReadTimeoutSeconds": 300.0,
+                    },
+                }
+            )
+        else:
+            common.update(
+                {
+                    "executionMode": "gateway_proxy",
+                    "authMode": "none",
+                    "stdio": {
+                        "command": str(gateway_settings.mcp_stdio_bridge_path),
+                        "args": [
+                            "--deployment-id",
+                            record.id,
+                            "--revision",
+                            record.active_revision,
+                        ],
+                        "cwd": str(gateway_settings.mcp_stdio_bridge_path.parent),
+                        "secretBindings": [],
+                    },
+                }
+            )
+        return McpServerConfig.model_validate(common)
+
+    def _preserve_deployment_managed_metadata(
+        runtime_server: McpServerConfig,
+        current_server: McpServerConfig,
+    ) -> McpServerConfig:
+        if runtime_server.transport != current_server.transport:
+            return runtime_server
+        updates: dict[str, Any] = {
+            "display_name": current_server.display_name,
+            "expected_server_name": current_server.expected_server_name,
+            "timeout_seconds": current_server.timeout_seconds,
+            "enabled": current_server.enabled,
+        }
+        if runtime_server.transport == "streamable_http":
+            updates["streamable_http"] = current_server.streamable_http
+            updates["auth_mode"] = current_server.auth_mode
+        return runtime_server.model_copy(update=updates)
+
+    @app.get(
+        f"{API_PREFIX}/admin/mcp-deployments",
+        response_model=list[dict[str, Any]],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def list_mcp_deployments() -> list[dict[str, Any]]:
+        client = _require_mcp_deployer()
+        try:
+            payload = await client.request("GET", "/v1/deployments")
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+        assert isinstance(payload, list)
+        return payload
+
+    @app.get(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def get_mcp_deployment(deployment_id: McpServerIdPath) -> dict[str, Any]:
+        try:
+            payload = await _require_mcp_deployer().request(
+                "GET", f"/v1/deployments/{deployment_id}"
+            )
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+        assert isinstance(payload, dict)
+        return payload
+
+    @app.put(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}",
+        status_code=202,
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def put_mcp_deployment(
+        deployment_id: McpServerIdPath,
+        req: McpDeploymentUpsertRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        if deployment_id != req.id:
+            raise HTTPException(status_code=400, detail={"code": "MCP_DEPLOYMENT_ID_MISMATCH"})
+        if mcp_server_store.source_for(deployment_id) == "environment":
+            raise HTTPException(status_code=409, detail={"code": "MCP_ENVIRONMENT_SERVER_CONFLICT"})
+        current = mcp_server_store.get_config(deployment_id)
+        current_version = mcp_server_store.effective_version(deployment_id) if current else 0
+        if req.expected_config_version != current_version:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "MCP_CONFIG_VERSION_CONFLICT",
+                    "expected": req.expected_config_version,
+                    "current": current_version,
+                },
+            )
+        try:
+            if req.source.credential_secret_id:
+                managed_secrets.require_exposure(
+                    req.source.credential_secret_id,
+                    {"deployment_only"},
+                )
+            for binding in req.registration.secret_bindings:
+                managed_secrets.require_exposure(
+                    binding.secret_id,
+                    {"browser_header"},
+                )
+            if req.manifest is not None:
+                required_scope = (
+                    "stdio_env"
+                    if req.manifest.transport == "stdio"
+                    else "deployment_only"
+                )
+                for binding in req.manifest.environment:
+                    managed_secrets.require_exposure(
+                        binding.secret_id,
+                        {required_scope},
+                    )
+        except Exception as exc:
+            raise _managed_secret_http_error(exc) from exc
+        try:
+            payload = await _require_mcp_deployer().request(
+                "PUT",
+                f"/v1/deployments/{deployment_id}",
+                json_body=req.model_dump(mode="json", by_alias=True),
+            )
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+        audit_logs.record(
+            action="mcp_deployment_start",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": deployment_id,
+                "sourceType": req.source.type,
+                "sourceHash": hashlib.sha256(
+                    json.dumps(
+                        req.source.model_dump(mode="json", by_alias=True),
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest(),
+                "expectedDeploymentVersion": req.expected_deployment_version,
+                "expectedConfigVersion": req.expected_config_version,
+            },
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    @app.get(
+        f"{API_PREFIX}/admin/mcp-deployment-jobs/{{job_id}}",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def get_mcp_deployment_job(job_id: str) -> dict[str, Any]:
+        try:
+            payload = await _require_mcp_deployer().request("GET", f"/v1/jobs/{job_id}")
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+        assert isinstance(payload, dict)
+        return payload
+
+    @app.get(
+        f"{API_PREFIX}/admin/mcp-deployment-jobs/{{job_id}}/candidate-config",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def get_mcp_deployment_candidate_config(
+        job_id: str,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            raw = await _require_mcp_deployer().request("GET", f"/v1/jobs/{job_id}")
+            assert isinstance(raw, dict)
+            job = McpDeploymentJob.model_validate(raw)
+            if job.status != "awaiting_browser_validation" or job.manifest is None:
+                raise ValueError("deployment candidate is not ready")
+            if job.manifest.transport == "stdio":
+                return {
+                    "id": job.deployment_id,
+                    "transport": "stdio",
+                    "browserSupported": False,
+                    "executionMode": "gateway_proxy",
+                    "revision": job.revision,
+                }
+            headers = dict(job.request.registration.static_headers)
+            bindings: list[dict[str, str]] = []
+            for binding in job.request.registration.secret_bindings:
+                managed_secrets.require_exposure(binding.secret_id, {"browser_header"})
+                value = managed_secrets.resolve_value(binding.secret_id)
+                headers[binding.name] = f"{binding.value_prefix}{value}"
+                bindings.append(
+                    {
+                        "secretId": binding.secret_id,
+                        "name": binding.name,
+                        "valuePrefix": binding.value_prefix,
+                        "value": value,
+                    }
+                )
+            return {
+                "id": job.deployment_id,
+                "transport": "streamable_http",
+                "browserSupported": True,
+                "executionMode": "browser_direct",
+                "revision": job.revision,
+                "streamableHttp": {
+                    "url": gateway_settings.mcp_deployment_public_base_url.rstrip("/") + job.candidate_path,
+                    "headers": headers,
+                    "staticHeaders": job.request.registration.static_headers,
+                    "secretBindings": bindings,
+                    "protocolVersion": "2025-06-18",
+                    "sseReadTimeoutSeconds": 300.0,
+                },
+            }
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+
+    @app.post(
+        f"{API_PREFIX}/admin/mcp-deployment-jobs/{{job_id}}/browser-validation",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def validate_mcp_deployment_candidate(
+        job_id: str,
+        req: dict[str, Any],
+        request: Request,
+    ) -> dict[str, Any]:
+        client = _require_mcp_deployer()
+        try:
+            raw = await client.request("GET", f"/v1/jobs/{job_id}")
+            assert isinstance(raw, dict)
+            job = McpDeploymentJob.model_validate(raw)
+            success = req.get("success") is True
+            if success and job.manifest and job.manifest.transport == "stdio":
+                candidate_server = _deployment_server_config(job)
+                runtime = _build_mcp_proxy(
+                    [candidate_server],
+                    _snapshot_mcp_secrets(managed_secrets, []),
+                    gateway_settings,
+                )
+                await runtime.list_tools(job.deployment_id)
+            if not success:
+                rejected = await client.request("POST", f"/v1/jobs/{job_id}/reject")
+                assert isinstance(rejected, dict)
+                return rejected
+            await client.request("POST", f"/v1/jobs/{job_id}/promote")
+            server = _deployment_server_config(job)
+            previous = mcp_server_store.get_config(job.deployment_id)
+            candidate = mcp_server_store.create_upsert_candidate(
+                server,
+                expected_config_version=job.request.expected_config_version,
+            )
+            if server.transport == "stdio":
+                runtime = _managed_mcp_runtime(list(candidate.configs))
+                browser_mcp_config.commit_runtime_candidate(
+                    candidate,
+                    runtime,
+                    _publish_managed_mcp_runtime,
+                )
+            else:
+                browser_mcp_config.commit_metadata_candidate(candidate)
+            config_version = mcp_server_store.effective_version(job.deployment_id)
+            try:
+                committed = await client.request(
+                    "POST",
+                    f"/v1/jobs/{job_id}/commit?configVersion={config_version}",
+                )
+            except Exception:
+                restore_candidate = (
+                    mcp_server_store.create_upsert_candidate(
+                        previous,
+                        expected_config_version=config_version,
+                    )
+                    if previous is not None
+                    else mcp_server_store.create_delete_candidate(
+                        job.deployment_id,
+                        expected_config_version=config_version,
+                    )
+                )
+                if any(item.transport == "stdio" for item in restore_candidate.configs):
+                    restore_runtime = _managed_mcp_runtime(list(restore_candidate.configs))
+                    browser_mcp_config.commit_runtime_candidate(
+                        restore_candidate,
+                        restore_runtime,
+                        _publish_managed_mcp_runtime,
+                    )
+                else:
+                    browser_mcp_config.commit_metadata_candidate(restore_candidate)
+                await client.request("POST", f"/v1/jobs/{job_id}/reject")
+                raise
+        except Exception as exc:
+            try:
+                await client.request("POST", f"/v1/jobs/{job_id}/reject")
+            except Exception:
+                pass
+            raise _deployer_http_error(exc) from exc
+        audit_logs.record(
+            action="mcp_deployment_promote",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": job.deployment_id,
+                "jobId": job.id,
+                "revision": job.revision,
+                "configVersion": config_version,
+                "toolListHash": str(req.get("toolListHash") or "")[:128],
+            },
+        )
+        assert isinstance(committed, dict)
+        return committed
+
+    @app.get(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}/logs",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def get_mcp_deployment_logs(
+        deployment_id: McpServerIdPath,
+        response: Response,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            payload = await _require_mcp_deployer().request(
+                "GET", f"/v1/deployments/{deployment_id}/logs"
+            )
+        except Exception as exc:
+            raise _deployer_http_error(exc) from exc
+        assert isinstance(payload, dict)
+        return payload
+
+    @app.put(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}/enabled",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def set_mcp_deployment_enabled(
+        deployment_id: McpServerIdPath,
+        req: BrowserMcpEnabledRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        if req.expected_deployment_version is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "MCP_DEPLOYMENT_VERSION_REQUIRED"},
+            )
+        async with mcp_mutation_lock:
+            current = mcp_server_store.get_config(deployment_id)
+            if current is None or current.deployment_ref is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "MCP_DEPLOYMENT_NOT_FOUND"},
+                )
+            current_config_version = mcp_server_store.effective_version(deployment_id)
+            if req.expected_config_version != current_config_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "MCP_CONFIG_VERSION_CONFLICT",
+                        "expected": req.expected_config_version,
+                        "current": current_config_version,
+                    },
+                )
+            deployer = _require_mcp_deployer()
+            try:
+                deployed = await deployer.request(
+                    "PUT",
+                    f"/v1/deployments/{deployment_id}/enabled",
+                    json_body={
+                        "enabled": req.enabled,
+                        "expectedDeploymentVersion": req.expected_deployment_version,
+                        "nextConfigVersion": req.expected_config_version + 1,
+                    },
+                )
+                assert isinstance(deployed, dict)
+                candidate = browser_mcp_config.create_enabled_candidate(
+                    deployment_id,
+                    req.enabled,
+                    expected_config_version=req.expected_config_version,
+                )
+                try:
+                    if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                        runtime = _managed_mcp_runtime(list(candidate.configs))
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                        )
+                    else:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
+                except Exception:
+                    await deployer.request(
+                        "PUT",
+                        f"/v1/deployments/{deployment_id}/enabled",
+                        json_body={
+                            "enabled": current.enabled,
+                            "expectedDeploymentVersion": int(
+                                deployed["deploymentVersion"]
+                            ),
+                            "nextConfigVersion": req.expected_config_version,
+                        },
+                    )
+                    raise
+            except Exception as exc:
+                if isinstance(exc, McpDeploymentError):
+                    raise _deployer_http_error(exc) from exc
+                raise _mcp_server_http_error(exc) from exc
+            projected = browser_mcp_config.get_server(deployment_id)
+            assert projected is not None
+            result = (await _enrich_deployment_projection([projected]))[0]
+        audit_logs.record(
+            action="mcp_deployment_enabled",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": deployment_id,
+                "enabled": req.enabled,
+                "deploymentVersion": result["deploymentVersion"],
+                "configVersion": result["configVersion"],
+            },
+        )
+        return result
+
+    @app.post(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}/rollback",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def rollback_mcp_deployment(
+        deployment_id: McpServerIdPath,
+        req: dict[str, Any],
+        request: Request,
+    ) -> dict[str, Any]:
+        expected_deployment_version = int(req.get("expectedDeploymentVersion", 0))
+        expected_config_version = int(req.get("expectedConfigVersion", 0))
+        async with mcp_mutation_lock:
+            current = mcp_server_store.get_config(deployment_id)
+            if current is None or current.deployment_ref is None:
+                raise HTTPException(status_code=404, detail={"code": "MCP_DEPLOYMENT_NOT_FOUND"})
+            current_config_version = mcp_server_store.effective_version(deployment_id)
+            if expected_config_version != current_config_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "MCP_CONFIG_VERSION_CONFLICT",
+                        "expected": expected_config_version,
+                        "current": current_config_version,
+                    },
+                )
+            try:
+                raw = await _require_mcp_deployer().request(
+                    "POST",
+                    f"/v1/deployments/{deployment_id}/rollback",
+                    json_body={
+                        "expectedDeploymentVersion": expected_deployment_version,
+                        "nextConfigVersion": expected_config_version + 1,
+                    },
+                )
+                assert isinstance(raw, dict)
+                try:
+                    deployment_record = McpDeploymentRecord.model_validate(raw)
+                    updated = _deployment_record_server(deployment_record)
+                    updated = _preserve_deployment_managed_metadata(updated, current)
+                    candidate = mcp_server_store.create_upsert_candidate(
+                        updated,
+                        expected_config_version=expected_config_version,
+                    )
+                    if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                        runtime = _managed_mcp_runtime(list(candidate.configs))
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                        )
+                    else:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
+                except Exception:
+                    try:
+                        await _require_mcp_deployer().request(
+                            "POST",
+                            f"/v1/deployments/{deployment_id}/rollback",
+                            json_body={
+                                "expectedDeploymentVersion": int(raw["deploymentVersion"]),
+                                "nextConfigVersion": expected_config_version,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    raise
+            except Exception as exc:
+                raise _deployer_http_error(exc) if isinstance(exc, McpDeploymentError) else _mcp_server_http_error(exc)
+        audit_logs.record(
+            action="mcp_deployment_rollback",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": deployment_id,
+                "deploymentVersion": raw["deploymentVersion"],
+                "configVersion": mcp_server_store.effective_version(deployment_id),
+                "revision": raw["activeRevision"],
+            },
+        )
+        return raw
+
+    @app.delete(
+        f"{API_PREFIX}/admin/mcp-deployments/{{deployment_id}}",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_profile_admin_dependency)],
+    )
+    async def delete_mcp_deployment(
+        deployment_id: McpServerIdPath,
+        req: BrowserMcpDeleteRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        if req.expected_deployment_version is None:
+            raise HTTPException(status_code=422, detail={"code": "MCP_DEPLOYMENT_VERSION_REQUIRED"})
+        async with mcp_mutation_lock:
+            configured = mcp_server_store.get_config(deployment_id)
+            if configured is None or configured.deployment_ref is None:
+                raise HTTPException(status_code=404, detail={"code": "MCP_DEPLOYMENT_NOT_FOUND"})
+            current_config_version = mcp_server_store.effective_version(deployment_id)
+            if req.expected_config_version != current_config_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "MCP_CONFIG_VERSION_CONFLICT",
+                        "expected": req.expected_config_version,
+                        "current": current_config_version,
+                    },
+                )
+            client = _require_mcp_deployer()
+            try:
+                prepared = await client.request(
+                    "DELETE",
+                    (
+                        f"/v1/deployments/{deployment_id}"
+                        f"?expectedDeploymentVersion={req.expected_deployment_version}"
+                    ),
+                )
+                assert isinstance(prepared, dict)
+                try:
+                    candidate = mcp_server_store.create_delete_candidate(
+                        deployment_id,
+                        expected_config_version=req.expected_config_version,
+                    )
+                    if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                        runtime = _managed_mcp_runtime(list(candidate.configs))
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                        )
+                    else:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
+                    await client.request(
+                        "DELETE",
+                        (
+                            f"/v1/deployments/{deployment_id}"
+                            f"?expectedDeploymentVersion={prepared['deploymentVersion']}&finalize=true"
+                        ),
+                    )
+                except Exception:
+                    if mcp_server_store.get_config(deployment_id) is None:
+                        restore = mcp_server_store.create_upsert_candidate(
+                            configured,
+                            expected_config_version=0,
+                        )
+                        if browser_mcp_config.candidate_requires_stdio_runtime(restore):
+                            runtime = _managed_mcp_runtime(list(restore.configs))
+                            browser_mcp_config.commit_runtime_candidate(
+                                restore,
+                                runtime,
+                                _publish_managed_mcp_runtime,
+                            )
+                        else:
+                            browser_mcp_config.commit_metadata_candidate(restore)
+                    try:
+                        await client.request(
+                            "PUT",
+                            f"/v1/deployments/{deployment_id}/enabled",
+                            json_body={
+                                "enabled": configured.enabled,
+                                "expectedDeploymentVersion": int(prepared["deploymentVersion"]),
+                                "nextConfigVersion": req.expected_config_version,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    raise
+            except Exception as exc:
+                raise _deployer_http_error(exc) if isinstance(exc, McpDeploymentError) else _mcp_server_http_error(exc)
+        audit_logs.record(
+            action="mcp_deployment_delete",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": deployment_id,
+                "deploymentVersion": req.expected_deployment_version,
+                "configVersion": req.expected_config_version,
+            },
+        )
+        return {"id": deployment_id, "deleted": True}
+
     @app.get(
         f"{API_PREFIX}/admin/runtime-policy",
         response_model=AdminRuntimePolicyResponse,
@@ -1606,75 +2516,356 @@ def create_app(
         }
 
     @app.get(
+        f"{API_PREFIX}/mcp-browser/servers",
+        response_model=list[dict[str, Any]],
+    )
+    async def list_browser_mcp_servers(
+        request: Request,
+        response: Response,
+    ) -> list[dict[str, Any]]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        items = await _enrich_deployment_projection(browser_mcp_config.list_servers())
+        return [_browser_contract_projection(item) for item in items]
+
+    @app.get(
+        f"{API_PREFIX}/mcp-browser/servers/{{server_id}}",
+        response_model=dict[str, Any],
+    )
+    async def get_browser_mcp_server(
+        server_id: McpServerIdPath,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        result = browser_mcp_config.get_server(server_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+        enriched = (await _enrich_deployment_projection([result]))[0]
+        return _browser_contract_projection(enriched)
+
+    @app.put(
+        f"{API_PREFIX}/mcp-browser/servers/{{server_id}}",
+        response_model=dict[str, Any],
+    )
+    async def put_browser_mcp_server(
+        server_id: McpServerIdPath,
+        req: BrowserMcpServerWriteRequest,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        if server_id != req.id:
+            raise HTTPException(status_code=400, detail={"code": "MCP_SERVER_ID_MISMATCH"})
+        async with mcp_mutation_lock:
+            try:
+                result = browser_mcp_config.upsert_server(req)
+            except Exception as exc:
+                raise _browser_mcp_config_http_error(exc) from exc
+        audit_logs.record(
+            action="browser_mcp_server_upsert",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": server_id,
+                "source": "managed",
+                "transport": "streamable_http",
+                "configVersion": result["configVersion"],
+                "entry": "mcp-browser",
+                "configHash": browser_mcp_config.configuration_hash(server_id),
+            },
+        )
+        return _browser_contract_projection(result)
+
+    @app.put(
+        f"{API_PREFIX}/mcp-browser/servers/{{server_id}}/enabled",
+        response_model=dict[str, Any],
+    )
+    async def set_browser_mcp_server_enabled(
+        server_id: McpServerIdPath,
+        req: BrowserMcpEnabledRequest,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        async with mcp_mutation_lock:
+            try:
+                current = mcp_server_store.get_config(server_id)
+                if current is not None and current.deployment_ref is not None:
+                    if req.expected_deployment_version is None:
+                        raise ValueError("expectedDeploymentVersion is required")
+                    current_config_version = mcp_server_store.effective_version(server_id)
+                    if req.expected_config_version != current_config_version:
+                        raise McpServerConfigVersionConflictError(
+                            server_id,
+                            req.expected_config_version,
+                            current_config_version,
+                        )
+                    deployer = _require_mcp_deployer()
+                    deployed = await deployer.request(
+                        "PUT",
+                        f"/v1/deployments/{server_id}/enabled",
+                        json_body={
+                            "enabled": req.enabled,
+                            "expectedDeploymentVersion": req.expected_deployment_version,
+                            "nextConfigVersion": req.expected_config_version + 1,
+                        },
+                    )
+                    assert isinstance(deployed, dict)
+                    candidate = browser_mcp_config.create_enabled_candidate(
+                        server_id,
+                        req.enabled,
+                        expected_config_version=req.expected_config_version,
+                    )
+                    try:
+                        if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                            runtime = _managed_mcp_runtime(list(candidate.configs))
+                            browser_mcp_config.commit_runtime_candidate(
+                                candidate,
+                                runtime,
+                                _publish_managed_mcp_runtime,
+                            )
+                        else:
+                            browser_mcp_config.commit_metadata_candidate(candidate)
+                    except Exception:
+                        await deployer.request(
+                            "PUT",
+                            f"/v1/deployments/{server_id}/enabled",
+                            json_body={
+                                "enabled": current.enabled,
+                                "expectedDeploymentVersion": int(deployed["deploymentVersion"]),
+                                "nextConfigVersion": req.expected_config_version,
+                            },
+                        )
+                        raise
+                    projected = browser_mcp_config.get_server(server_id)
+                    assert projected is not None
+                    result = (await _enrich_deployment_projection([projected]))[0]
+                else:
+                    result = browser_mcp_config.set_enabled(server_id, req)
+            except Exception as exc:
+                if isinstance(exc, McpDeploymentError):
+                    raise _deployer_http_error(exc) from exc
+                raise _browser_mcp_config_http_error(exc) from exc
+        audit_logs.record(
+            action="browser_mcp_server_enabled",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": server_id,
+                "enabled": req.enabled,
+                "configVersion": result["configVersion"],
+                "entry": "mcp-browser",
+                "configHash": browser_mcp_config.configuration_hash(server_id),
+            },
+        )
+        return _browser_contract_projection(result)
+
+    @app.delete(
+        f"{API_PREFIX}/mcp-browser/servers/{{server_id}}",
+        response_model=McpServerDeleteResponse,
+    )
+    async def delete_browser_mcp_server(
+        server_id: McpServerIdPath,
+        req: BrowserMcpDeleteRequest,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        previous_hash = ""
+        async with mcp_mutation_lock:
+            try:
+                previous_hash = browser_mcp_config.configuration_hash(server_id)
+                current = mcp_server_store.get_config(server_id)
+                if current is not None and current.deployment_ref is not None:
+                    if req.expected_deployment_version is None:
+                        raise ValueError("expectedDeploymentVersion is required")
+                    current_config_version = mcp_server_store.effective_version(server_id)
+                    if req.expected_config_version != current_config_version:
+                        raise McpServerConfigVersionConflictError(
+                            server_id,
+                            req.expected_config_version,
+                            current_config_version,
+                        )
+                    deployer = _require_mcp_deployer()
+                    prepared = await deployer.request(
+                        "DELETE",
+                        (
+                            f"/v1/deployments/{server_id}"
+                            f"?expectedDeploymentVersion={req.expected_deployment_version}"
+                        ),
+                    )
+                    assert isinstance(prepared, dict)
+                    candidate = browser_mcp_config.create_delete_candidate(
+                        server_id,
+                        expected_config_version=req.expected_config_version,
+                    )
+                    try:
+                        if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                            runtime = _managed_mcp_runtime(list(candidate.configs))
+                            browser_mcp_config.commit_runtime_candidate(
+                                candidate,
+                                runtime,
+                                _publish_managed_mcp_runtime,
+                            )
+                        else:
+                            browser_mcp_config.commit_metadata_candidate(candidate)
+                        final_version = int(prepared["deploymentVersion"])
+                        await deployer.request(
+                            "DELETE",
+                            (
+                                f"/v1/deployments/{server_id}"
+                                f"?expectedDeploymentVersion={final_version}&finalize=true"
+                            ),
+                        )
+                    except Exception:
+                        if mcp_server_store.get_config(server_id) is None:
+                            restore = mcp_server_store.create_upsert_candidate(
+                                current,
+                                expected_config_version=0,
+                            )
+                            if browser_mcp_config.candidate_requires_stdio_runtime(restore):
+                                runtime = _managed_mcp_runtime(list(restore.configs))
+                                browser_mcp_config.commit_runtime_candidate(
+                                    restore,
+                                    runtime,
+                                    _publish_managed_mcp_runtime,
+                                )
+                            else:
+                                browser_mcp_config.commit_metadata_candidate(restore)
+                        try:
+                            await deployer.request(
+                                "PUT",
+                                f"/v1/deployments/{server_id}/enabled",
+                                json_body={
+                                    "enabled": current.enabled,
+                                    "expectedDeploymentVersion": int(prepared["deploymentVersion"]),
+                                    "nextConfigVersion": req.expected_config_version,
+                                },
+                            )
+                        except Exception:
+                            pass
+                        raise
+                    result = {"id": server_id, "deleted": True}
+                else:
+                    result = browser_mcp_config.delete_server(server_id, req)
+            except Exception as exc:
+                if isinstance(exc, McpDeploymentError):
+                    raise _deployer_http_error(exc) from exc
+                raise _browser_mcp_config_http_error(exc) from exc
+        audit_logs.record(
+            action="browser_mcp_server_delete",
+            success=True,
+            actor=_audit_actor(request),
+            request_id=_audit_request_id(request),
+            details={
+                "serverId": server_id,
+                "entry": "mcp-browser",
+                "configVersion": req.expected_config_version,
+                "configHash": previous_hash,
+            },
+        )
+        return result
+
+    @app.post(
+        f"{API_PREFIX}/mcp-browser/servers/{{server_id}}/connection-test",
+        response_model=dict[str, Any],
+    )
+    async def test_browser_mcp_server_configuration(
+        server_id: McpServerIdPath,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        _prepare_browser_mcp_request(request, response, gateway_settings)
+        try:
+            return browser_mcp_config.test_configuration(server_id)
+        except Exception as exc:
+            raise _browser_mcp_config_http_error(exc) from exc
+
+    @app.get(
         f"{API_PREFIX}/admin/mcp-servers",
-        response_model=list[McpServerResponse],
+        response_model=list[dict[str, Any]],
         dependencies=[Depends(_require_profile_admin_dependency)],
     )
     @app.get(
         f"{API_PREFIX}/mcp-config/servers",
-        response_model=list[McpServerResponse],
+        response_model=list[dict[str, Any]],
         dependencies=[Depends(_require_client_api_key)],
     )
     async def list_mcp_servers(request: Request) -> list[dict[str, Any]]:
-        return mcp_server_store.list_public(
-            managed_secrets,
-            proxy_enabled=gateway_settings.mcp_proxy_enabled,
-        )
+        items = await _enrich_deployment_projection(browser_mcp_config.list_servers())
+        if request.url.path.startswith(f"{API_PREFIX}/mcp-config/"):
+            return [_legacy_mcp_config_projection(item) for item in items]
+        return items
 
     @app.get(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_profile_admin_dependency)],
     )
     @app.get(
         f"{API_PREFIX}/mcp-config/servers/{{server_id}}",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_client_api_key)],
     )
     async def get_mcp_server(
         server_id: McpServerIdPath,
         request: Request,
     ) -> dict[str, Any]:
-        result = mcp_server_store.get_public(
-            server_id,
-            managed_secrets,
-            proxy_enabled=gateway_settings.mcp_proxy_enabled,
-        )
+        result = browser_mcp_config.get_server(server_id)
         if result is None:
             raise HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
-        return result
+        enriched = (await _enrich_deployment_projection([result]))[0]
+        if request.url.path.startswith(f"{API_PREFIX}/mcp-config/"):
+            return _legacy_mcp_config_projection(enriched)
+        return enriched
 
     @app.put(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_profile_admin_dependency)],
     )
     @app.put(
         f"{API_PREFIX}/mcp-config/servers/{{server_id}}",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_client_api_key)],
     )
     async def put_mcp_server(
         server_id: McpServerIdPath,
-        req: McpServerConfig,
+        req: dict[str, Any],
         request: Request,
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
-        if server_id != req.id:
+        if server_id != req.get("id"):
             raise HTTPException(status_code=400, detail={"code": "MCP_SERVER_ID_MISMATCH"})
+        await mcp_mutation_lock.acquire()
         try:
-            candidate = mcp_server_store.create_upsert_candidate(req)
-            runtime = await _connection_test_mcp_candidate(candidate)
-            mcp_server_store.commit_candidate(
-                candidate,
-                runtime,
-                _publish_managed_mcp_runtime,
-                connection_status="healthy",
-            )
-            saved = candidate.config(server_id)
-            assert saved is not None
+            if req.get("transport") == "streamable_http":
+                payload = BrowserMcpServerWriteRequest.model_validate(req)
+                result = browser_mcp_config.upsert_server(payload)
+                saved = mcp_server_store.get_config(server_id)
+                assert saved is not None
+            else:
+                payload = AdminMcpStdioServerWriteRequest.model_validate(req)
+                candidate = browser_mcp_config.create_stdio_candidate(payload)
+                runtime = await _connection_test_mcp_candidate(candidate)
+                saved = candidate.config(server_id)
+                assert saved is not None
+                browser_mcp_config.commit_runtime_candidate(
+                    candidate,
+                    runtime,
+                    _publish_managed_mcp_runtime,
+                    connection_status=(
+                        "healthy" if saved.enabled else "disconnected"
+                    ),
+                )
+                result = browser_mcp_config.get_server(server_id)
+                assert result is not None
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="mcp_server_upsert",
             success=True,
@@ -1686,58 +2877,82 @@ def create_app(
                 "transport": saved.transport,
                 "enabled": saved.enabled,
                 "secretIds": _mcp_server_secret_ids(saved),
+                "configVersion": result["configVersion"],
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "configHash": browser_mcp_config.configuration_hash(server_id),
             },
         )
-        result = mcp_server_store.get_public(
-            server_id,
-            managed_secrets,
-            proxy_enabled=gateway_settings.mcp_proxy_enabled,
-        )
-        assert result is not None
+        if request.url.path.startswith(f"{API_PREFIX}/mcp-config/"):
+            return _legacy_mcp_config_projection(result)
         return result
 
     @app.put(
         f"{API_PREFIX}/admin/mcp-servers/{{server_id}}/enabled",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_profile_admin_dependency)],
     )
     @app.put(
         f"{API_PREFIX}/mcp-config/servers/{{server_id}}/enabled",
-        response_model=McpServerResponse,
+        response_model=dict[str, Any],
         dependencies=[Depends(_require_client_api_key)],
     )
     async def set_mcp_server_enabled(
         server_id: McpServerIdPath,
-        req: McpServerEnabledRequest,
+        req: BrowserMcpEnabledRequest,
         request: Request,
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
+        await mcp_mutation_lock.acquire()
         try:
-            candidate = mcp_server_store.create_enabled_candidate(server_id, req.enabled)
-            runtime = await _connection_test_mcp_candidate(candidate)
-            mcp_server_store.commit_candidate(
-                candidate,
-                runtime,
-                _publish_managed_mcp_runtime,
-                connection_status="healthy" if req.enabled else "disconnected",
-            )
-            saved = candidate.config(server_id)
-            assert saved is not None
+            configured = mcp_server_store.get_config(server_id)
+            if configured is None:
+                raise KeyError(server_id)
+            if configured.deployment_ref is not None:
+                raise PermissionError(
+                    "deployment-managed lifecycle must use MCP deployment API"
+                )
+            if configured.transport == "streamable_http":
+                result = browser_mcp_config.set_enabled(server_id, req)
+                saved = mcp_server_store.get_config(server_id)
+                assert saved is not None
+            else:
+                candidate = browser_mcp_config.create_enabled_candidate(
+                    server_id,
+                    req.enabled,
+                    expected_config_version=req.expected_config_version,
+                )
+                runtime = await _connection_test_mcp_candidate(candidate)
+                saved = candidate.config(server_id)
+                assert saved is not None
+                browser_mcp_config.commit_runtime_candidate(
+                    candidate,
+                    runtime,
+                    _publish_managed_mcp_runtime,
+                    connection_status=(
+                        "healthy" if req.enabled else "disconnected"
+                    ),
+                )
+                result = browser_mcp_config.get_server(server_id)
+                assert result is not None
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="mcp_server_enabled",
             success=True,
             actor=_audit_actor(request),
             request_id=request_id,
-            details={"serverId": saved.id, "enabled": saved.enabled},
+            details={
+                "serverId": saved.id,
+                "enabled": saved.enabled,
+                "configVersion": result["configVersion"],
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "configHash": browser_mcp_config.configuration_hash(server_id),
+            },
         )
-        result = mcp_server_store.get_public(
-            server_id,
-            managed_secrets,
-            proxy_enabled=gateway_settings.mcp_proxy_enabled,
-        )
-        assert result is not None
+        if request.url.path.startswith(f"{API_PREFIX}/mcp-config/"):
+            return _legacy_mcp_config_projection(result)
         return result
 
     @app.delete(
@@ -1752,26 +2967,50 @@ def create_app(
     )
     async def delete_mcp_server(
         server_id: McpServerIdPath,
+        req: BrowserMcpDeleteRequest,
         request: Request,
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
+        await mcp_mutation_lock.acquire()
         try:
-            candidate = mcp_server_store.create_delete_candidate(server_id)
-            runtime = _managed_mcp_runtime(list(candidate.configs))
-            mcp_server_store.commit_candidate(
-                candidate,
-                runtime,
-                _publish_managed_mcp_runtime,
-                connection_status="disconnected",
-            )
+            configured = mcp_server_store.get_config(server_id)
+            if configured is None:
+                raise KeyError(server_id)
+            if configured.deployment_ref is not None:
+                raise PermissionError(
+                    "deployment-managed lifecycle must use MCP deployment API"
+                )
+            deleted_version = mcp_server_store.effective_version(server_id)
+            deleted_hash = browser_mcp_config.configuration_hash(server_id)
+            if configured.transport == "streamable_http":
+                browser_mcp_config.delete_server(server_id, req)
+            else:
+                candidate = browser_mcp_config.create_delete_candidate(
+                    server_id,
+                    expected_config_version=req.expected_config_version,
+                )
+                runtime = _managed_mcp_runtime(list(candidate.configs))
+                browser_mcp_config.commit_runtime_candidate(
+                    candidate,
+                    runtime,
+                    _publish_managed_mcp_runtime,
+                    connection_status="disconnected",
+                )
         except Exception as exc:
             raise _mcp_server_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="mcp_server_delete",
             success=True,
             actor=_audit_actor(request),
             request_id=request_id,
-            details={"serverId": server_id},
+            details={
+                "serverId": server_id,
+                "configVersion": deleted_version,
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "configHash": deleted_hash,
+            },
         )
         return {"id": server_id, "deleted": True}
 
@@ -1791,7 +3030,29 @@ def create_app(
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
         started = time.monotonic()
-        if not gateway_settings.mcp_proxy_enabled:
+        configured = mcp_server_store.get_config(server_id)
+        if configured is None:
+            raise HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+        if configured.transport == "streamable_http":
+            checked = browser_mcp_config.test_configuration(server_id)
+            result = _mcp_connection_result(
+                server_id,
+                started,
+                error_code=(
+                    "" if checked["status"] == "valid" else checked["errorCode"]
+                ),
+                listed=(
+                    {
+                        "serverName": configured.expected_server_name,
+                        "serverVersion": "configuration-only",
+                        "tools": [],
+                    }
+                    if checked["status"] == "valid"
+                    else None
+                ),
+            )
+            mcp_server_store.set_connection_status(server_id, "disconnected")
+        elif not gateway_settings.mcp_proxy_enabled:
             result = _mcp_connection_result(
                 server_id,
                 started,
@@ -1876,30 +3137,37 @@ def create_app(
         request_id = _audit_request_id(request)
         if secret_id != req.id:
             raise HTTPException(status_code=400, detail={"code": "SECRET_ID_MISMATCH"})
+        await mcp_mutation_lock.acquire()
         try:
             candidate = None
             runtime = None
             if req.value:
-                candidate = mcp_server_store.create_secret_candidate([secret_id])
-                if candidate.server_ids:
+                candidate = browser_mcp_config.create_secret_candidate([secret_id])
+                if (
+                    candidate.server_ids
+                    and browser_mcp_config.candidate_requires_stdio_runtime(candidate)
+                ):
                     runtime = await _connection_test_mcp_candidate(
                         candidate,
                         secret_overrides={secret_id: req.value},
                     )
             rollback_snapshot = (
                 managed_secrets.snapshot_for_rollback(secret_id)
-                if runtime is not None
+                if candidate is not None and candidate.server_ids
                 else None
             )
             result = managed_secrets.upsert(req)
-            if candidate is not None and runtime is not None:
+            if candidate is not None and candidate.server_ids:
                 try:
-                    mcp_server_store.commit_candidate(
-                        candidate,
-                        runtime,
-                        _publish_managed_mcp_runtime,
-                        connection_status="healthy",
-                    )
+                    if runtime is None:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
+                    else:
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                            connection_status="healthy",
+                        )
                 except Exception:
                     assert rollback_snapshot is not None
                     managed_secrets.restore_snapshot(rollback_snapshot)
@@ -1908,12 +3176,27 @@ def create_app(
             if isinstance(exc, (McpProxyError, McpServerStoreError)):
                 raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="secret_upsert",
             success=True,
             actor=_audit_actor(request),
             request_id=request_id,
-            details={"secretId": secret_id, "kind": result["kind"], "configured": result["configured"]},
+            details={
+                "secretId": secret_id,
+                "kind": result["kind"],
+                "configured": result["configured"],
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "serverConfigs": [
+                    {
+                        "serverId": affected_id,
+                        "configVersion": mcp_server_store.effective_version(affected_id),
+                        "configHash": browser_mcp_config.configuration_hash(affected_id),
+                    }
+                    for affected_id in (candidate.server_ids if candidate else ())
+                ],
+            },
         )
         return result
 
@@ -1933,28 +3216,35 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
+        await mcp_mutation_lock.acquire()
         try:
-            candidate = mcp_server_store.create_secret_candidate([secret_id])
+            candidate = browser_mcp_config.create_secret_candidate([secret_id])
             runtime = None
-            if candidate.server_ids:
+            if (
+                candidate.server_ids
+                and browser_mcp_config.candidate_requires_stdio_runtime(candidate)
+            ):
                 runtime = await _connection_test_mcp_candidate(
                     candidate,
                     secret_overrides={secret_id: req.value},
                 )
             rollback_snapshot = (
                 managed_secrets.snapshot_for_rollback(secret_id)
-                if runtime is not None
+                if candidate.server_ids
                 else None
             )
             result = managed_secrets.rotate(secret_id, req)
-            if runtime is not None:
+            if candidate.server_ids:
                 try:
-                    mcp_server_store.commit_candidate(
-                        candidate,
-                        runtime,
-                        _publish_managed_mcp_runtime,
-                        connection_status="healthy",
-                    )
+                    if runtime is None:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
+                    else:
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                            connection_status="healthy",
+                        )
                 except Exception:
                     assert rollback_snapshot is not None
                     managed_secrets.restore_snapshot(rollback_snapshot)
@@ -1963,12 +3253,27 @@ def create_app(
             if isinstance(exc, (McpProxyError, McpServerStoreError)):
                 raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="secret_rotate",
             success=True,
             actor=_audit_actor(request),
             request_id=request_id,
-            details={"secretId": secret_id, "kind": result["kind"], "configured": True},
+            details={
+                "secretId": secret_id,
+                "kind": result["kind"],
+                "configured": True,
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "serverConfigs": [
+                    {
+                        "serverId": affected_id,
+                        "configVersion": mcp_server_store.effective_version(affected_id),
+                        "configHash": browser_mcp_config.configuration_hash(affected_id),
+                    }
+                    for affected_id in candidate.server_ids
+                ],
+            },
         )
         return result
 
@@ -1987,8 +3292,9 @@ def create_app(
         request: Request,
     ) -> dict[str, Any]:
         request_id = _audit_request_id(request)
+        await mcp_mutation_lock.acquire()
         try:
-            candidate = mcp_server_store.create_secret_candidate([secret_id])
+            candidate = browser_mcp_config.create_secret_candidate([secret_id])
             rollback_snapshot = (
                 managed_secrets.snapshot_for_rollback(secret_id)
                 if candidate.server_ids
@@ -1996,14 +3302,17 @@ def create_app(
             )
             result = managed_secrets.revoke(secret_id)
             if candidate.server_ids:
-                runtime = _managed_mcp_runtime(list(candidate.configs))
                 try:
-                    mcp_server_store.commit_candidate(
-                        candidate,
-                        runtime,
-                        _publish_managed_mcp_runtime,
-                        connection_status="disconnected",
-                    )
+                    if browser_mcp_config.candidate_requires_stdio_runtime(candidate):
+                        runtime = _managed_mcp_runtime(list(candidate.configs))
+                        browser_mcp_config.commit_runtime_candidate(
+                            candidate,
+                            runtime,
+                            _publish_managed_mcp_runtime,
+                            connection_status="disconnected",
+                        )
+                    else:
+                        browser_mcp_config.commit_metadata_candidate(candidate)
                 except Exception:
                     assert rollback_snapshot is not None
                     managed_secrets.restore_snapshot(rollback_snapshot)
@@ -2012,12 +3321,27 @@ def create_app(
             if isinstance(exc, McpServerStoreError):
                 raise _mcp_server_http_error(exc) from exc
             raise _managed_secret_http_error(exc) from exc
+        finally:
+            mcp_mutation_lock.release()
         audit_logs.record(
             action="secret_revoke",
             success=True,
             actor=_audit_actor(request),
             request_id=request_id,
-            details={"secretId": secret_id, "kind": result["kind"], "configured": False},
+            details={
+                "secretId": secret_id,
+                "kind": result["kind"],
+                "configured": False,
+                "entry": "admin" if request.url.path.startswith(f"{API_PREFIX}/admin/") else "mcp-config",
+                "serverConfigs": [
+                    {
+                        "serverId": affected_id,
+                        "configVersion": mcp_server_store.effective_version(affected_id),
+                        "configHash": browser_mcp_config.configuration_hash(affected_id),
+                    }
+                    for affected_id in candidate.server_ids
+                ],
+            },
         )
         return result
 
@@ -3198,6 +4522,80 @@ def _require_mcp_enabled(settings: Settings) -> None:
         raise HTTPException(status_code=503, detail={"code": "MCP_PROXY_DISABLED"})
 
 
+def _prepare_browser_mcp_request(
+    request: Request,
+    response: Response,
+    settings: Settings,
+) -> None:
+    if not settings.public_browser_mcp_config:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "BROWSER_MCP_CONFIG_DISABLED"},
+        )
+    origin = request.headers.get("Origin", "").rstrip("/")
+    if not origin:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "MCP_ORIGIN_REQUIRED"},
+        )
+    allowed = {item.rstrip("/") for item in settings.allow_origins if item != "*"}
+    if origin not in allowed:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "MCP_ORIGIN_NOT_ALLOWED"},
+        )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
+def _require_stdio_mcp_server(
+    store: McpServerStore,
+    server_id: str,
+) -> None:
+    server = store.get_config(server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+    if server.transport != "stdio":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MCP_BROWSER_DIRECT_REQUIRED"},
+        )
+
+
+def _browser_mcp_config_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, McpServerConfigVersionConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "MCP_CONFIG_VERSION_CONFLICT",
+                "serverId": exc.server_id,
+                "expectedConfigVersion": exc.expected,
+                "currentConfigVersion": exc.current,
+            },
+        )
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+    if isinstance(exc, PermissionError):
+        return HTTPException(
+            status_code=403,
+            detail={"code": "MCP_SERVER_READ_ONLY"},
+        )
+    if isinstance(exc, (ValueError, ValidationError)):
+        return HTTPException(
+            status_code=422,
+            detail={"code": "MCP_BROWSER_CONFIG_INVALID"},
+        )
+    if isinstance(exc, (McpServerStoreError, ManagedSecretStoreError)):
+        return HTTPException(
+            status_code=503,
+            detail={"code": "MCP_CONFIG_STORE_UNAVAILABLE"},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={"code": "MCP_BROWSER_CONFIG_OPERATION_FAILED"},
+    )
+
+
 def _log_mcp_call(
     settings: Settings,
     server_id: str,
@@ -3449,6 +4847,16 @@ def _mcp_server_http_error(exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=409,
             detail={"code": "MCP_SERVER_CANDIDATE_STALE"},
+        )
+    if isinstance(exc, McpServerConfigVersionConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "MCP_CONFIG_VERSION_CONFLICT",
+                "serverId": exc.server_id,
+                "expectedConfigVersion": exc.expected,
+                "currentConfigVersion": exc.current,
+            },
         )
     if isinstance(exc, McpServerStoreError):
         return HTTPException(
