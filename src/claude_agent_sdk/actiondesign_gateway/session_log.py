@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -31,6 +32,7 @@ _CONVERSATION_LOCKS_GUARD = threading.RLock()
 _INLINE_TOOL_RESULT_MAX_CHARS = 32_768
 _ARTIFACT_REF_PREFIX = "artifact:sha256:"
 _MAX_CONVERSATION_ARTIFACT_BYTES = 5 * 1024 * 1024
+_logger = logging.getLogger(__name__)
 
 
 def append_log(
@@ -55,6 +57,12 @@ def append_log(
         log_path.chmod(0o600)
     except OSError:
         pass
+    _logger.info(
+        "agent_log %s/%s %s",
+        safe_id,
+        Path(filename).name,
+        json.dumps(log_payload, ensure_ascii=False, default=str),
+    )
 
 
 def conversation_log_enabled(settings: Settings | Any) -> bool:
@@ -224,6 +232,7 @@ def append_conversation_event(
     payload.setdefault("conversationId", safe_id)
     payload.setdefault("time", _iso_time())
     serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    _logger.info("conversation_event %s", serialized)
     max_bytes = int(
         getattr(settings, "full_conversation_log_max_bytes", 100 * 1024 * 1024)
     )

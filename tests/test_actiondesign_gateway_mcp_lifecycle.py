@@ -68,7 +68,7 @@ def secret_store(tmp_path) -> ManagedSecretStore:
     return ManagedSecretStore(tmp_path / "secrets.json", DictSecretBackend())
 
 
-def test_hybrid_contract_defaults_to_proxy_and_only_projects_safe_direct_url(tmp_path):
+def test_legacy_http_modes_migrate_to_browser_direct_and_stdio_stays_proxy(tmp_path):
     store = McpServerStore(tmp_path / "servers.json", [])
     runtime = object()
 
@@ -93,19 +93,19 @@ def test_hybrid_contract_defaults_to_proxy_and_only_projects_safe_direct_url(tmp
         lambda _runtime: None,
     )
 
-    assert legacy.execution_mode == "gateway_proxy"
+    assert legacy.execution_mode == "browser_direct"
     assert legacy.auth_mode == "none"
     assert direct.execution_mode == "browser_direct"
-    assert automatic.execution_mode == "auto"
-    assert secret.execution_mode == "gateway_proxy"
+    assert automatic.execution_mode == "browser_direct"
+    assert secret.execution_mode == "browser_direct"
     assert secret.auth_mode == "backend_secret"
 
     public = {
         item["id"]: item
         for item in store.list_public(secret_store(tmp_path), proxy_enabled=True)
     }
-    assert public["legacy"]["browserDirectUrl"] == ""
-    assert public["secret"]["browserDirectUrl"] == ""
+    assert public["legacy"]["browserDirectUrl"] == "https://legacy.example.test/mcp"
+    assert public["secret"]["browserDirectUrl"] == "https://secret.example.test/mcp"
     assert public["direct"]["browserDirectUrl"] == (
         "https://direct.example.test/mcp"
     )
@@ -121,10 +121,6 @@ def test_hybrid_contract_defaults_to_proxy_and_only_projects_safe_direct_url(tmp
     "payload",
     [
         {
-            **http_server("secret-direct", secret_id="mcp.secret"),
-            "executionMode": "browser_direct",
-        },
-        {
             "id": "stdio-auto",
             "displayName": "stdio",
             "transport": "stdio",
@@ -139,26 +135,20 @@ def test_hybrid_contract_defaults_to_proxy_and_only_projects_safe_direct_url(tmp
         },
     ],
 )
-def test_stdio_and_backend_secret_are_forced_to_gateway_proxy(payload):
+def test_stdio_route_and_auth_mismatch_are_rejected(payload):
     with pytest.raises(ValidationError):
         McpServerConfig.model_validate(payload)
 
 
-@pytest.mark.parametrize("execution_mode", ["auto", "browser_direct"])
-def test_static_http_headers_force_gateway_proxy(execution_mode):
-    payload = http_server("static-headers", execution_mode=execution_mode)
+@pytest.mark.parametrize("execution_mode", ["auto", "browser_direct", "gateway_proxy"])
+def test_http_headers_and_secrets_preserve_browser_direct_route(execution_mode):
+    payload = http_server("static-headers", execution_mode=execution_mode, secret_id="mcp.secret")
     payload["streamableHttp"]["headers"] = {"X-Client-Version": "1"}
-
-    with pytest.raises(
-        ValidationError,
-        match="static headers must use gateway_proxy execution",
-    ):
-        McpServerConfig.model_validate(payload)
-
-    payload["executionMode"] = "gateway_proxy"
-    assert McpServerConfig.model_validate(payload).streamable_http.headers == {
-        "X-Client-Version": "1"
-    }
+    server = McpServerConfig.model_validate(payload)
+    assert server.execution_mode == "browser_direct"
+    assert server.auth_mode == "backend_secret"
+    assert server.streamable_http.headers == {"X-Client-Version": "1"}
+    assert server.streamable_http.secret_bindings[0].secret_id == "mcp.secret"
 
 
 def test_candidate_failure_keeps_active_then_success_publishes_and_drains(tmp_path):

@@ -235,6 +235,16 @@ class Settings(BaseModel):
     allow_origins: list[str] = Field(
         default_factory=lambda: _csv("ACTIONDESIGN_AGENT_ALLOW_ORIGINS", ["*"])
     )
+    allow_private_network: bool = Field(
+        default_factory=lambda: _bool("ACTIONDESIGN_AGENT_ALLOW_PRIVATE_NETWORK", False)
+    )
+    local_default_client_api_key: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_LOCAL_DEFAULT_CLIENT_API_KEY"),
+        repr=False,
+    )
+    local_default_client_origin: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_LOCAL_DEFAULT_CLIENT_ORIGIN")
+    )
     service_auth_mode: Literal["disabled", "required"] = Field(
         default_factory=lambda: _env(
             "ACTIONDESIGN_SERVICE_AUTH_MODE",
@@ -453,6 +463,9 @@ class Settings(BaseModel):
             [],
         )
     )
+    mcp_allowed_directory_paths: list[str] = Field(
+        default_factory=lambda: _csv("ACTIONDESIGN_MCP_ALLOWED_DIRECTORY_PATHS", [])
+    )
     mcp_timeout_seconds: float = Field(
         default_factory=lambda: _float("ACTIONDESIGN_MCP_TIMEOUT_SECONDS", 30.0),
         ge=1.0,
@@ -474,6 +487,7 @@ class Settings(BaseModel):
         "mcp_allowed_http_paths",
         "mcp_allowed_http_urls",
         "mcp_allowed_executable_paths",
+        "mcp_allowed_directory_paths",
         mode="before",
     )
     @classmethod
@@ -576,6 +590,7 @@ class Settings(BaseModel):
         "langsmith_api_key",
         "service_auth_token",
         "mcp_deployer_token",
+        "local_default_client_api_key",
     )
     def _validate_secret_length(cls, value: str) -> str:
         if value and len(value) > 8192:
@@ -584,6 +599,27 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_feature_dependencies(self) -> Settings:
+        if self.local_default_client_api_key or self.local_default_client_origin:
+            parsed_origin = urlsplit(self.local_default_client_origin)
+            if (
+                not self.local_default_client_api_key
+                or self.local_default_client_origin not in self.allow_origins
+                or parsed_origin.scheme not in {"http", "https"}
+                or not parsed_origin.netloc
+                or parsed_origin.username is not None
+                or parsed_origin.password is not None
+                or parsed_origin.path
+                or parsed_origin.query
+                or parsed_origin.fragment
+                or self.service_auth_mode != "required"
+            ):
+                raise ValueError("Local default client requires a key, an exact allowed Origin and required service auth")
+        if self.allow_private_network and (
+            not self.allow_origins or "*" in self.allow_origins
+        ):
+            raise ValueError(
+                "ACTIONDESIGN_AGENT_ALLOW_ORIGINS must be explicit when private network access is enabled"
+            )
         if self.service_auth_mode == "required":
             if len(self.service_auth_token) < 32:
                 raise ValueError(

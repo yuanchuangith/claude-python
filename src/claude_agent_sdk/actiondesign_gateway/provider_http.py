@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .request_budget import prepare_provider_body
 
 import json
 import time
@@ -12,6 +13,7 @@ from jsonschema import Draft202012Validator
 
 from .models import AgentChatResponse, DiscoveredProviderModel
 from .profile_store import ProviderProfile
+from .reasoning import compatible_reasoning, reasoning_payload
 
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
@@ -38,7 +40,11 @@ def normalize_chat_completions_url(value: str) -> str:
 
 
 def normalize_models_url(value: str, protocol: str) -> str:
-    if protocol == "openai":
+    if protocol == "openai-responses":
+        from .provider_responses import normalize_responses_url
+        endpoint = normalize_responses_url(value)
+        resource_suffix = "/responses"
+    elif protocol == "openai":
         endpoint = normalize_chat_completions_url(value)
         resource_suffix = "/chat/completions"
     else:
@@ -122,7 +128,7 @@ def openai_request_headers(profile: ProviderProfile) -> dict[str, str]:
 def request_body(req: Any, profile: ProviderProfile, stream: bool) -> dict[str, Any]:
     history = list(getattr(req, "messages", None) or [])
     if history:
-        messages = _anthropic_history_messages(req, history)
+        messages = _anthropic_history_messages(req, history, profile)
         body: dict[str, Any] = {
             "model": req.model or profile.default_model,
             "max_tokens": req.max_tokens,
@@ -164,7 +170,7 @@ def openai_request_body(req: Any, profile: ProviderProfile, stream: bool) -> dic
         system_prompt = str(getattr(req, "system_prompt", "") or "")
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.extend(_openai_history_messages(req, history))
+        messages.extend(_openai_history_messages(req, history, profile))
         body: dict[str, Any] = {
             "model": req.model or profile.default_model,
             "max_tokens": req.max_tokens,
@@ -258,7 +264,7 @@ def _apply_openai_tools(body: dict[str, Any], req: Any) -> None:
         )
 
 
-def _anthropic_history_messages(req: Any, history: list[Any]) -> list[dict[str, Any]]:
+def _anthropic_history_messages(req: Any, history: list[Any], profile: ProviderProfile | None = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     last_user_index = max(
         (index for index, message in enumerate(history) if message.role == "user"),
@@ -267,6 +273,10 @@ def _anthropic_history_messages(req: Any, history: list[Any]) -> list[dict[str, 
     for index, message in enumerate(history):
         if message.role == "assistant":
             blocks: list[dict[str, Any]] = []
+            state = compatible_reasoning(message, req, profile) if profile else None
+            if state is not None and state.protocol == "claude":
+                blocks.extend(block.model_dump(exclude_none=True) for block in state.blocks
+                              if block.type == "redacted_thinking" or block.signature)
             if message.content:
                 blocks.append({"type": "text", "text": message.content})
             blocks.extend(
@@ -333,7 +343,7 @@ def _anthropic_image_blocks(req: Any) -> list[dict[str, Any]]:
     return blocks
 
 
-def _openai_history_messages(req: Any, history: list[Any]) -> list[dict[str, Any]]:
+def _openai_history_messages(req: Any, history: list[Any], profile: ProviderProfile | None = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     last_user_index = max(
         (index for index, message in enumerate(history) if message.role == "user"),
@@ -345,6 +355,9 @@ def _openai_history_messages(req: Any, history: list[Any]) -> list[dict[str, Any
                 "role": "assistant",
                 "content": message.content or None,
             }
+            state = compatible_reasoning(message, req, profile) if profile else None
+            if state is not None and state.protocol == "openai":
+                item["reasoning_content"] = state.reasoning_content
             if message.tool_calls:
                 item["tool_calls"] = [
                     {
@@ -405,7 +418,7 @@ def _openai_reasoning_effort(budget_tokens: int) -> str:
     return "max"
 
 
-def parse_response(payload: dict[str, Any], provider: str, model: str, started: float) -> dict[str, Any]:
+def parse_response(payload: dict[str, Any], provider: str, model: str, started: float, profile_id: str = "") -> dict[str, Any]:
     content: list[str] = []
     calls: list[dict[str, Any]] = []
     blocks = payload.get("content")
@@ -445,6 +458,9 @@ def parse_response(payload: dict[str, Any], provider: str, model: str, started: 
         "duration_ms": int((time.time() - started) * 1000),
         "usage": {**usage, **({"output_truncated": True} if truncated else {})},
     }
+    reasoning_blocks = [block for block in blocks if block.get("type") in {"thinking", "redacted_thinking"}]
+    if reasoning_blocks and not truncated:
+        normalized["reasoning"] = reasoning_payload(provider, profile_id, model, "claude", blocks=reasoning_blocks)
     validated = AgentChatResponse.model_validate(normalized)
     validate_response_against_request(req=None, response=validated)
     return validated.model_dump(mode="json")
@@ -457,7 +473,7 @@ async def call_messages(req: Any, profile: ProviderProfile) -> dict[str, Any]:
             response = await client.post(
                 normalize_messages_url(profile.base_url),
                 headers=request_headers(profile),
-                json=request_body(req, profile, False),
+                json=prepare_provider_body(req, profile, False)[0],
             )
             _raise_provider_status(response)
             payload = response.json()
@@ -490,7 +506,7 @@ async def call_messages(req: Any, profile: ProviderProfile) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise _upstream_error(502, "PROVIDER_RESPONSE_INVALID", "Provider response is not an object")
     parsed = AgentChatResponse.model_validate(
-        parse_response(payload, profile.provider, req.model or profile.default_model, started)
+        parse_response(payload, profile.provider, req.model or profile.default_model, started, profile.id)
     )
     validate_response_against_request(req, parsed)
     return parsed.model_dump(mode="json")
@@ -500,6 +516,8 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
     started = time.time()
     text_parts: list[str] = []
     tool_blocks: dict[int, dict[str, Any]] = {}
+    thinking_blocks: dict[int, dict[str, Any]] = {}
+    stream_completed = False
     usage: dict[str, Any] = {}
     model = req.model or profile.default_model
     try:
@@ -507,7 +525,7 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
             "POST",
             normalize_messages_url(profile.base_url),
             headers=request_headers(profile),
-            json=request_body(req, profile, True),
+            json=prepare_provider_body(req, profile, True)[0],
         ) as response:
             if response.is_error:
                 # Streaming responses are not buffered by httpx. Read only
@@ -525,12 +543,14 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
                         event_name, data_lines = "", []
                         if event is None:
                             continue
+                        stream_completed = stream_completed or event.get("type") == "message_stop"
                         model, delta_text = _consume_stream_event(
                             event,
                             model,
                             text_parts,
                             tool_blocks,
                             usage,
+                            thinking_blocks,
                         )
                         if delta_text:
                             yield {"kind": "delta", "content": delta_text}
@@ -542,12 +562,14 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
             if data_lines:
                 event = _parse_event(event_name, data_lines)
                 if event is not None:
+                    stream_completed = stream_completed or event.get("type") == "message_stop"
                     model, delta_text = _consume_stream_event(
                         event,
                         model,
                         text_parts,
                         tool_blocks,
                         usage,
+                        thinking_blocks,
                     )
                     if delta_text:
                         yield {"kind": "delta", "content": delta_text}
@@ -558,6 +580,8 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
     except httpx.RequestError as exc:
         raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc), retryable=True, failover_scope="model") from exc
 
+    if thinking_blocks and not stream_completed:
+        raise _upstream_error(502, "PROVIDER_STREAM_INVALID", "Thinking stream ended without message_stop")
     calls = []
     for block in tool_blocks.values():
         arguments = block.get("input") or {}
@@ -585,6 +609,9 @@ async def stream_messages(req: Any, profile: ProviderProfile) -> AsyncIterator[d
         "usage": {**usage, **({"output_truncated": True} if truncated else {})},
     }
     validated = AgentChatResponse.model_validate(normalized)
+    if thinking_blocks and not truncated:
+        validated.reasoning = AgentChatResponse.model_validate({**normalized,
+            "reasoning": reasoning_payload(profile.provider, profile.id, req.model or profile.default_model, "claude", blocks=list(thinking_blocks.values()))}).reasoning
     validate_response_against_request(req, validated)
     yield {
         "kind": "completed",
@@ -597,6 +624,7 @@ def parse_openai_response(
     provider: str,
     model: str,
     started: float,
+    profile_id: str = "",
 ) -> dict[str, Any]:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -637,6 +665,8 @@ def parse_openai_response(
         "duration_ms": int((time.time() - started) * 1000),
         "usage": {**usage, **({"output_truncated": True} if truncated else {})},
     }
+    if message.get("reasoning_content") and not truncated:
+        normalized["reasoning"] = reasoning_payload(provider, profile_id, model, "openai", reasoningContent=message["reasoning_content"])
     return AgentChatResponse.model_validate(normalized).model_dump(mode="json")
 
 
@@ -647,7 +677,7 @@ async def call_openai(req: Any, profile: ProviderProfile) -> dict[str, Any]:
             response = await client.post(
                 normalize_chat_completions_url(profile.base_url),
                 headers=openai_request_headers(profile),
-                json=openai_request_body(req, profile, False),
+                json=prepare_provider_body(req, profile, False)[0],
             )
             _raise_provider_status(response)
             payload = response.json()
@@ -667,6 +697,7 @@ async def call_openai(req: Any, profile: ProviderProfile) -> dict[str, Any]:
             profile.provider,
             req.model or profile.default_model,
             started,
+            profile.id,
         )
     )
     validate_response_against_request(req, parsed)
@@ -676,6 +707,7 @@ async def call_openai(req: Any, profile: ProviderProfile) -> dict[str, Any]:
 async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dict[str, Any]]:
     started = time.time()
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: dict[int, dict[str, str]] = {}
     usage: dict[str, Any] = {}
     finish_reason = ""
@@ -686,7 +718,7 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
                 "POST",
                 normalize_chat_completions_url(profile.base_url),
                 headers=openai_request_headers(profile),
-                json=openai_request_body(req, profile, True),
+                json=prepare_provider_body(req, profile, True)[0],
             ) as response:
                 if response.is_error:
                     await response.aread()
@@ -729,6 +761,10 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
                         if not isinstance(delta, dict):
                             continue
                         delta_text = _openai_content_text(delta.get("content"))
+                        if delta.get("reasoning_content"):
+                            if not isinstance(delta["reasoning_content"], str):
+                                raise _upstream_error(502, "PROVIDER_STREAM_INVALID", "reasoning_content must be text")
+                            reasoning_parts.append(delta["reasoning_content"])
                         if delta_text:
                             text_parts.append(delta_text)
                             yield {"kind": "delta", "content": delta_text}
@@ -740,6 +776,8 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
     except httpx.RequestError as exc:
         raise _upstream_error(502, "PROVIDER_NETWORK_ERROR", str(exc), retryable=True, failover_scope="model") from exc
 
+    if reasoning_parts and not finish_reason:
+        raise _upstream_error(502, "PROVIDER_STREAM_INVALID", "Reasoning stream ended without finish_reason")
     calls = _finalize_openai_tool_calls(tool_calls)
     truncated = finish_reason in {"length", "max_tokens", "output_truncated"}
     if not "".join(text_parts).strip() and not calls and not truncated:
@@ -757,6 +795,8 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
             "code": "PROVIDER_OUTPUT_TRUNCATED" if truncated else None,
             "duration_ms": int((time.time() - started) * 1000),
             "usage": {**usage, **({"output_truncated": True} if truncated else {})},
+            **({"reasoning": reasoning_payload(profile.provider, profile.id, req.model or profile.default_model, "openai", reasoningContent="".join(reasoning_parts))}
+               if reasoning_parts and not truncated else {}),
         }
     )
     validate_response_against_request(req, validated)
@@ -764,6 +804,9 @@ async def stream_openai(req: Any, profile: ProviderProfile) -> AsyncIterator[dic
 
 
 async def call_provider(req: Any, profile: ProviderProfile) -> dict[str, Any]:
+    if profile.protocol == "openai-responses":
+        from .provider_responses import call_responses
+        return await call_responses(req, profile)
     if profile.protocol == "openai":
         return await call_openai(req, profile)
     return await call_messages(req, profile)
@@ -777,7 +820,13 @@ async def probe_provider(profile: ProviderProfile, model: str) -> None:
             "The requested model is not configured for this Profile",
             retryable=False,
         )
-    if profile.protocol == "openai":
+    if profile.protocol == "openai-responses":
+        from .provider_responses import normalize_responses_url
+        url = normalize_responses_url(profile.base_url)
+        headers = openai_request_headers(profile)
+        body = {"model": model, "max_output_tokens": 1, "stream": False, "store": False,
+                "input": [{"role": "user", "content": "ping"}]}
+    elif profile.protocol == "openai":
         url = normalize_chat_completions_url(profile.base_url)
         headers = openai_request_headers(profile)
         body = {
@@ -823,7 +872,7 @@ async def discover_provider_models(profile: ProviderProfile) -> dict[str, Any]:
     url = normalize_models_url(profile.base_url, profile.protocol)
     headers = (
         openai_request_headers(profile)
-        if profile.protocol == "openai"
+        if profile.protocol in {"openai", "openai-responses"}
         else request_headers(profile)
     )
     try:
@@ -948,6 +997,9 @@ async def discover_provider_models(profile: ProviderProfile) -> dict[str, Any]:
 
 
 def stream_provider(req: Any, profile: ProviderProfile) -> AsyncIterator[dict[str, Any]]:
+    if profile.protocol == "openai-responses":
+        from .provider_responses import stream_responses
+        return stream_responses(req, profile)
     if profile.protocol == "openai":
         return stream_openai(req, profile)
     return stream_messages(req, profile)
@@ -1068,6 +1120,7 @@ def _consume_stream_event(
     text_parts: list[str],
     tool_blocks: dict[int, dict[str, Any]],
     usage: dict[str, Any],
+    thinking_blocks: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     event_type = str(event.get("type") or "")
     if event_type == "message_start":
@@ -1077,6 +1130,8 @@ def _consume_stream_event(
     elif event_type == "content_block_start":
         index = int(event.get("index") or 0)
         block = event.get("content_block") or {}
+        if thinking_blocks is not None and block.get("type") in {"thinking", "redacted_thinking"}:
+            thinking_blocks[index] = dict(block)
         if block.get("type") == "tool_use":
             tool_blocks[index] = {
                 "id": str(block.get("id") or ""),
@@ -1087,6 +1142,12 @@ def _consume_stream_event(
     elif event_type == "content_block_delta":
         index = int(event.get("index") or 0)
         delta = event.get("delta") or {}
+        if thinking_blocks is not None and index in thinking_blocks:
+            block = thinking_blocks[index]
+            if delta.get("type") == "thinking_delta":
+                block["thinking"] = str(block.get("thinking") or "") + str(delta.get("thinking") or "")
+            elif delta.get("type") == "signature_delta":
+                block["signature"] = str(block.get("signature") or "") + str(delta.get("signature") or "")
         if delta.get("type") == "text_delta":
             text = str(delta.get("text") or "")
             if text:

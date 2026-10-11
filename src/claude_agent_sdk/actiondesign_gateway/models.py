@@ -18,7 +18,9 @@ from pydantic import (
     Field,
     SecretStr,
     field_validator,
+    field_serializer,
     model_validator,
+    model_serializer,
 )
 
 from .identifiers import (
@@ -29,6 +31,7 @@ from .identifiers import (
     validate_safe_request_id,
     validate_uuid4_id,
 )
+from .reasoning import NativeReasoningState
 
 MIMO_MODELS: dict[str, dict[str, Any]] = {
     "mimo-v2.5": {
@@ -284,6 +287,11 @@ class AgentChatMessage(_GatewayBaseModel):
     tool_call_id: str = Field(default="", alias="toolCallId", max_length=256)
     is_error: bool = Field(default=False, alias="isError")
     name: str = Field(default="", max_length=128)
+    reasoning: NativeReasoningState | None = None
+
+    @field_serializer("reasoning")
+    def _serialize_reasoning(self, value: NativeReasoningState | None) -> Any:
+        return value.model_dump(mode="json", by_alias=True, exclude_none=True) if value else None
 
     @field_validator("tool_call_id")
     def _validate_tool_call_id(cls, value: str) -> str:
@@ -299,6 +307,8 @@ class AgentChatMessage(_GatewayBaseModel):
 
     @model_validator(mode="after")
     def _validate_role_shape(self) -> AgentChatMessage:
+        if self.reasoning is not None and self.role != "assistant":
+            raise ValueError("only assistant messages may carry native reasoning")
         if self.role == "assistant":
             if self.tool_call_id:
                 raise ValueError("assistant messages cannot set toolCallId")
@@ -337,8 +347,9 @@ class AgentChatRequest(RequestCorrelationIdentity):
     images: list[ImageInput] = Field(default_factory=list)
     max_tokens: int = Field(default=8192, alias="maxTokens", ge=256, le=32768)
     thinking: ThinkingConfig = Field(default_factory=ThinkingConfig)
+    task_purpose: Literal["main", "review", "compaction", "memory", "intent"] = Field(default="main", alias="taskPurpose")
     context_management: ContextManagementMetadata | None = Field(default=None, alias="contextManagement")
-    protocol_version: str = Field(default="1.0", alias="protocolVersion")
+    protocol_version: Literal["1.0", "1.1"] = Field(default="1.0", alias="protocolVersion")
     graph_version: str = Field(default="", alias="graphVersion")
     prompt_manifest_version: str = Field(default="", alias="promptManifestVersion")
     prompt_manifest_hash: str = Field(default="", alias="promptManifestHash")
@@ -495,7 +506,22 @@ class AgentChatResponse(_GatewayBaseModel):
     error: str | None = None
     code: str | None = None
     duration_ms: int = 0
+    normalized_usage: dict[str, int | None] | None = Field(default=None, alias="normalizedUsage")
+    request_budget: dict[str, Any] | None = Field(default=None, alias="requestBudget")
     usage: dict[str, Any] = Field(default_factory=dict)
+    reasoning: NativeReasoningState | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_accounting(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        for key in ("normalized_usage", "normalizedUsage", "request_budget", "requestBudget"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+    @field_serializer("reasoning")
+    def _serialize_reasoning(self, value: NativeReasoningState | None) -> Any:
+        return value.model_dump(mode="json", by_alias=True, exclude_none=True) if value else None
 
     @field_validator("usage")
     @classmethod
@@ -911,7 +937,7 @@ class ApiProfileWriteRequest(_GatewayBaseModel):
     id: str
     provider: str
     display_name: str = Field(default="", alias="displayName", max_length=256)
-    protocol: Literal["openai", "claude"] = "claude"
+    protocol: Literal["openai", "claude", "openai-responses"] = "claude"
     base_url: str = Field(alias="baseUrl")
     api_key: str = Field(default="", alias="apiKey")
     default_model: str = Field(alias="defaultModel", min_length=1, max_length=256)
@@ -974,9 +1000,9 @@ class ApiProfileResponse(_GatewayBaseModel):
     id: str
     provider: str
     display_name: str = Field(alias="displayName")
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     base_url: str = Field(alias="baseUrl")
-    provider_path: Literal["/v1/chat/completions", "/v1/messages"] = Field(
+    provider_path: Literal["/v1/chat/completions", "/v1/messages", "/v1/responses"] = Field(
         alias="providerPath"
     )
     default_model: str = Field(default="", alias="defaultModel")
@@ -1022,7 +1048,7 @@ class ProviderConnectionTestRequest(_GatewayBaseModel):
 
 
 class ProviderModelDiscoveryRequest(_GatewayBaseModel):
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     base_url: str = Field(alias="baseUrl")
     api_key: SecretStr = Field(
         default_factory=lambda: SecretStr(""),
@@ -1141,7 +1167,9 @@ class TraceEnvelope(_GatewayBaseModel):
     trace_run_id: str = Field(alias="traceRunId")
     parent_trace_run_id: str = Field(default="", alias="parentTraceRunId")
     agent_run_id: str = Field(alias="agentRunId")
-    request_id: str = Field(alias="requestId")
+    # Graph/node events may have no associated HTTP request. The enclosing
+    # batch still requires its own canonical HTTP request identity.
+    request_id: str = Field(default="", alias="requestId")
     correlation_id: str = Field(alias="correlationId")
     retry_of: str = Field(default="", alias="retryOf")
     name: str = Field(min_length=1, max_length=512)
@@ -1172,7 +1200,7 @@ class TraceEnvelope(_GatewayBaseModel):
 
     @field_validator("request_id")
     def _validate_request_id(cls, value: str) -> str:
-        return validate_uuid4_id(value, label="requestId")
+        return validate_uuid4_id(value, label="requestId") if value else value
 
     @field_validator("correlation_id", "retry_of")
     def _validate_trace_correlation_ids(cls, value: str) -> str:
@@ -1309,7 +1337,7 @@ class RetryPolicyResponse(_GatewayBaseModel):
 
 class AdminRuntimePolicyResponse(_GatewayBaseModel):
     profile_allowed_hosts: list[str] = Field(alias="profileAllowedHosts", max_length=256)
-    provider_paths: dict[Literal["openai", "claude"], str] = Field(alias="providerPaths")
+    provider_paths: dict[Literal["openai", "claude", "openai-responses"], str] = Field(alias="providerPaths")
     retry_policy: RetryPolicyResponse = Field(alias="retryPolicy")
 
 
@@ -1328,7 +1356,7 @@ class ModelCapability(_GatewayBaseModel):
 
 class ProviderCapability(_GatewayBaseModel):
     display_name: str = Field(alias="displayName")
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     default_profile_id: str = Field(alias="defaultProfileId")
     status: Literal["ready", "unavailable"]
     default_model: str = Field(alias="defaultModel")
@@ -1341,7 +1369,7 @@ class RoutingOrderItem(_GatewayBaseModel):
     position: int = Field(ge=1)
     provider: str
     profile_id: str = Field(alias="profileId")
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     model: str
     profile_priority: int = Field(alias="profilePriority", ge=1, le=10_000)
     model_priority: int = Field(alias="modelPriority", ge=1, le=10_000)
@@ -1352,7 +1380,7 @@ class RoutingOrderItem(_GatewayBaseModel):
 class AgentModelsResponse(_GatewayBaseModel):
     default_provider: str = Field(alias="defaultProvider")
     default_model: str = Field(alias="defaultModel")
-    supported_protocol_versions: list[Literal["1.0"]] = Field(alias="supportedProtocolVersions")
+    supported_protocol_versions: list[Literal["1.0", "1.1"]] = Field(alias="supportedProtocolVersions")
     providers: dict[str, ProviderCapability]
     routing_order: list[RoutingOrderItem] = Field(default_factory=list, alias="routingOrder")
 
@@ -1369,7 +1397,7 @@ class RequestLogEntry(_GatewayBaseModel):
     endpoint: str = Field(default="", max_length=512)
     provider: str
     profile_id: str = Field(alias="profileId")
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     model: str
     attempt: int = Field(default=1, ge=1, le=10_000)
     stream: bool
@@ -1720,7 +1748,7 @@ class ConversationSealResponse(_GatewayBaseModel):
 
 
 class GatewayEventEnvelope(_GatewayBaseModel):
-    protocol_version: Literal["1.0"] = Field(alias="protocolVersion")
+    protocol_version: Literal["1.0", "1.1"] = Field(alias="protocolVersion")
     sequence: int = Field(gt=0)
     conversation_id: str = Field(alias="conversationId")
     run_id: str = Field(alias="runId")

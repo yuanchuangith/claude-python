@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ _READ_CHUNK_BYTES = 64 * 1024
 _MAX_LOG_LINE_BYTES = 64 * 1024
 _MAX_USAGE_TOKENS = 1_000_000_000_000
 _MAX_ERROR_MESSAGE_CHARS = 1_000
+_logger = logging.getLogger(__name__)
 _KNOWN_ERROR_CODES = frozenset(
     {
         "GATEWAY_ERROR",
@@ -220,6 +222,7 @@ class RequestLogStore:
                 self.path.chmod(0o600)
             except OSError:
                 pass
+        _logger.info("provider_request %s", serialized)
         return entry
 
     def list(

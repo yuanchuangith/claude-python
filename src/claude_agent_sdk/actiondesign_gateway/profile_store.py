@@ -215,7 +215,7 @@ class _PersistedProviderProfile(BaseModel):
     id: str = Field(min_length=1, max_length=64)
     provider: str = Field(min_length=1, max_length=64)
     display_name: str = Field(min_length=1, max_length=256)
-    protocol: Literal["openai", "claude"]
+    protocol: Literal["openai", "claude", "openai-responses"]
     base_url: str = Field(min_length=1, max_length=2_048)
     secret_ref: str | None = Field(default=None, max_length=64)
     default_model: str = Field(min_length=1, max_length=256)
@@ -379,6 +379,7 @@ class ProviderProfile:
             "protocol": self.protocol,
             "baseUrl": self.base_url,
             "providerPath": (
+                "/v1/responses" if self.protocol == "openai-responses" else
                 "/v1/chat/completions" if self.protocol == "openai" else "/v1/messages"
             ),
             "defaultModel": self.default_model,
@@ -1144,7 +1145,7 @@ class ApiProfileStore:
         self,
         profile_id: str,
         base_url: str,
-        protocol: Literal["openai", "claude"],
+        protocol: Literal["openai", "claude", "openai-responses"],
     ) -> None:
         if not _PROFILE_ID.fullmatch(profile_id):
             raise HTTPException(status_code=400, detail={"code": "INVALID_PROFILE_ID"})
@@ -1161,6 +1162,8 @@ class ApiProfileStore:
         if allowed and parsed.hostname.lower() not in allowed:
             raise HTTPException(status_code=400, detail={"code": "PROFILE_HOST_NOT_ALLOWED"})
         path = parsed.path.rstrip("/")
+        if protocol == "openai-responses" and path.endswith("/responses") and not path.endswith("/v1/responses"):
+            raise HTTPException(status_code=400, detail={"code": "PROVIDER_PATH_NOT_ALLOWED"})
         if protocol == "claude" and path.endswith("/messages") and not path.endswith(
             "/v1/messages"
         ):

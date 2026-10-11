@@ -7,6 +7,11 @@ from typing import Any
 from fastapi import HTTPException
 
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_GRAPH_USER_MESSAGE_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])run_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}:user:[0-9]+(?![A-Za-z0-9_:.-])",
+    re.IGNORECASE,
+)
 _SECRET_KEYS = {
     "authorization",
     "api-key",
@@ -17,20 +22,35 @@ _SECRET_KEYS = {
     "model_mimo_key",
 }
 _NON_SECRET_TOKEN_KEYS = {
+    "availableinputtokens",
     "budget_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cachecreationtokens",
+    "cachedinputtokens",
     "cached_tokens",
     "completion_tokens",
+    "completion_tokens_details",
     "contextwindowtokens",
     "context_window_tokens",
     "input_tokens",
+    "input_tokens_details",
+    "inputtokens",
+    "estimatedinputtokens",
     "maxoutputtokens",
     "max_output_tokens",
     "maxtokens",
     "max_tokens",
     "output_tokens",
+    "output_tokens_details",
+    "outputtokens",
     "prompt_tokens",
+    "prompt_tokens_details",
     "reasoning_tokens",
+    "reasoningtokens",
+    "reservedoutputtokens",
     "total_tokens",
+    "totaltokens",
 }
 _NON_SECRET_STATUS_KEYS = {
     "keyconfigured",
@@ -85,7 +105,8 @@ def safe_conversation_id(value: str) -> str:
 def redact_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
-            key: _REDACTED if _is_secret_key(key) else redact_value(item)
+            key: _redact_native_reasoning(item) if key == "reasoning" and isinstance(item, Mapping) and item.get("schemaVersion") == 1
+            else _REDACTED if _is_secret_key(key) else redact_value(item)
             for key, item in value.items()
         }
     if isinstance(value, tuple):
@@ -97,6 +118,28 @@ def redact_value(value: Any) -> Any:
             return _REDACTED
         return _redact_string(value)
     return value
+
+
+def _redact_native_reasoning(value: Mapping) -> Any:
+    # Only strict, bounded protocol state may preserve opaque signatures/ciphertext.
+    # Signed plaintext must remain exact; if it contains sensitive material, omit
+    # the state instead of returning a modified block that cannot be replayed.
+    from .reasoning import REASONING_ADAPTER
+    try:
+        state = REASONING_ADAPTER.validate_python(dict(value))
+    except ValueError:
+        return None
+    native = state.model_dump(mode="json", by_alias=True, exclude_none=True)
+    texts: list[str] = []
+    if state.protocol == "claude":
+        texts = [block.thinking for block in state.blocks if block.type == "thinking"]
+    elif state.protocol == "openai":
+        texts = [state.reasoning_content]
+    else:
+        texts = [summary.text for item in state.items for summary in item.summary]
+    if any(_redact_string(text) != text for text in texts):
+        return None
+    return native
 
 
 def redact_secret_values(value: Any, secret_values: Sequence[str]) -> Any:
@@ -115,7 +158,10 @@ def redact_secret_values(value: Any, secret_values: Sequence[str]) -> Any:
 def _replace_secret_values(value: Any, secret_values: tuple[str, ...]) -> Any:
     if isinstance(value, Mapping):
         return {
-            key: _replace_secret_values(item, secret_values)
+            key: None if key == "reasoning" and isinstance(item, Mapping)
+            and any(secret in str(item) for secret in secret_values)
+            else item if key == "reasoning" and isinstance(item, Mapping) and item.get("schemaVersion") == 1
+            else _replace_secret_values(item, secret_values)
             for key, item in value.items()
         }
     if isinstance(value, tuple):
@@ -144,12 +190,25 @@ def _is_secret_key(key: Any) -> bool:
 
 
 def _redact_string(value: str) -> str:
-    redacted = _BEARER_RE.sub("Bearer [REDACTED]", value)
+    # Only canonical UUID/numeric Graph identities are protected. Their user:0
+    # suffix is provenance, not a connection credential (including in JSON text).
+    placeholder = "__GRAPH_MESSAGE_ID__"
+    while placeholder in value:
+        placeholder += "_"
+    identities: list[str] = []
+    def protect_identity(match: re.Match[str]) -> str:
+        identities.append(match.group(0))
+        return f"{placeholder}{len(identities) - 1}__"
+    redacted = _GRAPH_USER_MESSAGE_ID_RE.sub(protect_identity, value)
+    redacted = _BEARER_RE.sub("Bearer [REDACTED]", redacted)
     redacted = _SECRET_PAIR_RE.sub(r"\1\2[REDACTED]", redacted)
     redacted = _CONNECTION_PAIR_RE.sub(r"\1\2[REDACTED]", redacted)
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]:[REDACTED]@", redacted)
     redacted = _WINDOWS_PATH_RE.sub("[REDACTED_PATH]", redacted)
-    return _UNIX_SENSITIVE_PATH_RE.sub("[REDACTED_PATH]", redacted)
+    redacted = _UNIX_SENSITIVE_PATH_RE.sub("[REDACTED_PATH]", redacted)
+    for index, identity in enumerate(identities):
+        redacted = redacted.replace(f"{placeholder}{index}__", identity)
+    return redacted
 
 
 def _is_non_string_sequence(value: Any) -> bool:

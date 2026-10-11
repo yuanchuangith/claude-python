@@ -446,6 +446,7 @@ class McpProxy:
         secret_store: McpSecretResolver,
         *,
         allowed_stdio_paths: Sequence[Path] = (),
+        allowed_stdio_roots: Sequence[Path] = (),
         allowed_http_urls: Sequence[str] = (),
     ) -> None:
         parsed_servers = [McpServerConfig.model_validate(item) for item in servers]
@@ -464,7 +465,10 @@ class McpProxy:
             self._validate_stdio_executable(item) for item in allowed_stdio_paths
         )
         self._allowed_stdio_roots = tuple(
-            sorted({item.parent for item in self._allowed_stdio_executables})
+            sorted(
+                {item.parent for item in self._allowed_stdio_executables}
+                | {self._validate_stdio_directory(item) for item in allowed_stdio_roots}
+            )
         )
         self._allowed_http_urls = self._validate_http_urls(allowed_http_urls)
         self._servers = {item.id: item for item in parsed_servers}
@@ -798,6 +802,13 @@ class McpProxy:
         resolved = path.resolve(strict=True)
         if resolved not in self._allowed_stdio_executables:
             raise ValueError("stdio MCP executable is not explicitly allowlisted")
+
+    @staticmethod
+    def _validate_stdio_directory(path: Path) -> Path:
+        value = Path(path)
+        if not value.is_absolute() or not value.is_dir():
+            raise ValueError("stdio MCP directory allowlist entries must be existing absolute directories")
+        return value.resolve(strict=True)
 
     @staticmethod
     def _validate_stdio_executable(path: Path) -> Path:

@@ -90,6 +90,41 @@ def create_stdio_files(tmp_path):
     return root, command, server_script
 
 
+def test_separate_stdio_directory_allowlist_does_not_allow_executables(tmp_path):
+    _, command, _ = create_stdio_files(tmp_path)
+    project = tmp_path / "look"
+    project.mkdir()
+    script = project / "start.mjs"
+    script.write_text("// fixture", encoding="utf-8")
+    store, _ = make_secret_store(tmp_path)
+    config = stdio_config(command, script)
+    config["stdio"]["cwd"] = str(project)
+    with pytest.raises(ValueError, match="path is not allowlisted"):
+        McpProxy([config], store, allowed_stdio_paths=[command])
+    proxy = McpProxy([config], store, allowed_stdio_paths=[command], allowed_stdio_roots=[project])
+    parameters, _ = proxy._stdio_parameters(proxy._servers["local-mcp"])
+    assert Path(parameters.cwd) == project.resolve()
+    assert parameters.args == [str(script.resolve())]
+    config["stdio"]["command"] = str(script)
+    with pytest.raises(ValueError, match="executable is not explicitly allowlisted"):
+        McpProxy([config], store, allowed_stdio_paths=[command], allowed_stdio_roots=[project])
+
+
+def test_stdio_directory_allowlist_rejects_file_and_directory_escape(tmp_path):
+    _, command, _ = create_stdio_files(tmp_path)
+    project = tmp_path / "look"
+    project.mkdir()
+    outside = tmp_path / "outside.mjs"
+    outside.write_text("// fixture", encoding="utf-8")
+    store, _ = make_secret_store(tmp_path)
+    with pytest.raises(ValueError, match="existing absolute directories"):
+        McpProxy([], store, allowed_stdio_roots=[outside])
+    config = stdio_config(command, outside)
+    config["stdio"]["cwd"] = str(project)
+    with pytest.raises(ValueError, match="path is not allowlisted"):
+        McpProxy([config], store, allowed_stdio_paths=[command], allowed_stdio_roots=[project])
+
+
 def stdio_config(command: Path, server_script: Path):
     return {
         "id": "local-mcp",

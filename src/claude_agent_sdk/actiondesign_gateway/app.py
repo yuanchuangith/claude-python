@@ -1,6 +1,7 @@
 """FastAPI application for the thin ActionDesign model gateway."""
 
 from __future__ import annotations
+from .request_budget import prepare_provider_body, response_accounting
 
 import asyncio
 import hashlib
@@ -470,6 +471,7 @@ def create_app(
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
+        **({"allow_private_network": True} if gateway_settings.allow_private_network else {}),
     )
 
     @app.get(f"{API_PREFIX}/health", response_model=HealthResponse)
@@ -509,7 +511,7 @@ def create_app(
                 else gateway_settings.default_provider
             ),
             "defaultModel": default_route.model.id if default_route is not None else "",
-            "supportedProtocolVersions": [PROTOCOL_VERSION],
+            "supportedProtocolVersions": [PROTOCOL_VERSION, "1.1"],
             "providers": providers,
             "routingOrder": [
                 {
@@ -670,6 +672,7 @@ def create_app(
     @app.post(
         f"{API_PREFIX}/chat",
         response_model=AgentChatHttpResponse,
+        response_model_exclude_unset=True,
         dependencies=[Depends(_require_service_auth)],
     )
     async def generic_chat(
@@ -699,6 +702,7 @@ def create_app(
     @app.post(
         f"{API_PREFIX}/mimo/chat",
         response_model=AgentChatHttpResponse,
+        response_model_exclude_unset=True,
         dependencies=[Depends(_require_service_auth)],
     )
     async def mimo_chat(req: AgentChatRequest, request: Request, response: Response) -> dict[str, Any]:
@@ -707,6 +711,7 @@ def create_app(
     @app.post(
         f"{API_PREFIX}/claude-code/chat",
         response_model=AgentChatHttpResponse,
+        response_model_exclude_unset=True,
         dependencies=[Depends(_require_service_auth)],
     )
     async def claude_chat(req: AgentChatRequest, request: Request, response: Response) -> dict[str, Any]:
@@ -801,6 +806,7 @@ def create_app(
         _require_mcp_origin(request, gateway_settings)
         _require_stdio_mcp_server(mcp_server_store, server_id)
         _require_mcp_enabled(gateway_settings)
+        _require_mcp_config_version(request, mcp_server_store, server_id)
         proxy: McpProxy = request.app.state.mcp_proxy
         try:
             result = await proxy.list_tools(server_id)
@@ -851,6 +857,30 @@ def create_app(
             )
         }
 
+    @app.get(
+        f"{API_PREFIX}/mcp/{{server_id}}/connection-config",
+        response_model=dict[str, Any],
+        dependencies=[Depends(_require_service_auth)],
+    )
+    async def mcp_connection_config(
+        server_id: McpServerIdPath,
+        request: Request,
+        response: Response,
+    ) -> dict[str, Any]:
+        """Runtime-only projection using the existing session/client/service auth.
+
+        Unlike the management projection, this omits plaintext Secret bindings
+        and stdio commands. Final HTTP headers exist only for browser execution.
+        """
+        identity = resolve_correlation_identity(request, header_only=True)
+        _apply_correlation_headers(response, identity)
+        _require_mcp_origin(request, gateway_settings)
+        projected = browser_mcp_config.get_server(server_id)
+        if projected is None:
+            raise HTTPException(status_code=404, detail={"code": "MCP_SERVER_NOT_FOUND"})
+        response.headers["Cache-Control"] = "no-store"
+        return _browser_contract_projection(projected)
+
     @app.post(
         f"{API_PREFIX}/mcp/{{server_id}}/call",
         response_model=McpToolCallResponse,
@@ -868,6 +898,7 @@ def create_app(
         _require_mcp_origin(request, gateway_settings)
         _require_stdio_mcp_server(mcp_server_store, server_id)
         _require_mcp_enabled(gateway_settings)
+        _require_mcp_config_version(request, mcp_server_store, server_id)
         proxy: McpProxy = request.app.state.mcp_proxy
         try:
             result = await proxy.call_tool(server_id, req.tool_name, req.arguments)
@@ -1022,6 +1053,28 @@ def create_app(
                 status_code=401,
                 detail={"code": "ADMIN_LOGIN_FAILED"},
             )
+        return result
+
+    @app.post(
+        f"{API_PREFIX}/admin/local-session",
+        response_model=AdminLoginResponse,
+    )
+    async def admin_local_session(request: Request) -> dict[str, Any]:
+        """Issue a short admin session for the explicitly configured local CPM origin."""
+        _require_local_default_origin(request, gateway_settings)
+        if not gateway_settings.admin_password:
+            raise HTTPException(status_code=503, detail={"code": "ADMIN_LOGIN_DISABLED"})
+        actor = _audit_actor(request)
+        result, status = admin_sessions.login(gateway_settings.admin_password, actor=actor)
+        audit_logs.record(
+            action="admin_local_session",
+            success=result is not None,
+            actor=actor,
+            request_id=f"admin_local_{secrets.token_hex(8)}",
+            details={"result": status},
+        )
+        if result is None:
+            raise HTTPException(status_code=503, detail={"code": "ADMIN_LOCAL_SESSION_UNAVAILABLE"})
         return result
 
     @app.get(
@@ -2505,6 +2558,7 @@ def create_app(
             "profileAllowedHosts": sorted(set(gateway_settings.profile_allowed_hosts)),
             "providerPaths": {
                 "openai": "/v1/chat/completions",
+                "openai-responses": "/v1/responses",
                 "claude": "/v1/messages",
             },
             "retryPolicy": {
@@ -3355,7 +3409,7 @@ def create_app(
         offset: Annotated[int, Query(ge=0)] = 0,
         provider: Annotated[str, Query(max_length=64)] = "",
         profile_id: Annotated[str, Query(alias="profileId", max_length=64)] = "",
-        protocol: Annotated[str, Query(pattern=r"^(openai|claude)?$")] = "",
+        protocol: Annotated[str, Query(pattern=r"^(openai|claude|openai-responses)?$")] = "",
         status: Annotated[str, Query(pattern=r"^(success|error|cancelled)?$")] = "",
         conversation_id: Annotated[str, Query(alias="conversationId", max_length=128)] = "",
         request_id: Annotated[str, Query(alias="requestId", max_length=256)] = "",
@@ -3632,6 +3686,8 @@ async def _chat(
             )
         except HTTPException as exc:
             safe_exc = _sanitized_provider_exception(exc, secret_values)
+            if routed_request.protocol_version != "1.1" and isinstance(safe_exc.detail, dict):
+                safe_exc.detail.pop("budget", None)
             detail = _error_detail(safe_exc)
             profiles.record_health(
                 route.profile.id,
@@ -4002,14 +4058,21 @@ async def _call_route(
     req: AgentChatRequest,
     profile: ProviderProfile,
 ) -> dict[str, Any]:
-    return await call_provider(req, profile)
+    prepare_provider_body(req, profile, False)
+    return response_accounting(req, profile, await call_provider(req, profile))
 
 
 def _stream_route(
     req: AgentChatRequest,
     profile: ProviderProfile,
 ) -> AsyncIterator[dict[str, Any]]:
-    return stream_provider(req, profile)
+    async def accounted():
+        prepare_provider_body(req, profile, True)
+        async for event in stream_provider(req, profile):
+            if event.get("kind") == "completed":
+                event = {**event, "payload": response_accounting(req, profile, event["payload"])}
+            yield event
+    return accounted()
 
 
 def _next_route_index(
@@ -4150,8 +4213,10 @@ def _sse_envelope(
     payload: dict[str, Any],
 ) -> str:
     event_payload = dict(payload)
+    if req.protocol_version != "1.1":
+        event_payload.pop("budget", None)
     envelope = GatewayEventEnvelope.model_validate({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": req.protocol_version,
         "sequence": sequence,
         "conversationId": req.conversation_id,
         "runId": req.run_id,
@@ -4161,7 +4226,7 @@ def _sse_envelope(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "type": event_type,
         "payload": event_payload,
-    }).model_dump(mode="json", by_alias=True)
+    }).model_dump(mode="json", by_alias=True, exclude_unset=True)
     return f"data: {json.dumps(envelope, ensure_ascii=False)}\n\n"
 
 
@@ -4278,6 +4343,7 @@ def _error_detail(exc: Exception) -> dict[str, Any]:
         return {
             "code": str(detail.get("code", "GATEWAY_ERROR")),
             "message": str(message),
+            **({"budget": detail["budget"]} if detail.get("code") == "CONTEXT_BUDGET_EXCEEDED" and isinstance(detail.get("budget"), dict) else {}),
         }
     return {
         "code": "GATEWAY_ERROR",
@@ -4323,6 +4389,7 @@ def _settings_secret_values(settings: Settings) -> tuple[str, ...]:
             settings.admin_password,
             settings.service_auth_token,
             settings.langsmith_api_key,
+            settings.local_default_client_api_key,
         )
         if value
     )
@@ -4399,6 +4466,15 @@ def _require_service_auth(
             or client_api_keys.verify(browser_api_key) is not None
         ):
             return
+    if (
+        settings.local_default_client_api_key
+        and not service_token
+        and not browser_api_key
+        and not authorization
+        and not request.headers.get("x-api-key")
+    ):
+        _require_client_api_key(request)
+        return
     api_keys = request.app.state.browser_api_keys
     if (
         settings.service_auth_mode == "disabled"
@@ -4409,6 +4485,23 @@ def _require_service_auth(
         status_code=401,
         detail={"code": "GATEWAY_SERVICE_AUTH_REQUIRED"},
     )
+
+
+def _local_default_client_key(request: Request) -> str:
+    settings: Settings = request.app.state.settings
+    if (
+        not settings.local_default_client_api_key
+        or request.headers.get("Origin") != settings.local_default_client_origin
+        or request.headers.get(SERVICE_AUTH_HEADER)
+        or not request.url.path.startswith(f"{API_PREFIX}/")
+        or request.url.path.startswith(f"{API_PREFIX}/admin/")
+    ):
+        return ""
+    try:
+        is_loopback = bool(request.client) and ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        return ""
+    return settings.local_default_client_api_key if is_loopback else ""
 
 
 def _require_client_api_key(request: Request) -> dict[str, Any]:
@@ -4431,6 +4524,10 @@ def _require_client_api_key(request: Request) -> dict[str, Any]:
         )
         if value
     ]
+    if not candidates:
+        default_key = _local_default_client_key(request)
+        if default_key:
+            candidates.append(default_key)
     if not candidates or any(value != candidates[0] for value in candidates[1:]):
         raise HTTPException(
             status_code=401,
@@ -4505,6 +4602,24 @@ def _require_admin_origin(request: Request, settings: Settings) -> None:
         )
 
 
+def _require_local_default_origin(request: Request, settings: Settings) -> None:
+    origin = request.headers.get("Origin", "").rstrip("/")
+    client_host = request.client.host if request.client else ""
+    try:
+        is_loopback = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        is_loopback = client_host == "localhost"
+    if (
+        not settings.local_default_client_api_key
+        or not settings.local_default_client_origin
+        or origin != settings.local_default_client_origin.rstrip("/")
+        or not is_loopback
+    ):
+        raise HTTPException(status_code=403, detail={"code": "ADMIN_LOCAL_SESSION_NOT_ALLOWED"})
+    if request.app.state.client_api_keys.verify(settings.local_default_client_api_key) is None:
+        raise HTTPException(status_code=403, detail={"code": "ADMIN_LOCAL_SESSION_NOT_ALLOWED"})
+
+
 def _require_mcp_origin(request: Request, settings: Settings) -> None:
     origin = request.headers.get("Origin", "").rstrip("/")
     if not origin:
@@ -4546,6 +4661,36 @@ def _prepare_browser_mcp_request(
         )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
+
+
+def _require_mcp_config_version(
+    request: Request, store: McpServerStore, server_id: str
+) -> None:
+    """Refuse a stale Step binding before dispatch; in-flight calls keep their proxy.
+
+    Older clients may omit the header. New clients pin every tools/list and call
+    so a configuration replacement or Secret rotation cannot silently reroute it.
+    """
+    expected = request.headers.get("X-MCP-Config-Version")
+    if expected is None:
+        return
+    if (
+        not expected.isascii()
+        or not expected.isdecimal()
+        or len(expected) > 10
+        or int(expected) < 1
+    ):
+        raise HTTPException(status_code=422, detail={"code": "MCP_CONFIG_VERSION_INVALID"})
+    current = store.effective_version(server_id)
+    if int(expected) != current:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MCP_CONFIG_VERSION_CONFLICT",
+                "expected": int(expected),
+                "current": current,
+            },
+        )
 
 
 def _require_stdio_mcp_server(
@@ -4723,6 +4868,7 @@ def _build_mcp_proxy(
             for path in settings.mcp_allowed_executable_paths
         },
         allowed_http_urls=settings.mcp_allowed_http_urls,
+        allowed_stdio_roots=[FilePath(path) for path in settings.mcp_allowed_directory_paths],
     )
 
 

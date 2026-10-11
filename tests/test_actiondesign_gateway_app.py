@@ -236,6 +236,36 @@ def test_service_auth_is_explicit_and_protects_sensitive_transport_routes(tmp_pa
     assert preflight.status_code == 200
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_private_network_preflight_requires_opt_in_and_allowed_origin(tmp_path, enabled):
+    origin = "http://cpm.rongchang.gxp2.com:51124"
+    client = make_client(tmp_path, allow_origins=[origin], allow_private_network=enabled)
+    headers = {
+        "Origin": origin,
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization",
+        "Access-Control-Request-Private-Network": "true",
+    }
+    response = client.options("/api/actiondesign-agent/models", headers=headers)
+    assert response.status_code == (200 if enabled else 400)
+    if enabled:
+        assert response.headers["access-control-allow-origin"] == origin
+        assert response.headers["access-control-allow-private-network"] == "true"
+    rejected = client.options(
+        "/api/actiondesign-agent/models",
+        headers={**headers, "Origin": "http://untrusted.example"},
+    )
+    assert rejected.status_code == 400
+    assert "access-control-allow-origin" not in rejected.headers
+    assert client.get("/api/actiondesign-agent/models", headers={"Origin": origin}).status_code == 401
+
+
+@pytest.mark.parametrize("origins", [[], ["*"]])
+def test_private_network_access_rejects_unrestricted_origins(tmp_path, origins):
+    with pytest.raises(ValidationError, match="must be explicit"):
+        make_settings(tmp_path, allow_origins=origins, allow_private_network=True)
+
+
 def test_service_auth_openapi_covers_only_sensitive_transport_routes(tmp_path):
     schema = make_client(tmp_path).get("/openapi.json").json()
     assert schema["info"]["version"] == "3.1.0"
@@ -1701,6 +1731,25 @@ def test_langsmith_disabled_does_not_block_agent_telemetry(tmp_path):
     assert session_events[0]["type"] == "trace"
     assert session_events[0]["trace"]["eventId"] == "event_1"
     assert session_events[0]["trace"]["metadata"]["conversationId"] == CONVERSATION_ID
+
+    # Graph/tool events do not necessarily correspond to an HTTP model request.
+    graph_event = {key: value for key, value in trace_event.items() if key != "requestId"}
+    graph_batch = {**batch, "events": [graph_event]}
+    graph_response = make_client(tmp_path).post(
+        "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
+        headers=identity_headers(graph_batch), json=graph_batch,
+    )
+    assert graph_response.status_code == 200, graph_response.json()
+    invalid_event_batch = {**batch, "events": [{**graph_event, "requestId": "provider-event-1"}]}
+    assert make_client(tmp_path).post(
+        "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
+        headers=identity_headers(invalid_event_batch), json=invalid_event_batch,
+    ).status_code == 422
+    missing_batch_identity = {key: value for key, value in graph_batch.items() if key != "requestId"}
+    assert make_client(tmp_path).post(
+        "/api/actiondesign-agent/telemetry/langsmith/runs/batch",
+        headers=identity_headers(graph_batch), json=missing_batch_identity,
+    ).status_code == 422
 
 
 def test_langsmith_batch_requires_canonical_runtime_identity(tmp_path):
