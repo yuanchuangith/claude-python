@@ -1,0 +1,14 @@
+.env
+.runtime-mode
+.venv/
+**/__pycache__/
+**/.pytest_cache/
+!backend/uv.lock
+!.env.example
+data/
+backups/
+*.log
+runtime/
+frontend/node_modules/
+frontend/dist/
+

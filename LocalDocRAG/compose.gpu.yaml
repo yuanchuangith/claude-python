@@ -1,0 +1,12 @@
+services:
+  api:
+    environment:
+      GPU_MODE: gpu
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

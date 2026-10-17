@@ -1,0 +1,39 @@
+{
+  "kind": "real_native_diagnostic_after_repository_move",
+  "backend_repository": "F:\\Desktop\\plan\\claude-python\\LocalDocRAG",
+  "frontend_repository": "F:\\Desktop\\plan\\component\\tools\\local-doc-rag",
+  "home_status": 200,
+  "health": {
+    "status": "ok",
+    "ready": false,
+    "version": "1.0.0"
+  },
+  "status": {
+    "sqlite": "ready",
+    "mode": "auto",
+    "gpu_status": "检测失败",
+    "models": [],
+    "ollama": "unavailable",
+    "qdrant": "unavailable",
+    "free_bytes": 66283720704,
+    "queue": [],
+    "profile": null,
+    "settings": {
+      "chat_model": "qwen3:4b",
+      "vision_model": "qwen3-vl:2b",
+      "embedding_model": "qwen3-embedding:0.6b",
+      "context_length": 4096,
+      "ocr": true,
+      "caption": true
+    },
+    "warnings": [
+      "无法连接本地 Ollama 或调用超时，请查看诊断并重试。",
+      "本地 Qdrant 尚未就绪或索引写入失败，请检查服务后重试。"
+    ],
+    "jobs": [],
+    "ocr": "CPU / rapidocr",
+    "docker": "原生开发模式，Docker状态由启动脚本检查"
+  },
+  "write_without_local_header": 403,
+  "models_mocked": false
+}

@@ -3,6 +3,8 @@ from .request_budget import prepare_provider_body
 
 import json
 import time
+import math
+from email.utils import parsedate_to_datetime
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -14,6 +16,7 @@ from jsonschema import Draft202012Validator
 from .models import AgentChatResponse, DiscoveredProviderModel
 from .profile_store import ProviderProfile
 from .reasoning import compatible_reasoning, reasoning_payload
+from .system_log import SystemLogHttpClient, provider_log_hooks
 
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
 _OPENAI_CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
@@ -88,9 +91,16 @@ def _normalize_fixed_provider_url(
 
 
 def _provider_http_client(profile: ProviderProfile) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
+    hooks = provider_log_hooks(profile)
+    if not hooks:
+        return httpx.AsyncClient(
+            timeout=profile.timeout_seconds,
+            follow_redirects=False,
+        )
+    return SystemLogHttpClient(
         timeout=profile.timeout_seconds,
         follow_redirects=False,
+        event_hooks=hooks,
     )
 
 
@@ -231,6 +241,8 @@ def _apply_anthropic_tools(body: dict[str, Any], req: Any) -> None:
             "type": "enabled",
             "budget_tokens": thinking.budget_tokens,
         }
+    elif thinking is not None and thinking.type == "disabled":
+        body["thinking"] = {"type": "disabled"}
 
 
 def _apply_openai_tools(body: dict[str, Any], req: Any) -> None:
@@ -1189,6 +1201,7 @@ def _upstream_error(
     *,
     retryable: bool | None = None,
     failover_scope: str = "none",
+    retry_after_ms: int | None = None,
 ) -> HTTPException:
     if retryable is None:
         retryable = code in {
@@ -1207,7 +1220,9 @@ def _upstream_error(
             "message": message,
             "retryable": retryable,
             "failoverScope": failover_scope,
+            **({"retryAfterMs": retry_after_ms} if retry_after_ms is not None else {}),
         },
+        headers={"Retry-After": str(math.ceil(retry_after_ms / 1000))} if retry_after_ms is not None else None,
     )
 
 
@@ -1230,6 +1245,7 @@ def _provider_http_error(exc: httpx.HTTPStatusError) -> HTTPException:
             "Provider rate limit exceeded",
             retryable=True,
             failover_scope="model",
+            retry_after_ms=_retry_after_ms(exc.response.headers.get("Retry-After")),
         )
     if status in {400, 413} and any(
         marker in normalized_body
@@ -1268,3 +1284,13 @@ def _provider_http_error(exc: httpx.HTTPStatusError) -> HTTPException:
             failover_scope="model",
         )
     return _upstream_error(502, "PROVIDER_HTTP_ERROR", f"Provider HTTP {status}")
+
+
+def _retry_after_ms(value: str | None) -> int | None:
+    if not value or len(value) > 128:
+        return None
+    try:
+        seconds = float(value) if value.strip().replace(".", "", 1).isdigit() else parsedate_to_datetime(value).timestamp() - time.time()
+        return min(86_400_000, math.ceil(seconds * 1000)) if math.isfinite(seconds) and seconds >= 0 else None
+    except (ValueError, TypeError, OverflowError):
+        return None

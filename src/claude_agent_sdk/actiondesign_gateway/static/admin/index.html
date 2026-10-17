@@ -15,6 +15,7 @@
         <button class="nav-item active" data-view="channels"><span>◫</span>渠道</button>
         <button class="nav-item" data-view="models"><span>◇</span>模型</button>
         <button class="nav-item" data-view="secrets"><span>⌁</span>Secret</button>
+        <button class="nav-item" data-view="system"><span>▤</span>系统日志</button>
         <button class="nav-item" data-view="requests"><span>↔</span>请求日志</button>
         <button class="nav-item" data-view="conversations"><span>◌</span>完整会话</button>
         <button class="nav-item" data-view="audit"><span>≡</span>系统审计</button>
@@ -29,7 +30,7 @@
       </header>
 
       <section id="login-panel" class="login-panel">
-        <div><span class="eyebrow">ADMIN SESSION</span><h2>登录管理中心</h2><p>管理员 Bearer 会话仅保存在当前页面内存中；退出或失效后立即清空管理数据。</p></div>
+        <div><span class="eyebrow">ADMIN SESSION</span><h2>登录管理中心</h2><p>刷新页面自动恢复登录，使用期间自动续期；主动退出后清除登录状态。</p></div>
         <form id="login-form" class="login-form" autocomplete="off"><label>管理密码<input id="admin-password" type="password" required maxlength="8192" autocomplete="current-password" placeholder="管理密码"></label><button class="primary-btn" type="submit">登录</button></form>
       </section>
 
@@ -207,6 +208,22 @@
           <div id="revealed-client-key" class="revealed-key hidden"><span>测试阶段：完整 Key 持续显示到刷新、退出或手动清除</span><code id="revealed-client-key-value"></code><div class="row-actions"><button id="copy-client-key" class="secondary-btn" type="button">复制</button><button id="clear-client-key" class="ghost-btn" type="button">清除</button></div></div>
         </div>
 
+      </section>
+
+      <section id="view-system" class="view">
+        <div class="panel">
+          <div class="panel-head"><div><h2>系统日志 · 请求与返回明文</h2><p id="system-log-state">查看网关收到的全部 HTTP 请求和模型服务调用，包括原始请求头、全部参数、正文和返回内容。日志查看与清空接口自身不采集，浏览器直连 MCP 不经过网关。</p></div><div class="row-actions"><button id="refresh-system-logs" class="secondary-btn">刷新</button><button id="clear-system-logs" class="secondary-btn" type="button">清空全部日志</button></div></div>
+          <form id="system-log-filters" class="filters wide">
+            <input id="system-q" placeholder="全文搜索：地址 / 参数 / 请求 / 返回">
+            <select id="system-direction"><option value="">全部方向</option><option value="inbound">客户端 → 网关</option><option value="outbound">网关 → 模型服务</option></select>
+            <select id="system-method"><option value="">全部方法</option><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>OPTIONS</option><option>HEAD</option></select>
+            <input id="system-status" type="number" min="0" max="599" placeholder="HTTP 状态码">
+            <input id="system-request" placeholder="requestId"><input id="system-conversation" placeholder="conversationId"><input id="system-run" placeholder="runId"><input id="system-provider" placeholder="渠道"><input id="system-model" placeholder="模型">
+            <input id="system-start" type="datetime-local" title="开始时间"><input id="system-end" type="datetime-local" title="结束时间">
+            <label class="inline-check">仅错误<input id="system-errors" type="checkbox"></label><label class="inline-check">每 5 秒刷新<input id="system-auto" type="checkbox" checked></label><button class="secondary-btn" type="submit">筛选</button>
+          </form>
+          <div class="table-wrap"><table><thead><tr><th>时间 / ID</th><th>方向</th><th>方法 / 地址</th><th>状态</th><th>模型 / 标识</th><th>耗时</th><th></th></tr></thead><tbody id="system-logs-body"></tbody></table></div><div id="system-log-pages" class="pager"></div>
+        </div>
       </section>
 
       <section id="view-requests" class="view">

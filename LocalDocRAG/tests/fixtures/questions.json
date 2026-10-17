@@ -1,0 +1,50 @@
+[
+  {
+    "question": "管理人员的培训周期？",
+    "expected": "6个月"
+  },
+  {
+    "question": "管理人员合格分数？",
+    "expected": "90分"
+  },
+  {
+    "question": "生产人员培训周期？",
+    "expected": "12个月"
+  },
+  {
+    "question": "合格分数最低的岗位？",
+    "expected": "80分"
+  },
+  {
+    "question": "培训记录需要关联什么？",
+    "expected": "受控文件的有效版本"
+  },
+  {
+    "question": "图中的审批失败后会发生什么？",
+    "expected": "退回"
+  },
+  {
+    "question": "ABC-2048 的检查周期？",
+    "expected": "30"
+  },
+  {
+    "question": "文档中有没有关于年假天数的规定？",
+    "expected": "没有足够信息"
+  },
+  {
+    "question": "生产人员合格分数？",
+    "expected": "80分"
+  },
+  {
+    "question": "管理人员与生产人员的周期分别是多少？",
+    "expected": "6个月"
+  },
+  {
+    "question": "管理人员与生产人员谁合格分数更高？",
+    "expected": "管理人员"
+  },
+  {
+    "question": "管理人员合格线是否为80分？",
+    "expected": "90分"
+  }
+]

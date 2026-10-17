@@ -26,6 +26,7 @@ if (-not (Test-Path -LiteralPath $configPath)) {
         ACTIONDESIGN_SERVICE_AUTH_MODE = 'required'
         ACTIONDESIGN_SERVICE_AUTH_TOKEN = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
         ACTIONDESIGN_ADMIN_PASSWORD = ([guid]::NewGuid().ToString('N'))
+        ACTIONDESIGN_ADMIN_SESSION_TTL_SECONDS = '86400'
         ACTIONDESIGN_AGENT_ALLOW_ORIGINS = ($origins -join ',')
         ACTIONDESIGN_PROFILE_STORE_PATH = 'logs/local/config/api-profiles.json'
         ACTIONDESIGN_PROFILE_SECRET_STORE_PATH = 'logs/local/config/api-profile-secrets.json'
@@ -34,6 +35,8 @@ if (-not (Test-Path -LiteralPath $configPath)) {
         ACTIONDESIGN_BROWSER_API_KEY_STORE_PATH = 'logs/local/config/browser-api-key.json'
         ACTIONDESIGN_CLIENT_API_KEY_STORE_PATH = 'logs/local/config/client-api-keys.json'
         ACTIONDESIGN_AGENT_LOG_ROOT = 'logs/local/debug'
+        ACTIONDESIGN_SYSTEM_LOG_ENABLED = 'true'
+        ACTIONDESIGN_SYSTEM_LOG_PATH = 'logs/local/system-logs.sqlite3'
     } | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding utf8
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json

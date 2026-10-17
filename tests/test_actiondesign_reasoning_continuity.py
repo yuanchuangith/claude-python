@@ -163,6 +163,20 @@ def test_native_state_exact_roundtrip_and_route_isolation(protocol):
         )
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_disabled_claude_thinking_preserves_signed_tool_history(stream):
+    native = state("claude")
+    req = request(messages=history(native), thinking={"type": "disabled"})
+
+    wire = provider_http.request_body(req, profile("claude"), stream)
+
+    assert wire["thinking"] == {"type": "disabled"}
+    assert wire["messages"][1]["content"][:2] == native["blocks"]
+    assert wire["messages"][1]["content"][2]["id"] == "call-1"
+    assert wire["messages"][2]["content"][0]["tool_use_id"] == "call-1"
+    assert req.messages[1].reasoning.model_dump(by_alias=True, exclude_none=True) == native
+
+
 def test_signed_and_encrypted_state_survives_log_redaction_but_secrets_do_not(tmp_path):
     for protocol in ["claude", "openai", "openai-responses"]:
         value = {"reasoning": state(protocol)}

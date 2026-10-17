@@ -1,0 +1,10 @@
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+frontend/dist
+frontend/node_modules
+data
+backups
+.env
+.runtime-mode

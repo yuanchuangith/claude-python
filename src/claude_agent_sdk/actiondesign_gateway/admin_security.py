@@ -74,6 +74,24 @@ class AdminSessionStore:
             expires_at = self._sessions.get(token)
             return bool(expires_at and expires_at > now)
 
+    def renew(self, token: str) -> dict[str, Any] | None:
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            if not token or token not in self._sessions:
+                return None
+            expires_at = now + self._ttl_seconds
+            self._sessions[token] = expires_at
+        return {
+            "sessionToken": token,
+            "expiresAt": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            "expiresInSeconds": self._ttl_seconds,
+        }
+
+    def revoke(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
     def _prune(self, now: float) -> None:
         for token in [
             item for item, expires_at in self._sessions.items() if expires_at <= now

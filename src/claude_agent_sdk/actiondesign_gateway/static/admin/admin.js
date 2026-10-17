@@ -13,6 +13,8 @@ const state = {
   sessionToken: "",
   sessionExpiresAt: "",
   sessionEpoch: 0,
+  sessionRefreshTimer: 0,
+  sessionRefresh: null,
   controllers: new Set(),
   profiles: [],
   models: null,
@@ -30,6 +32,8 @@ const state = {
   auditPage: 1,
   conversationPage: 1,
   requestPage: 1,
+  systemLogPage: 1,
+  systemLogsLoading: false,
   conversationDetail: null,
 };
 
@@ -106,8 +110,11 @@ async function api(path, options = {}, admin = true) {
   let payload = null;
   try { payload = await response.json(); } catch { payload = null; }
   if (!response.ok) {
-    if (response.status === 401 && admin) logout(false);
-    throw new Error(errorMessage(payload, response));
+    const error = new Error(errorMessage(payload, response));
+    error.status = response.status;
+    error.code = payload?.detail?.code;
+    if (response.status === 401 && admin && error.code === "PROFILE_ADMIN_AUTH_REQUIRED" && epoch === state.sessionEpoch) logout(false);
+    throw error;
   }
   if (admin && epoch !== state.sessionEpoch) throw new Error("");
   return payload;
@@ -211,6 +218,7 @@ function clearSensitiveUi() {
 }
 
 function logout(notify = true) {
+  clearTimeout(state.sessionRefreshTimer);
   state.sessionEpoch += 1;
   state.controllers.forEach((controller) => controller.abort());
   state.controllers.clear();
@@ -232,17 +240,65 @@ function logout(notify = true) {
   if (notify) showNotice("管理会话已退出");
 }
 
+function acceptAdminSession(result) {
+  state.sessionToken = result.sessionToken;
+  state.sessionExpiresAt = result.expiresAt;
+  clearTimeout(state.sessionRefreshTimer);
+  state.sessionRefreshTimer = setTimeout(() => refreshAdminSession(),
+    Math.min(600000, Math.max(30000, result.expiresInSeconds * 1000 / 3)));
+  updateSessionUi();
+}
+
+async function refreshAdminSession(restore = false) {
+  if (state.sessionRefresh) return state.sessionRefresh;
+  const epoch = state.sessionEpoch;
+  const headers = { "X-ActionDesign-Admin-Session": "1" };
+  if (state.sessionToken) headers.Authorization = `Bearer ${state.sessionToken}`;
+  state.sessionRefresh = (async () => {
+    try {
+      const result = await api("/admin/session", { method: "POST", headers }, false);
+      if (epoch !== state.sessionEpoch) return;
+      if (!state.sessionToken) state.sessionEpoch += 1;
+      acceptAdminSession(result);
+      if (restore) await loadChannels();
+    } catch (error) {
+      if (epoch !== state.sessionEpoch) return;
+      if (error.status === 401) {
+        const wasLoggedIn = Boolean(state.sessionToken);
+        if (wasLoggedIn) {
+          logout(false);
+          showNotice("管理会话已过期或服务已重启，请重新登录", "error");
+        }
+      } else if (state.sessionToken) {
+        state.sessionRefreshTimer = setTimeout(() => refreshAdminSession(), 30000);
+      }
+    } finally { state.sessionRefresh = null; }
+  })();
+  return state.sessionRefresh;
+}
+
+async function logoutAdminSession() {
+  const headers = { "X-ActionDesign-Admin-Session": "1", Authorization: `Bearer ${state.sessionToken}` };
+  // Clear displayed data and cancel work immediately; revoke the server cookie next.
+  logout(false);
+  try {
+    await api("/admin/session", { method: "DELETE", headers }, false);
+    showNotice("管理会话已退出");
+  } catch (error) { showError("页面已退出，服务端会话注销未完成，请恢复连接后重试", error); }
+}
+
 async function login(event) {
   event.preventDefault();
   const password = $("admin-password").value;
   try {
+    // Finish bootstrap before issuing a new cookie so an older 401 response
+    // cannot delete the newly established login.
+    if (state.sessionRefresh) await state.sessionRefresh;
     const result = await api("/admin/login", { method: "POST", body: JSON.stringify({ password }) }, false);
     state.sessionEpoch += 1;
-    state.sessionToken = result.sessionToken;
-    state.sessionExpiresAt = result.expiresAt;
+    acceptAdminSession(result);
     $("admin-password").value = "";
-    updateSessionUi();
-    showNotice("管理会话已建立；凭据仅保存在当前页面内存");
+    showNotice("已登录；刷新页面会恢复会话，使用期间自动续期");
     await loadChannels();
   } catch (error) {
     $("admin-password").value = "";
@@ -264,7 +320,7 @@ async function loadChannels() {
   if (!state.sessionToken) return;
   const [profilesResult, modelsResult, healthResult, policyResult] = await Promise.allSettled([
     api("/admin/providers"),
-    api("/models", {}, false),
+    api("/models"),
     api("/admin/channels/health"),
     api("/admin/runtime-policy"),
   ]);
@@ -1312,6 +1368,102 @@ async function loadAudit(page = state.auditPage) {
   } catch (error) { showError("审计日志加载失败", error); }
 }
 
+function systemLogQuery(page) {
+  const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String((page - 1) * PAGE_SIZE) });
+  for (const [id, key] of [["system-q", "q"], ["system-direction", "direction"], ["system-method", "method"], ["system-status", "status"], ["system-request", "requestId"], ["system-conversation", "conversationId"], ["system-run", "runId"], ["system-provider", "provider"], ["system-model", "model"]]) {
+    const value = $(id).value.trim(); if (value) query.set(key, value);
+  }
+  if ($("system-start").value) query.set("startedAt", toIso($("system-start").value));
+  if ($("system-end").value) query.set("endedAt", toIso($("system-end").value));
+  if ($("system-errors").checked) query.set("errorsOnly", "true");
+  return query;
+}
+
+async function loadSystemLogs(page = state.systemLogPage) {
+  if (!state.sessionToken || state.systemLogsLoading) return;
+  state.systemLogsLoading = true;
+  try {
+    const result = await api(`/admin/system-logs?${systemLogQuery(page)}`);
+    state.systemLogPage = page;
+    $("system-log-state").textContent = result.enabled
+      ? `明文采集已开启 · 共 ${result.total} 条匹配记录 · 包含原始请求头、全部参数、正文和返回内容（含 SSE）。浏览器直连 MCP 不经过网关。`
+      : "明文采集未开启。设置 ACTIONDESIGN_SYSTEM_LOG_ENABLED=true 并重启网关后开始记录；历史记录仍可查看。";
+    const tbody = $("system-logs-body");
+    if (!result.items.length) emptyRow(tbody, 7, "暂无匹配日志；新请求会自动记录");
+    else tbody.replaceChildren(...result.items.map((item) => {
+      const row = element("tr");
+      const identity = td(); identity.append(element("div", "", formatTime(item.timestamp)), element("div", "subtle mono", item.id));
+      const url = td(); url.append(badge(item.method), element("div", "mono", item.url));
+      const status = td(); status.append(badge(item.status || (item.error ? "网络错误" : "进行中"), item.status >= 400 || item.error ? "red" : "green"));
+      if (item.error) status.append(element("div", "error-text", item.error));
+      const metadata = td(); metadata.append(element("div", "", `${item.provider || ""} ${item.model || ""}`), element("div", "subtle mono", item.requestId), element("div", "subtle mono", item.conversationId));
+      const actions = td(); const view = element("button", "link-btn", "请求 / 返回");
+      view.addEventListener("click", () => showSystemLog(item.id)); actions.append(view);
+      row.append(identity, td(item.direction === "outbound" ? "网关 → 模型服务" : "客户端 → 网关"), url, status, metadata, td(`${item.durationMs} ms`), actions);
+      return row;
+    }));
+    makePager($("system-log-pages"), page, result.total, loadSystemLogs);
+  } catch (error) { showError("系统日志加载失败", error); }
+  finally { state.systemLogsLoading = false; }
+}
+
+// Deliberately bypass the metadata viewer's redaction/truncation for this
+// authenticated, explicitly enabled plaintext debugging view. Use textContent.
+function systemLogPre(value) {
+  const pre = element("pre", "json-view");
+  pre.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return pre;
+}
+
+async function showSystemLog(logId) {
+  try {
+    const record = await api(`/admin/system-logs/${encodeURIComponent(logId)}`);
+    state.conversationDetail = null;
+    $("dialog-title").textContent = `系统日志 · ${record.method} ${record.path}`;
+    const body = $("dialog-body");
+    body.replaceChildren(keyValueGrid([["日志 ID", record.id], ["父请求日志 ID", record.parentId], ["请求地址", record.url], ["状态", record.status || "进行中"], ["耗时", `${record.durationMs} ms`], ["返回已完整接收", record.complete ? "是" : "否（进行中、断线或错误）"], ["错误", record.error]]));
+    const actions = element("div", "row-actions");
+    const refresh = element("button", "secondary-btn", "刷新详情"); refresh.addEventListener("click", () => showSystemLog(logId));
+    const copy = element("button", "secondary-btn", "复制完整日志 JSON"); copy.addEventListener("click", async () => {
+      try { await copyText(JSON.stringify(record, null, 2)); showNotice("完整日志已复制"); } catch (error) { showError("复制失败", error); }
+    });
+    const related = element("button", "secondary-btn", "查看关联模型调用"); related.addEventListener("click", async () => {
+      try {
+        const result = await api(`/admin/system-logs?parentId=${encodeURIComponent(record.parentId || record.id)}&limit=100`);
+        const group = element("div");
+        if (!result.items.length) group.append(element("p", "subtle", "此请求暂无关联模型调用。"));
+        for (const item of result.items) {
+          const button = element("button", "link-btn", `${item.method} ${item.url} · ${item.status || "进行中"}`);
+          button.addEventListener("click", () => showSystemLog(item.id)); group.append(button, element("br"));
+        }
+        body.append(group);
+      } catch (error) { showError("关联调用加载失败", error); }
+    });
+    actions.append(refresh, copy, related); body.append(actions);
+    if (record.traceback) body.append(element("h3", "section-title", "异常堆栈"), systemLogPre(record.traceback));
+    for (const [label, part] of [["请求", record.request], ["返回", record.response]]) {
+      body.append(element("h3", "section-title", label));
+      const headers = element("details", "event-details");
+      headers.append(element("summary", "", `${label}头${label === "请求" ? " / 查询参数" : ""} · 展开查看全部`), systemLogPre(Object.fromEntries(Object.entries(part || {}).filter(([key]) => key !== "body"))));
+      body.append(headers);
+      if (part?.body) body.append(element("h3", "section-title", `${label}正文 · ${part.body.bytes} bytes · ${part.body.encoding}`), systemLogPre(part.body.json ?? part.body.text));
+    }
+    $("dialog-pages").classList.add("hidden");
+    if (!$("detail-dialog").open) $("detail-dialog").showModal();
+  } catch (error) { showError("系统日志详情加载失败", error); }
+}
+
+async function clearSystemLogs() {
+  if (!confirm("确定清空全部系统日志？所有请求与返回明文将被删除，无法恢复。进行中的请求结束后会继续记录。")) return;
+  try {
+    const result = await api("/admin/system-logs", { method: "DELETE" });
+    $("dialog-body").replaceChildren();
+    if ($("detail-dialog").open) $("detail-dialog").close();
+    showNotice(`已清空 ${result.deleted} 条系统日志`);
+    await loadSystemLogs(1);
+  } catch (error) { showError("清空系统日志失败", error); }
+}
+
 function requestQuery(page) {
   const query = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String((page - 1) * PAGE_SIZE) });
   const fields = [["filter-conversation", "conversationId"], ["filter-request", "requestId"], ["filter-run", "runId"], ["filter-provider", "provider"], ["filter-profile", "profileId"], ["filter-model", "model"], ["filter-protocol", "protocol"], ["filter-status", "status"], ["filter-stream", "stream"], ["filter-error", "errorCode"]];
@@ -1482,6 +1634,7 @@ function switchView(name) {
     models: ["模型", "管理模型能力、参数限制、默认模型和可用状态"],
     secrets: ["Secret", "管理 Provider、MCP、Client API Key 和其他 Secret"],
     requests: ["请求日志", "按标识、渠道、模型、状态和时间筛选脱敏 metadata"],
+    system: ["系统日志", "筛选全部 HTTP 请求、完整参数与返回明文，支持清空"],
     conversations: ["完整会话", "分页查看 request/response、tool-result、SSE 最终结果和脱敏 trace"],
     audit: ["系统审计", "查看管理员登录及配置和 Secret 生命周期操作"],
   };
@@ -1493,13 +1646,14 @@ function switchView(name) {
   if (name === "models") state.profiles.length ? renderModels() : loadChannels();
   if (name === "secrets") { loadSecrets(); loadMcpServers(); loadMcpDeployments(); }
   if (name === "requests") loadRequests();
+  if (name === "system") loadSystemLogs();
   if (name === "conversations") loadConversations();
   if (name === "audit") loadAudit();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   updateSessionUi(); loadHealth();
-  $("login-form").addEventListener("submit", login); $("logout-btn").addEventListener("click", () => logout());
+  $("login-form").addEventListener("submit", login); $("logout-btn").addEventListener("click", logoutAdminSession);
   $("refresh-channels").addEventListener("click", loadChannels); $("new-provider").addEventListener("click", () => openProviderEditor()); $("cancel-provider").addEventListener("click", closeProviderEditor); $("reset-provider").addEventListener("click", () => openProviderEditor(state.editingProvider)); $("provider-form").addEventListener("submit", saveProvider); $("discover-provider-models").addEventListener("click", discoverProviderModels); $("provider-protocol").addEventListener("change", () => { clearProviderModelCandidates(); if (!state.editingProvider) populateProviderGroups(defaultProviderGroup($("provider-protocol").value)); });
   for (const id of ["provider-id", "provider-url", "provider-api-key"]) $(id).addEventListener("input", clearProviderModelCandidates);
   $("provider-auth").addEventListener("change", clearProviderModelCandidates);
@@ -1511,8 +1665,17 @@ document.addEventListener("DOMContentLoaded", () => {
   $("copy-client-key").addEventListener("click", async () => { try { await copyText($("revealed-client-key-value").textContent); showNotice("Client API Key 已复制"); } catch { showNotice("复制失败，请手动复制", "error"); } });
   $("refresh-audit").addEventListener("click", () => loadAudit()); $("refresh-conversations").addEventListener("click", () => loadConversations()); $("refresh-requests").addEventListener("click", () => loadRequests());
   $("request-filters").addEventListener("submit", (event) => { event.preventDefault(); state.requestPage = 1; loadRequests(1); });
+  $("system-log-filters").addEventListener("submit", (event) => { event.preventDefault(); loadSystemLogs(1); });
+  $("refresh-system-logs").addEventListener("click", () => loadSystemLogs());
+  $("clear-system-logs").addEventListener("click", clearSystemLogs);
+  setInterval(() => {
+    if (!document.hidden && $("view-system").classList.contains("active") && $("system-auto").checked) loadSystemLogs();
+  }, 5000);
   $("conversation-filters").addEventListener("submit", (event) => { event.preventDefault(); state.conversationPage = 1; loadConversations(1); });
   $("dialog-close").addEventListener("click", () => { state.conversationDetail = null; $("dialog-body").replaceChildren(); $("detail-dialog").close(); });
   document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
   window.addEventListener("pagehide", clearSensitiveUi);
+  window.addEventListener("pageshow", (event) => { if (event.persisted) refreshAdminSession(true); });
+  window.addEventListener("focus", () => { if (state.sessionToken) refreshAdminSession(); });
+  refreshAdminSession(true);
 });

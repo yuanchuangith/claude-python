@@ -1,10 +1,28 @@
 # ActionDesign Thin Gateway
 
 - 文档角色：Python轻量网关的接口、配置、认证、Secret、MCP和部署事实源。
-- 最后核对：2026-10-11；应用/OpenAPI版本与部署健康必须分别核实，不从旧部署记录推断当前运行状态。
-- 整个项目首读：[前端Agent主文档](../component/.claude/agent-context.md)。业务目标、Graph、工具/Skill/提示词及当前验收状态都从该入口读取；后端不运行ActionDesign业务Agent。
-- 当前前后端MCP实现与验证：[gateway-contract-review.md](../component/gateway-contract-review.md)。[交付状态](../component/.claude/actiondesign-langgraph-delivery-status.md)区分开发验证、隔离集成和用户业务验收。
-- 本文API、环境变量和部署说明按主题维护；历史部署日期不作为当前验收。归整前原文见[文档快照](../component/.claude/archive/docs-before-organization-2026-10-07/README.md)。
+- 本地知识库新增独立后端服务：[LocalDocRAG](LocalDocRAG/README.md)。FastAPI、Word/OCR、SQLite、Ollama/Qdrant、检索问答和后台任务均在本仓 `LocalDocRAG/backend`；React管理页面位于本仓 `LocalDocRAG/frontend`。其默认端口7860，既有网关8888保持原职责；真实模型/GPU验收状态见[记录](LocalDocRAG/docs/ACCEPTANCE.md)。
+- 最后核对：2026-10-17；应用/OpenAPI版本与部署健康必须分别核实，不从旧部署记录推断当前运行状态。
+- 2026-10-17：新增下面的共享业务证据只读代理；本机实际 MiMo 路由与验证范围由最新知识报告记录。
+- 整个项目首读：[前端Agent主文档](../component/doc/agent-context.md)。业务目标、Graph、工具/Skill/提示词及当前验收状态都从该入口读取；后端不运行ActionDesign业务Agent。
+- 当前前后端MCP实现与验证：[gateway-contract-review.md](../component/doc/shared/reports/gateway-contract-review.md)。[交付状态](../component/doc/shared/delivery-status.md)区分开发验证、隔离集成和用户业务验收。
+- 本文API、环境变量和部署说明按主题维护；历史部署日期不作为当前验收。
+
+## 两个前端 Agent 共用本地业务证据
+
+两个浏览器 Agent 仍运行各自 Graph/Registry/Prompt，网关不运行业务 Agent 或另建知识聊天循环。实际模型通过 `/api/actiondesign-agent/models` 发现，当前本机路由为 `claude-code / default-claude-code / claude / mimo-v2.6-pro`；Provider 名称不是模型名称，不复制一套 MiMo 密钥。
+
+配置 `ACTIONDESIGN_LOCALDOC_BASE_URL=http://127.0.0.1:7860` 与 `ACTIONDESIGN_LOCALDOC_KNOWLEDGE_BASE_ID=<UUID>` 后，以下接口复用既有 runtime 服务/客户端/本机默认认证及 Origin 策略。未配置两项时 config 返回 `enabled:false`，保留既有 IndexedDB 行为；配置必须同时提供，URL 仅允许 loopback HTTP origin，禁止任意远端、路径或重定向。
+
+| 方法 | 路径（共同前缀 `/api/actiondesign-agent`） | 约定 |
+| --- | --- | --- |
+| GET | `/knowledge/config` | 未配置时仅`{enabled:false}`；启用时包含knowledgeBaseId及`processing:{retrieval:'local',model:'configured_gateway'}`，不返回底层URL/密钥 |
+| POST | `/knowledge/search` | `query,offset?,limit?,max_snippet_chars?,result_version?,knowledge_base_id?`；可选KB必须匹配配置，按LocalDocRAG分页返回摘要/ID/版本；表行保留fullTableId/readHint供直接读取整表 |
+| GET | `/knowledge/documents/{chunk_uuid}` | 固定配置KB读取活动原文；可选 `knowledge_base_id` 必须匹配，返回 `KnowledgeDocument` 或 `null` |
+
+代理固定转发 `/api/agent/search`、`/api/agent/knowledge/{UUID}`，设置本地 Origin/请求头，不传浏览器认证/Cookie/Fetch Metadata。上游版本冲突409继续传递，服务不可用或异常响应返回有界502，响应与错误均不缓存。来源的相对预览链接转换为固定本机管理页绝对地址，点击不会误落到网关或平台根路径。此代理没有上传、删除、激活、保存或发布入口。Provider Key 仍由原网关托管。
+
+`evidence_only` 可用于业务理解、编排建议和完整流程问答，不成为已审核操作包，也不授予画布写入、保存发布、页面输入、提交或签名权限。必要证据可进入既有外部 MiMo Provider，不能宣称全离线；原件、解析、Embedding、版本和索引保留在本机。来源与分页见 [LocalDocRAG API](LocalDocRAG/docs/API.md)，质量与边界见[验收报告](../component/doc/business-operation/knowledge-shared-implementation-2026-10-17.md)。
 
 ## 原生推理状态协议
 
@@ -16,7 +34,7 @@ Python不拥有业务历史或checkpoint：浏览器保存对应消息和完整�
 
 缺少流终止标记、失败或截断的推理不回传。完整会话日志对严格验证的签名/密文原样保存，避免通用Base64脱敏损坏状态；原生正文命中敏感值/Secret时整状态移除（null），不篡改签名。前端trace只发送元数据。模型未返回状态时不伪造，也不承诺获取可读完整CoT。
 
-本地新增20项通过，扩展178通过/5已有失败/2既有跳过；已有失败在隔离的修改前协议副本复现。需重启更新后的gateway并加载新前端，真实Provider接受行为与正式页面验收未执行。完整前端续接/存储/压缩边界和证据见[实施报告](../component/agent-reasoning-continuity-report.md)。
+本地新增20项通过，扩展178通过/5已有失败/2既有跳过；已有失败在隔离的修改前协议副本复现。需重启更新后的gateway并加载新前端，真实Provider接受行为与正式页面验收未执行。完整前端续接/存储/压缩边界和证据见[实施报告](../component/doc/shared/reports/agent-reasoning-continuity-report.md)。
 
 ## MCP 单一配置源与浏览器直连
 
@@ -126,7 +144,7 @@ Secret 暴露范围是强制边界：`browser_header` 才能进入 HTTP 浏览�
 - 不运行 ActionDesign 工具循环。
 - 不解析文本标记或 XML 工具协议。
 - 不执行 Review、Topic classifier、计划闸门或完成闸门。
-- 不提供知识库、embedding、Markdown index 或 Qdrant。
+- actiondesign_gateway 不提供知识库、embedding、Markdown index 或 Qdrant；这些能力由本仓独立的[LocalDocRAG服务](LocalDocRAG/README.md)负责。
 - 不接受任意 URL 转发；受管 Profile host 必须在 allowlist 中，OpenAI `/v1/chat/completions`、Responses `/v1/responses` 或 Claude `/v1/messages` path 由网关按协议规范化。
 - 普通 MCP runtime 请求不接受浏览器传入命令、脚本路径、环境变量或任意目标 authority；只有管理员 Bearer 管理 API 可以提交 strict Server 配置，且不能扩大部署级 allowlist。不复制 GXP 查询业务逻辑，不执行数据库或设计写入。
 
@@ -331,7 +349,8 @@ Authorization: Bearer <short-lived-session-token>
 规则：
 
 - 管理密码不硬编码在源码中；本项目部署时通过隔离 `.env` 设置 `ACTIONDESIGN_ADMIN_PASSWORD=<set-in-deployment>`，未配置时登录端点返回 `ADMIN_LOGIN_DISABLED`。登录连续失败 5 次后，同一来源会被限制 30 分钟。密码只在登录请求中发送，不写日志。`ACTIONDESIGN_ADMIN_ALLOW_REMOTE` 默认 `false`，因此公网 admin 路由不可访问；生产前端必须由 loopback 上的 HTTPS 同源代理转发，或在完成网络边界保护后显式开启远程管理。
-- `/admin/` 直接调用同源管理 API，覆盖渠道、模型、路由优先级、Browser API Key、系统审计、完整 Conversation 和 metadata 请求日志。管理密码、session、Provider Key 与新生成的 Browser API Key 都只保存在当前页面内存；页面刷新后需要重新登录。
+- `/admin/` 直接调用同源管理 API，覆盖渠道、模型、路由优先级、Browser API Key、系统审计、完整 Conversation 和请求日志。页面内存保存 Bearer；登录另设 HttpOnly、SameSite=Strict、仅作用于 `/api/actiondesign-agent/admin/session` 的会话 Cookie（HTTPS 时 Secure），刷新页面通过同源 `POST /admin/session` 恢复登录，使用期间定时续期。此接口要求精确同源 Origin 和 `X-ActionDesign-Admin-Session: 1`，不因 CORS allowlist 接受跨域 Cookie 认证；普通管理员 API 仍只接受 Bearer。页面不向 localStorage/sessionStorage 保存凭据。
+- 默认空闲过期时间为 `ACTIONDESIGN_ADMIN_SESSION_TTL_SECONDS=3600`；本机启动配置为 `86400`（24 小时），页面打开期间最多每 10 分钟续期，回到页面时也续期。`DELETE /admin/session` 撤销服务器会话并删除 Cookie；会话仍由网关进程内存保存，服务重启或真实过期后需重新登录。仅真正的管理认证失效会清空页面，其他业务请求的 401 和网络波动不再直接登出。
 - 浏览器可直接把短期管理 session 放入 `X-ActionDesign-Api-Key` 调用模型；长期浏览器/CLI Key 通过 access-key rotate 创建或轮换，明文只在该次响应出现，后端仅持久化盐化摘要和末尾掩码。
 - 内部服务继续独立使用 `X-ActionDesign-Service-Token`，不得把 Provider Key 或 Service Token 下发给浏览器。
 - Profile API 响应只有 `keyConfigured` 与末四位掩码 `secretMasked`，绝不返回 Provider Key。通用 Secret 查询同样只返回状态、类型、时间和掩码。
@@ -339,7 +358,7 @@ Authorization: Bearer <short-lived-session-token>
 - 每个 Profile 包含动态 `provider` 渠道 ID、`displayName`、`protocol=openai|claude|openai-responses`、`priority`、`models[].priority`、`defaultModel`、Base URL、认证方式、超时和启用状态。priority 为 1..10000，数值越大越优先。
 - `/models.routingOrder` 返回真实全局顺序。无显式选择时先使用最高优先级渠道的 `defaultModel`；显式 profile/model 始终作为首选。可重试故障先切同 Profile 其余模型（按 priority），再切其他 Profile 的默认模型及模型链。
 - 401/403 会跳过当前 Profile 的其余模型再尝试其他凭据；408/429/5xx、timeout/network、context/model unavailable 可降级；参数、能力校验及普通 4xx 不盲重试。流式只允许首个可见 delta 前切换，已输出后返回 `gateway.error` 而不换路由。
-- Claude Thinking 透传为 Anthropic `thinking`；OpenAI Chat Completions 按预算映射为 `reasoning_effort`。
+- Claude Thinking 透传为 Anthropic `thinking`：`enabled`保留预算，显式或默认`disabled`发送`{"type":"disabled"}`，不再省略后交由上游默认决定。main/review及流式/非流式共用此转换；同路由历史signed/redacted thinking原样保留。此修复不改变请求schema默认值或其他协议；上游是否接受并实际关闭思考仍须真实Provider复验，不能仅由`supportsThinking:false`或本地测试断言。OpenAI Chat Completions继续按启用预算映射为 `reasoning_effort`。
 - `default-mimo` 和 `default-claude-code` 只是普通环境渠道，不允许删除，也不能改 provider/protocol/Base URL/auth/key；但允许页面修改 priority、defaultModel 和 models 路由 metadata，并通过 environment overlay 持久化。
 - 环境变量和受管 profile 的 URL 都会在注册前校验 HTTPS/loopback 与 `ACTIONDESIGN_PROFILE_ALLOWED_HOSTS`，并拒绝 userinfo、query 和 fragment；非法环境 Profile 会使网关启动失败，而不是带着未校验目标运行。
 - profile 文件使用 strict schema v4，只保存非敏感 metadata、优先级、环境 overlay 和随机 `secret_ref`；旧 schema v2/v3 会严格校验后一次性迁移到 v4，旧明文 Profile 文件仍拒绝加载。
@@ -473,6 +492,19 @@ ACTIONDESIGN_MCP_STDIO_MAX_SESSION_SECONDS=600
 
 ## 日志与脱敏
 
+### 系统日志页签（本机明文调试，2026-10-16）
+
+`/admin/` 新增独立“系统日志”页签，管理员登录后可以查看、筛选和清空请求与返回内容。`ACTIONDESIGN_SYSTEM_LOG_ENABLED=true` 开启采集，默认关闭；当前本机已开启。存储由 `ACTIONDESIGN_SYSTEM_LOG_PATH` 指定，默认 `logs/local/system-logs.sqlite3`，重启保留，清空删除全部系统调试记录并回收数据库空间。
+
+- 记录网关收到的 HTTP 请求（包括认证失败、校验失败、静态资源和预检）：方法、完整 URL、重复查询参数、原始 Header、完整 Body、状态码、耗时和返回 Header/Body。
+- 记录网关实际发给模型服务的每次 HTTP 调用，包括协议转换后的完整参数、每次 fallback、模型发现和连接测试，并用 `parentId` 关联客户端请求。支持 OpenAI Chat Completions、Responses 和 Claude；网络错误也保留记录。
+- 响应继续实时转发；SSE 正文在请求结束后完整保存，断开或失败标记不完整；压缩内容解码后可读，并保留线上字节，二进制使用 Base64。正文不按原有 metadata 日志的长度或深度裁剪。
+- 支持全文（含请求和返回正文）、方向、方法、HTTP 状态、requestId/conversationId/runId、渠道、模型、时间范围和仅错误筛选；列表分页，默认每 5 秒刷新，详情支持刷新、完整 JSON 复制和关联模型调用。
+- 这是用户明确要求的独立明文调试存储：Header 中的 Authorization/Cookie、API Key、密码、图片和其他参数原样保留，仅管理员接口可读取，响应 `Cache-Control: no-store`。以下脱敏规则仍适用于原有请求摘要、会话、审计和 Trace，不适用于此显式开启的系统调试日志。
+- 日志查询、详情和清空接口自身不采集，避免日志正文递归膨胀。清空不改变原有会话/审计日志；尚在执行的请求结束后会重新记录。开启前的完整原文无法补录；浏览器直连 MCP、浏览器内部事件及 stdio 进程内部日志不经过此 HTTP 采集器。
+
+管理 API：`GET /api/actiondesign-agent/admin/system-logs`、`GET /api/actiondesign-agent/admin/system-logs/{id}`、`DELETE /api/actiondesign-agent/admin/system-logs`。筛选参数为 `q/direction/method/status/requestId/conversationId/runId/provider/model/parentId/startedAt/endedAt/errorsOnly`，分页 `limit/offset`，时间必须带时区。
+
 - 系统修改审计日志独立写入 `debug_logs/actiondesign-agent/system/admin-audit.jsonl`，记录登录、Profile/Key/priority、Browser API Key 和 seal 操作的 actor/IP、requestId、结果与脱敏详情。
 - metadata 请求日志独立写入 `request-logs.jsonl` 并轮转；每个实际 fallback attempt 都记录 attempt、实际 Profile/协议/模型，不保存正文。
 - Agent运行时的chat、stream、tool-result、MCP和LangSmith真实HTTP调用由前端生成独立canonical UUID v4 requestId，网关在Header/Body边界校验并回显，不替换调用方身份；correlationId保持同一逻辑调用，重试使用新的requestId及retryOf/parentRequestId。兼容入口的内部请求映射遵守对应协议；同一次Provider fallback的attempts复用该HTTP requestId。
@@ -502,7 +534,7 @@ python -m pytest \
 
 `verify_actiondesign_gateway_local.py` 使用临时回环 Anthropic-compatible HTTP Provider 验证真实网关 `/models`、managed Profile HTTP CRUD、Key 只写不回显、使用该 Profile 的非流式 native tool call、SSE `model.completed`、删除回滚边界和日志不泄漏 Key；Secret Store 仅为进程内存，不访问外部网络、不使用真实凭据、不启动 MCP 或写入持久配置。真实 Provider 凭据、系统 Keyring 服务账户和 LangSmith workspace 仍需部署环境另行验收。
 
-已删除且不应恢复的路由：`/review`、`/topic/classify`、`/knowledge/*`、`/tool-results/*`。MCP 只通过通用 `{serverId}` transport 路由暴露；任何历史 server ID 若仍需使用，也只能作为普通预配置 server，不再拥有专用路由、Schema 或工具白名单。
+已删除且不应恢复的旧业务循环/知识管理路由：`/review`、`/topic/classify`、旧 `/knowledge/*`、`/tool-results/*`。2026-10-17 新增的 `/knowledge/config`、`/knowledge/search`、`/knowledge/documents/{UUID}` 只代理固定本机业务原文，属于本文开头明确的只读例外，不恢复旧知识管理或后端Agent循环。MCP只通过通用 `{serverId}` transport路由暴露；历史server ID若仍需使用，也只能作为普通预配置server，不再拥有专用路由、Schema或工具白名单。
 
 ## 当前开发验证与上线边界
 
@@ -510,13 +542,22 @@ MCP建设阶段相关后端51项通过；前端当阶段91个测试文件通过�
 
 实际浏览器在隔离当前网关验证HTTP认证、会话、调用、版本切换和旧/新步骤隔离；真实GXP stdio发现41工具并完成connection_status。传输验证不代表业务诊断、正式部署或用户阶段4验收。正式MCP/Provider配置未修改；旧运行进程需要重启才能提供新connection-config接口。
 
-前端SDK为1.32.1；工具/Skill/提示词与业务验收记录在[Agent主文档](../component/.claude/agent-context.md)及其索引中。HTTP最终Header、stdio_env绑定、配置写入/启停/删除的expectedConfigVersion和后端单一配置源须与前端同版本使用。
+前端SDK为1.32.1；工具/Skill/提示词与业务验收记录在[Agent主文档](../component/doc/agent-context.md)及其索引中。HTTP最终Header、stdio_env绑定、配置写入/启停/删除的expectedConfigVersion和后端单一配置源须与前端同版本使用。
 
 ## 持续上下文调用与预算（协议1.1）
+
+### 增量等待协议与验证（2026-10-12）
+
+- Provider HTTP 429解析Retry-After秒数或HTTP-date，保留脱敏retryAfterMs及等待Header；非法、负数、非有限值不返回等待。权限错误不附可重试等待。
+- /chat和/chat/stream协议1.1透传retryAfterMs，协议1.0保持原错误字段形状；前端执行可取消等待、有界重试和期限，后端不创建业务重试/工具状态机。
+- 分支、输入队列、安全artifact、空闲压缩、经验去重、预算校准和未知写核对仍由前端实现，后端没有增加业务存储或第二套Agent。
+- 定向reasoning_continuity/request_accounting/retry_after共53通过（Retry-After7项含HTTP/SSE×新旧协议）；扩大313通过/7既有失败/2跳过。7项在隔离当前src、仅替换本轮app.py/provider_http.py为HEAD后全部复现，Responses保留。源文件20项既有lint与基线一致、新测试lint/编译通过，没有新增真实Provider/正式页面验收或服务重启。详细边界见[增量实现报告](../component/agent-codex-incremental-implementation-report.md)。
+
+### 完整请求预算与用量
 
 - 网关仍只转换协议/路由/预算/用量，不拥有业务Graph、摘要策略、经验库或任务状态。前端复用/chat、/chat/stream，taskPurpose为main/review/compaction/memory/intent；辅助请求仅本次结构化结果工具，沿用当前模型和既有fallback。
 - /models协商supportedProtocolVersions=1.0/1.1。旧响应保持原形；新版保留原usage，新增normalizedUsage（输入/输出/缓存读取/缓存创建/推理/总量，未知null）和requestBudget（估算输入、可用输入、输出预留、窗口、实际Provider/Profile/model/protocol、isEstimate=true）。缓存/推理为分类或子集，不能重复累计到total。
 - [request_budget.py](src/claude_agent_sdk/actiondesign_gateway/request_budget.py)复用实际HTTP发送body，覆盖system/messages/native tools Schema/images及输出预留；每个候选路由发送前独立检查。模型名称取实际body.model，兼容req.model为空的既有默认模型路径。PNG/GIF/JPEG尺寸与协议估算图片，未知尺寸保守估计；opaque密文不按字符计真实推理token，业务字段名data/signature/encrypted_content不能因此漏算。
 - 超预算HTTP413，detail.code=CONTEXT_BUDGET_EXCEEDED，1.1附实际路由预算；旧协议不增加budget响应字段。主/Review/辅助实际路由均返回归一化用量。前端决定压缩及有界重试，默认累计请求硬上限null；后端没有另设业务累计上限。
 - 特殊图片/推理估计只在实际协议的原生消息与内容块边界生效，不递归传播到业务工具参数、Schema或示例；业务对象的type=reasoning/redacted_thinking/image不能绕过预算。
-- 新预算26项通过（Provider HTTP/Schema/图片/缓存/缺usage/实际fallback/旧新响应及SSE，同名业务type隔离，以及最终响应脱敏/来源ID/真实HTTP和SSE接线）；最新扩大230通过/6既有失败/2跳过，6项隔离旧源码复现。2026-10-11已使用claude协议mimo-v2.6-pro真实调用；发现并修复camelCase token用量误脱敏和Graph来源ID中的user:0被误当连接用户名。凭据仍脱敏，来源ID仅保护严格run_UUID:user:数字，已配置Secret精确替换仍执行。首轮用8889隔离store/log加载新代码复验；用户随后重启8888，HTTP新旧协议/SSE/预算拒绝/前端经验5/5定向实测通过，未部署正式业务页面。前端完整报告：[agent-continuity-recovery-report.md](../component/agent-continuity-recovery-report.md)。
+- 新预算26项通过（Provider HTTP/Schema/图片/缓存/缺usage/实际fallback/旧新响应及SSE，同名业务type隔离，以及最终响应脱敏/来源ID/真实HTTP和SSE接线）；最新扩大230通过/6既有失败/2跳过，6项隔离旧源码复现。2026-10-11已使用claude协议mimo-v2.6-pro真实调用；发现并修复camelCase token用量误脱敏和Graph来源ID中的user:0被误当连接用户名。凭据仍脱敏，来源ID仅保护严格run_UUID:user:数字，已配置Secret精确替换仍执行。首轮用8889隔离store/log加载新代码复验；用户随后重启8888，HTTP新旧协议/SSE/预算拒绝/前端经验5/5定向实测通过，未部署正式业务页面。前端完整报告：[agent-continuity-recovery-report.md](../component/doc/shared/reports/agent-continuity-recovery-report.md)。

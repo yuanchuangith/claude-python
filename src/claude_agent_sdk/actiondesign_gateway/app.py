@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from .admin_security import AdminSessionStore, BrowserApiKeyStore
 from .audit_log import AuditLogStore
+from .business_knowledge import create_knowledge_router
 from .client_api_key_store import (
     ClientApiKeyCreateRequest,
     ClientApiKeyStore,
@@ -144,6 +145,7 @@ from .provider_http import (
 )
 from .redaction import redact_secret_values, redact_value
 from .request_log import RequestLogStore
+from .system_log import SystemLogMiddleware, SystemLogStore
 from .secret_store import (
     ManagedSecretStore,
     ManagedSecretStoreError,
@@ -318,11 +320,14 @@ def create_app(
     app.state.mcp_deployer = mcp_deployer
     app.state.mcp_proxy = mcp_proxy
     app.state.request_logs = request_logs
+    system_logs = SystemLogStore(gateway_settings.system_log_path)
+    app.state.system_logs = system_logs
     app.state.admin_sessions = admin_sessions
     app.state.browser_api_keys = browser_api_keys
     app.state.client_api_keys = client_api_keys
     app.state.audit_logs = audit_logs
     app.state.mcp_mutation_lock = mcp_mutation_lock
+    app.include_router(create_knowledge_router(_require_service_auth))
 
     def _managed_mcp_runtime(
         configs: list[McpServerConfig],
@@ -382,6 +387,8 @@ def create_app(
             (
                 f"{API_PREFIX}/mcp-browser/",
                 f"{API_PREFIX}/admin/mcp-servers",
+                f"{API_PREFIX}/admin/system-logs",
+                f"{API_PREFIX}/knowledge/",
                 f"{API_PREFIX}/mcp-config/servers",
                 f"{API_PREFIX}/admin/mcp-deployment",
                 f"{API_PREFIX}/admin/mcp-deployments",
@@ -473,6 +480,57 @@ def create_app(
         allow_headers=["*"],
         **({"allow_private_network": True} if gateway_settings.allow_private_network else {}),
     )
+
+    if gateway_settings.system_log_enabled:
+        app.add_middleware(
+            SystemLogMiddleware, store=system_logs,
+            error_handler=sanitized_unhandled_error,
+        )
+
+    @app.get(f"{API_PREFIX}/admin/system-logs")
+    async def list_system_logs(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        q: Annotated[str, Query(max_length=2000)] = "",
+        direction: Annotated[str, Query(pattern=r"^(inbound|outbound)?$")] = "",
+        method: Annotated[str, Query(max_length=16)] = "",
+        status: Annotated[int | None, Query(ge=0, le=599)] = None,
+        request_id: Annotated[str, Query(alias="requestId", max_length=256)] = "",
+        conversation_id: Annotated[str, Query(alias="conversationId", max_length=256)] = "",
+        run_id: Annotated[str, Query(alias="runId", max_length=256)] = "",
+        model: Annotated[str, Query(max_length=256)] = "",
+        provider: Annotated[str, Query(max_length=64)] = "",
+        parent_id: Annotated[str, Query(alias="parentId", max_length=256)] = "",
+        errors_only: Annotated[bool, Query(alias="errorsOnly")] = False,
+        started_at: Annotated[datetime | None, Query(alias="startedAt")] = None,
+        ended_at: Annotated[datetime | None, Query(alias="endedAt")] = None,
+    ) -> dict[str, Any]:
+        _require_profile_admin(request, gateway_settings)
+        started_at, ended_at = _validated_time_range(started_at, ended_at)
+        filters = {"q": q, "direction": direction, "method": method, "status": status,
+                   "requestId": request_id, "conversationId": conversation_id,
+                   "runId": run_id, "model": model, "provider": provider,
+                   "parentId": parent_id, "errorsOnly": errors_only,
+                   "startedAt": started_at.astimezone(timezone.utc).isoformat() if started_at else "",
+                   "endedAt": ended_at.astimezone(timezone.utc).isoformat() if ended_at else ""}
+        result = await asyncio.to_thread(system_logs.list, limit=limit, offset=offset, filters=filters)
+        return JSONResponse({**result, "enabled": gateway_settings.system_log_enabled},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get(f"{API_PREFIX}/admin/system-logs/{{log_id}}")
+    async def get_system_log(log_id: RequestIdPath, request: Request) -> Response:
+        _require_profile_admin(request, gateway_settings)
+        entry = await asyncio.to_thread(system_logs.get, log_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail={"code": "SYSTEM_LOG_NOT_FOUND"})
+        return JSONResponse(entry, headers={"Cache-Control": "no-store"})
+
+    @app.delete(f"{API_PREFIX}/admin/system-logs")
+    async def clear_system_logs(request: Request) -> Response:
+        _require_profile_admin(request, gateway_settings)
+        count = await asyncio.to_thread(system_logs.clear)
+        return JSONResponse({"deleted": count}, headers={"Cache-Control": "no-store"})
 
     @app.get(f"{API_PREFIX}/health", response_model=HealthResponse)
     async def health() -> dict[str, Any]:
@@ -1019,6 +1077,50 @@ def create_app(
         )
         return response
 
+    admin_session_path = f"{API_PREFIX}/admin/session"
+    admin_session_cookie = "actiondesign_admin_session"
+
+    def _set_admin_session_cookie(response: Response, request: Request, result: dict[str, Any]) -> None:
+        response.headers["Cache-Control"] = "no-store"
+        response.set_cookie(
+            admin_session_cookie, result["sessionToken"],
+            max_age=result["expiresInSeconds"], path=admin_session_path,
+            httponly=True, secure=request.url.scheme == "https", samesite="strict",
+        )
+
+    def _require_same_origin_admin_session(request: Request) -> None:
+        _require_admin_origin(request, gateway_settings)
+        if (
+            request.headers.get("Origin", "").rstrip("/") != str(request.base_url).rstrip("/")
+            or request.headers.get("X-ActionDesign-Admin-Session") != "1"
+        ):
+            raise HTTPException(status_code=403, detail={"code": "ADMIN_SESSION_ORIGIN_REQUIRED"})
+
+    @app.post(admin_session_path, response_model=AdminLoginResponse)
+    async def renew_admin_session(request: Request, response: Response) -> dict[str, Any] | Response:
+        _require_same_origin_admin_session(request)
+        authorization = request.headers.get("Authorization", "")
+        # An explicitly supplied invalid Bearer must not fall back to a cookie.
+        token = authorization.removeprefix("Bearer ").strip() if authorization else request.cookies.get(admin_session_cookie, "")
+        result = admin_sessions.renew(token)
+        if result is None:
+            failure = JSONResponse(status_code=401, content={"detail": {"code": "PROFILE_ADMIN_AUTH_REQUIRED"}}, headers={"Cache-Control": "no-store"})
+            failure.delete_cookie(admin_session_cookie, path=admin_session_path)
+            return failure
+        _set_admin_session_cookie(response, request, result)
+        return result
+
+    @app.delete(admin_session_path)
+    async def revoke_admin_session(request: Request) -> Response:
+        _require_same_origin_admin_session(request)
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            admin_sessions.revoke(authorization.removeprefix("Bearer ").strip())
+        admin_sessions.revoke(request.cookies.get(admin_session_cookie, ""))
+        response = JSONResponse({"success": True}, headers={"Cache-Control": "no-store"})
+        response.delete_cookie(admin_session_cookie, path=admin_session_path)
+        return response
+
     @app.post(
         f"{API_PREFIX}/admin/login",
         response_model=AdminLoginResponse,
@@ -1026,6 +1128,7 @@ def create_app(
     async def admin_login(
         req: AdminLoginRequest,
         request: Request,
+        response: Response,
     ) -> dict[str, Any]:
         _require_admin_origin(request, gateway_settings)
         if not gateway_settings.admin_password:
@@ -1053,6 +1156,7 @@ def create_app(
                 status_code=401,
                 detail={"code": "ADMIN_LOGIN_FAILED"},
             )
+        _set_admin_session_cookie(response, request, result)
         return result
 
     @app.post(
@@ -3688,6 +3792,7 @@ async def _chat(
             safe_exc = _sanitized_provider_exception(exc, secret_values)
             if routed_request.protocol_version != "1.1" and isinstance(safe_exc.detail, dict):
                 safe_exc.detail.pop("budget", None)
+                safe_exc.detail.pop("retryAfterMs", None)
             detail = _error_detail(safe_exc)
             profiles.record_health(
                 route.profile.id,
@@ -3924,6 +4029,8 @@ def _chat_stream(
                         _provider_secret_values(settings, route.profile),
                     )
                     detail = _error_detail(safe_exc)
+                    if routed_request.protocol_version != "1.1":
+                        detail.pop("retryAfterMs", None)
                     profiles.record_health(
                         route.profile.id,
                         success=False,
@@ -4343,6 +4450,7 @@ def _error_detail(exc: Exception) -> dict[str, Any]:
         return {
             "code": str(detail.get("code", "GATEWAY_ERROR")),
             "message": str(message),
+            **({"retryAfterMs": detail["retryAfterMs"]} if isinstance(detail.get("retryAfterMs"), int | float) else {}),
             **({"budget": detail["budget"]} if detail.get("code") == "CONTEXT_BUDGET_EXCEEDED" and isinstance(detail.get("budget"), dict) else {}),
         }
     return {

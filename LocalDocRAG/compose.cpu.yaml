@@ -1,0 +1,7 @@
+services:
+  api:
+    environment:
+      GPU_MODE: cpu
+  ollama:
+    environment:
+      CUDA_VISIBLE_DEVICES: "-1"

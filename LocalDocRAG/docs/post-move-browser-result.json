@@ -1,0 +1,11 @@
+{
+  "kind": "post_move_synthetic_browser_setup",
+  "models_mocked": true,
+  "knowledge_base_id": "5b374a0a-74dc-4bc0-bd2f-678d1515b563",
+  "document_id": "06955353-b82d-423e-965d-e0db1facbc5a",
+  "version_id": "1ea8b36a-448e-4b23-b4e3-4214a2f7f356",
+  "job_status": "completed_with_warnings",
+  "anchor": "dc9ff6c7-2d2f-54b3-b9fd-5138088c4cb6",
+  "url": "http://127.0.0.1:7863/documents/06955353-b82d-423e-965d-e0db1facbc5a/preview?version_id=1ea8b36a-448e-4b23-b4e3-4214a2f7f356&anchor=dc9ff6c7-2d2f-54b3-b9fd-5138088c4cb6",
+  "anchor_label": "body/tbl[1]"
+}

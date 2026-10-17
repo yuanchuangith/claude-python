@@ -317,7 +317,32 @@ def test_request_body_forwards_native_tool_choice():
     assert body["tool_choice"] == {"type": "tool", "name": "review_result"}
 
 
-def test_claude_request_forwards_enabled_thinking_budget():
+@pytest.mark.parametrize("task_purpose", ["main", "review"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_claude_request_forwards_disabled_thinking(task_purpose, stream, explicit):
+    req = AgentChatRequest(
+        conversationId=CONVERSATION_ID,
+        runId=RUN_ID,
+        requestId=REQUEST_ID,
+        correlationId=CORRELATION_ID,
+        systemPrompt="system rules",
+        prompt="return a structured answer",
+        taskPurpose=task_purpose,
+        **({"thinking": {"type": "disabled"}} if explicit else {}),
+    )
+
+    body = provider_http.request_body(req, profile(), stream)
+
+    assert req.thinking.type == "disabled"
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["stream"] is stream
+    assert "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize("task_purpose", ["main", "review"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_claude_request_forwards_enabled_thinking_budget(task_purpose, stream):
     req = AgentChatRequest(
         conversationId=CONVERSATION_ID,
         runId=RUN_ID,
@@ -326,10 +351,11 @@ def test_claude_request_forwards_enabled_thinking_budget():
         systemPrompt="system rules",
         prompt="reason carefully",
         maxTokens=8192,
+        taskPurpose=task_purpose,
         thinking={"type": "enabled", "budget_tokens": 4096},
     )
 
-    body = provider_http.request_body(req, profile(), False)
+    body = provider_http.request_body(req, profile(), stream)
 
     assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}
 

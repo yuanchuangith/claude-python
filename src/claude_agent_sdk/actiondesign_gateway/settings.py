@@ -254,6 +254,39 @@ class Settings(BaseModel):
     service_auth_token: str = Field(
         default_factory=lambda: _env("ACTIONDESIGN_SERVICE_AUTH_TOKEN")
     )
+    localdoc_base_url: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_LOCALDOC_BASE_URL")
+    )
+    localdoc_knowledge_base_id: str = Field(
+        default_factory=lambda: _env("ACTIONDESIGN_LOCALDOC_KNOWLEDGE_BASE_ID")
+    )
+
+    @field_validator("localdoc_knowledge_base_id")
+    def _canonical_localdoc_id(cls, value: str) -> str:
+        from uuid import UUID
+
+        return str(UUID(value)) if value else value
+
+    @model_validator(mode="after")
+    def _validate_localdoc(self) -> Settings:
+        if bool(self.localdoc_base_url) != bool(self.localdoc_knowledge_base_id):
+            raise ValueError("LocalDoc URL and knowledge base ID must be configured together")
+        if self.localdoc_base_url:
+            parsed = urlsplit(self.localdoc_base_url)
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname not in {"127.0.0.1", "localhost"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("LocalDoc URL must be a loopback HTTP origin")
+            # Accessing port also rejects malformed/out-of-range ports.
+            _ = parsed.port
+        return self
+
     log_root: Path | None = Field(
         default_factory=lambda: Path(_env("ACTIONDESIGN_AGENT_LOG_ROOT", default="debug_logs/actiondesign-agent"))
     )
@@ -270,6 +303,14 @@ class Settings(BaseModel):
         ),
         ge=1024 * 1024,
         le=1024 * 1024 * 1024,
+    )
+    system_log_enabled: bool = Field(
+        default_factory=lambda: _bool("ACTIONDESIGN_SYSTEM_LOG_ENABLED", False)
+    )
+    system_log_path: Path = Field(
+        default_factory=lambda: Path(_env(
+            "ACTIONDESIGN_SYSTEM_LOG_PATH", default="logs/local/system-logs.sqlite3"
+        ))
     )
     request_log_path: Path = Field(
         default_factory=lambda: Path(
